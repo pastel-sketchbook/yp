@@ -1,0 +1,15 @@
+version: "3"
+env:
+  PGM_NAME: yp
+tasks:
+  build:
+    cmds:
+      - cargo fmt
+      - cargo build --release
+  run:
+    cmds:
+      - target/release/$PGM_NAME
+  install:
+    cmds:
+      - task build
+      - cp target/release/$PGM_NAME ~/bin
