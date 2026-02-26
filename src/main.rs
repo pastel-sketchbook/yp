@@ -23,6 +23,9 @@ use player::{MusicPlayer, VideoDetails};
 use theme::THEMES;
 use youtube::{fetch_thumbnail, get_video_info, search_youtube};
 
+use directories::ProjectDirs;
+use serde::{Deserialize, Serialize};
+
 // --- CLI ---
 
 #[derive(Parser, Debug)]
@@ -37,6 +40,39 @@ struct Args {
 
 type SearchResult = Vec<(String, String)>;
 type LoadResult = (String, VideoDetails, Option<DynamicImage>);
+
+// --- Config ---
+
+#[derive(Serialize, Deserialize, Default, Debug)]
+pub struct Config {
+  pub theme_name: Option<String>,
+}
+
+impl Config {
+  pub fn load() -> Self {
+    if let Some(proj_dirs) = ProjectDirs::from("", "", "yp") {
+      let config_file = proj_dirs.config_dir().join("prefs.toml");
+      if let Ok(content) = std::fs::read_to_string(config_file) {
+        if let Ok(config) = toml::from_str(&content) {
+          return config;
+        }
+      }
+    }
+    Self::default()
+  }
+
+  pub fn save(&self) {
+    if let Some(proj_dirs) = ProjectDirs::from("", "", "yp") {
+      let config_dir = proj_dirs.config_dir();
+      if std::fs::create_dir_all(config_dir).is_ok() {
+        let config_file = config_dir.join("prefs.toml");
+        if let Ok(content) = toml::to_string(self) {
+          let _ = std::fs::write(config_file, content);
+        }
+      }
+    }
+  }
+}
 
 // --- App State ---
 
@@ -67,11 +103,15 @@ pub struct App {
 
 impl App {
   fn new(display_mode: DisplayMode) -> Self {
+    let config = Config::load();
+    let theme_index =
+      if let Some(ref name) = config.theme_name { THEMES.iter().position(|t| t.name == name).unwrap_or(0) } else { 0 };
+
     Self {
       input: String::new(),
       cursor_position: 0,
       mode: AppMode::Input,
-      theme_index: 0,
+      theme_index,
       search_results: Vec::new(),
       list_state: ListState::default(),
       player: MusicPlayer::new(display_mode),
@@ -93,6 +133,8 @@ impl App {
 
   fn next_theme(&mut self) {
     self.theme_index = (self.theme_index + 1) % THEMES.len();
+    let config = Config { theme_name: Some(self.theme().name.to_string()) };
+    config.save();
   }
 
   async fn check_pending(&mut self) -> Result<()> {

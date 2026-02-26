@@ -7,9 +7,10 @@ tasks:
       - cargo fmt
       - cargo build --release
   run:
+    deps: [build]
     cmds:
       - target/release/$PGM_NAME
   install:
+    deps: [build]
     cmds:
-      - task build
       - cp target/release/$PGM_NAME ~/bin
