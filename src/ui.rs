@@ -182,11 +182,18 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_results(frame: &mut Frame, app: &mut App, area: Rect) {
   let theme = app.theme();
+
+  let is_channel = app.channel_source.is_some();
+  let loading_more = app.channel_source.as_ref().is_some_and(|s| s.loading_more);
+
+  // Inner width: area minus 2 borders minus 2 chars for highlight symbol ("▶ ")
+  let inner_w = area.width.saturating_sub(4) as usize;
+
   let items: Vec<ListItem> = app
     .search_results
     .iter()
     .enumerate()
-    .map(|(i, (title, _))| {
+    .map(|(i, entry)| {
       let is_selected = Some(i) == app.list_state.selected();
       let fg = if is_selected { theme.highlight_fg } else { theme.fg };
       let bg = if is_selected {
@@ -196,14 +203,59 @@ fn render_results(frame: &mut Frame, app: &mut App, area: Rect) {
       } else {
         theme.bg
       };
-      ListItem::new(Line::from(Span::styled(title, Style::default().fg(fg)))).bg(bg)
+
+      // Build right-side metadata: "tags  date" or just "date" or just "tags"
+      let date_str = entry.upload_date.as_deref().unwrap_or("");
+      let tags_str = entry.tags.as_deref().unwrap_or("");
+      let right = match (!tags_str.is_empty(), !date_str.is_empty()) {
+        (true, true) => format!("{}  {}", tags_str, date_str),
+        (true, false) => tags_str.to_string(),
+        (false, true) => date_str.to_string(),
+        (false, false) => String::new(),
+      };
+
+      let line = if right.is_empty() {
+        let title = truncate_str(&entry.title, inner_w);
+        Line::from(Span::styled(title, Style::default().fg(fg)))
+      } else {
+        // Reserve space for right side + 2-char gap
+        let right_w = right.chars().count();
+        let title_max = inner_w.saturating_sub(right_w + 2);
+        let title = truncate_str(&entry.title, title_max);
+        let title_w = title.chars().count();
+        let gap = inner_w.saturating_sub(title_w + right_w);
+
+        // Split right into tags and date parts for separate styling
+        let padding: String = " ".repeat(gap);
+        let mut spans = vec![Span::styled(title, Style::default().fg(fg)), Span::raw(padding)];
+        if !tags_str.is_empty() && !date_str.is_empty() {
+          spans.push(Span::styled(tags_str.to_string(), Style::default().fg(theme.muted)));
+          spans.push(Span::raw("  "));
+          spans.push(Span::styled(date_str.to_string(), Style::default().fg(theme.muted)));
+        } else if !tags_str.is_empty() {
+          spans.push(Span::styled(tags_str.to_string(), Style::default().fg(theme.muted)));
+        } else {
+          spans.push(Span::styled(date_str.to_string(), Style::default().fg(theme.muted)));
+        }
+        Line::from(spans)
+      };
+
+      ListItem::new(line).bg(bg)
     })
     .collect();
+
+  let title = if is_channel {
+    let count = app.search_results.len();
+    let suffix = if loading_more { " (loading more…)" } else { "" };
+    format!(" Channel — {} videos{} ", count, suffix)
+  } else {
+    " Results ".to_string()
+  };
 
   let list = List::new(items)
     .block(
       Block::bordered()
-        .title(" Results ")
+        .title(title)
         .title_style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
         .border_type(ratatui::widgets::BorderType::Rounded)
         .border_style(Style::default().fg(theme.border)),
@@ -291,7 +343,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
       k
     }
     AppMode::Results => {
-      let mut k = vec![("Enter", "Play"), ("↑↓", "Navigate")];
+      let mut k = vec![("Enter", "Play"), ("j/k", "Navigate")];
       if is_playing {
         let pause_label = if app.player.paused { "Resume" } else { "Pause" };
         k.push(("Space", pause_label));

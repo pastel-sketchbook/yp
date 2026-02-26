@@ -3,16 +3,202 @@ use image::DynamicImage;
 use reqwest::Client;
 use std::process::Stdio;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
 use crate::player::VideoDetails;
 
-pub async fn search_youtube(query: &str) -> Result<Vec<(String, String)>> {
+/// Number of videos to fetch on the initial channel load.
+pub const CHANNEL_INITIAL_SIZE: usize = 30;
+
+/// Page size for subsequent channel "load more" fetches.
+pub const CHANNEL_PAGE_SIZE: usize = 20;
+
+/// A single entry from a search or channel listing.
+#[derive(Debug, Clone)]
+pub struct SearchEntry {
+  pub title: String,
+  pub video_id: String,
+  pub upload_date: Option<String>,
+  pub tags: Option<String>,
+  /// Whether this entry has been enriched with full metadata (date, tags).
+  /// Entries from `--flat-playlist` start as `false`.
+  pub enriched: bool,
+}
+
+/// Clean yt-dlp's Python-list repr of tags into a comma-separated string.
+/// e.g. `['rock', 'music', 'guitar']` → `rock, music, guitar`
+fn clean_tags(raw: &str) -> String {
+  raw.trim_start_matches('[').trim_end_matches(']').replace('\'', "")
+}
+
+/// Parse a single tab-separated yt-dlp output line into a SearchEntry.
+/// Expected format: `title\tid[\tupload_date\ttags]`
+fn parse_search_line(line: &str) -> Option<SearchEntry> {
+  let parts: Vec<&str> = line.split('\t').collect();
+  if parts.len() < 2 {
+    return None;
+  }
+  let title = parts[0].trim().to_string();
+  let video_id = parts[1].trim().to_string();
+  if video_id.is_empty() {
+    return None;
+  }
+  let opt = |idx: usize| -> Option<String> {
+    parts.get(idx).map(|s| s.trim()).filter(|s| !s.is_empty() && *s != "NA").map(|s| s.to_string())
+  };
+  let upload_date = opt(2);
+  let tags = opt(3).map(|s| clean_tags(&s)).filter(|s| !s.is_empty());
+  let enriched = upload_date.is_some() || tags.is_some();
+  Some(SearchEntry { title, video_id, upload_date, tags, enriched })
+}
+
+/// Parse yt-dlp stdout lines into SearchEntry vec.
+fn parse_search_output(stdout: &str) -> Vec<SearchEntry> {
+  stdout.lines().map(str::trim).filter(|l| !l.is_empty()).filter_map(parse_search_line).collect()
+}
+
+/// Detect whether user input refers to a YouTube channel.
+/// Returns the canonical channel URL if detected, or None for a regular search.
+pub fn detect_channel_url(input: &str) -> Option<String> {
+  let trimmed = input.trim();
+
+  // "/channel @handle" or "/channel https://..."
+  let after_prefix = trimmed.strip_prefix("/channel").map(str::trim_start);
+
+  let candidate = after_prefix.unwrap_or(trimmed);
+
+  // Bare @handle (e.g. "@TwoSetViolin")
+  if candidate.starts_with('@') && !candidate.contains(' ') && candidate.len() > 1 {
+    return Some(format!("https://www.youtube.com/{}/videos", candidate));
+  }
+
+  // Full YouTube channel URL
+  if (candidate.contains("youtube.com/@") || candidate.contains("youtube.com/channel/"))
+    && (candidate.starts_with("http://") || candidate.starts_with("https://"))
+  {
+    let url = candidate.trim_end_matches('/');
+    // Append /videos if not already present, so yt-dlp lists the uploads
+    if url.ends_with("/videos") {
+      return Some(url.to_string());
+    }
+    return Some(format!("{}/videos", url));
+  }
+
+  // Only trigger for the /channel prefix form, not bare text
+  if after_prefix.is_some() && !candidate.is_empty() {
+    // Assume it's a channel name/handle without @
+    return Some(format!("https://www.youtube.com/@{}/videos", candidate));
+  }
+
+  None
+}
+
+/// The yt-dlp print template used for all listing commands.
+const PRINT_FORMAT: &str = "%(title)s\t%(id)s\t%(upload_date>%Y-%m-%d)s\t%(tags)s";
+
+/// The yt-dlp print template used for per-video metadata enrichment.
+const ENRICH_FORMAT: &str = "%(id)s\t%(upload_date>%Y-%m-%d)s\t%(tags)s";
+
+/// Maximum number of concurrent yt-dlp enrichment processes.
+const ENRICH_CONCURRENCY: usize = 5;
+
+/// Enriched metadata for a single video (returned from background enrichment).
+#[derive(Debug, Clone)]
+pub struct VideoMeta {
+  pub video_id: String,
+  pub upload_date: Option<String>,
+  pub tags: Option<String>,
+}
+
+/// Enrich a list of video IDs with full metadata (upload_date, tags).
+/// Spawns up to `ENRICH_CONCURRENCY` concurrent yt-dlp processes.
+/// Each result is sent progressively through `tx` as it becomes available.
+pub async fn enrich_video_metadata(video_ids: Vec<String>, tx: mpsc::Sender<VideoMeta>) {
+  use futures::stream::{self, StreamExt};
+
+  stream::iter(video_ids)
+    .map(|video_id| {
+      let tx = tx.clone();
+      async move {
+        let url = format!("https://youtube.com/watch?v={}", video_id);
+        let result = Command::new("yt-dlp")
+          .args(["--skip-download", "--print", ENRICH_FORMAT, "--no-warnings", "--", &url])
+          .stdin(Stdio::null())
+          .stdout(Stdio::piped())
+          .stderr(Stdio::null())
+          .output()
+          .await;
+
+        if let Ok(output) = result
+          && output.status.success()
+          && let Ok(stdout) = String::from_utf8(output.stdout)
+        {
+          let line = stdout.trim();
+          let parts: Vec<&str> = line.split('\t').collect();
+          if !parts.is_empty() && !parts[0].is_empty() {
+            let opt = |idx: usize| -> Option<String> {
+              parts.get(idx).map(|s| s.trim()).filter(|s| !s.is_empty() && *s != "NA").map(|s| s.to_string())
+            };
+            let upload_date = opt(1);
+            let tags = opt(2).map(|s| clean_tags(&s)).filter(|s| !s.is_empty());
+            let _ = tx.send(VideoMeta { video_id: parts[0].trim().to_string(), upload_date, tags }).await;
+          }
+        }
+      }
+    })
+    .buffer_unordered(ENRICH_CONCURRENCY)
+    .collect::<()>()
+    .await;
+}
+
+/// Fetch a batch of videos from a channel URL using --flat-playlist for speed.
+/// Results will have titles and IDs but no date/tags (those come from enrichment).
+/// `start` is 1-indexed, `count` is how many to fetch.
+pub async fn list_channel_videos(channel_url: &str, start: usize, count: usize) -> Result<Vec<SearchEntry>> {
+  let end = start + count - 1;
+  let playlist_range = format!("{}:{}", start, end);
+
+  let output = Command::new("yt-dlp")
+    .args([
+      "--flat-playlist",
+      "--print",
+      "%(title)s\t%(id)s",
+      "--playlist-items",
+      &playlist_range,
+      "--no-warnings",
+      "--ignore-errors",
+      "--",
+      channel_url,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .output()
+    .await
+    .map_err(|e| {
+      if e.kind() == std::io::ErrorKind::NotFound {
+        anyhow!("yt-dlp not found. Install it with: brew install yt-dlp (macOS) or pip install yt-dlp")
+      } else {
+        anyhow!(e).context("Failed to execute yt-dlp channel listing")
+      }
+    })?;
+
+  if !output.status.success() {
+    return Err(anyhow!("yt-dlp channel listing failed: {}", String::from_utf8_lossy(&output.stderr)));
+  }
+
+  let stdout_str = String::from_utf8(output.stdout).context("yt-dlp output non-UTF8")?;
+  // flat-playlist only gives title + id, so entries will have enriched=false
+  Ok(parse_search_output(&stdout_str))
+}
+
+pub async fn search_youtube(query: &str) -> Result<Vec<SearchEntry>> {
   let output = Command::new("yt-dlp")
     .args([
       "--print",
-      "%(title)s\t%(id)s",
+      PRINT_FORMAT,
       "--default-search",
-      "ytsearch5:",
+      "ytsearch20:",
       "--no-playlist",
       "--skip-download",
       "--ignore-errors",
@@ -38,14 +224,7 @@ pub async fn search_youtube(query: &str) -> Result<Vec<(String, String)>> {
   }
 
   let stdout_str = String::from_utf8(output.stdout).context("yt-dlp output non-UTF8")?;
-  Ok(
-    stdout_str
-      .lines()
-      .map(str::trim)
-      .filter(|l| !l.is_empty())
-      .filter_map(|l| l.split_once('\t').map(|(t, id)| (t.to_string(), id.to_string())))
-      .collect(),
-  )
+  Ok(parse_search_output(&stdout_str))
 }
 
 pub async fn get_video_info(video_id: &str) -> Result<VideoDetails> {

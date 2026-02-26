@@ -15,13 +15,17 @@ use ratatui::{
   widgets::ListState,
 };
 use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 use display::{CliDisplayMode, DisplayMode};
 use graphics::{kitty_delete_all, kitty_render_image, sixel_render_image};
 use player::{MusicPlayer, VideoDetails};
 use theme::THEMES;
-use youtube::{fetch_thumbnail, get_video_info, search_youtube};
+use youtube::{
+  CHANNEL_INITIAL_SIZE, CHANNEL_PAGE_SIZE, SearchEntry, VideoMeta, detect_channel_url, enrich_video_metadata,
+  fetch_thumbnail, get_video_info, list_channel_videos, search_youtube,
+};
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -38,8 +42,21 @@ struct Args {
 
 // --- Types ---
 
-type SearchResult = Vec<(String, String)>;
+type SearchResult = Vec<SearchEntry>;
 type LoadResult = (String, VideoDetails, Option<DynamicImage>);
+
+/// Tracks the state of a channel listing for on-demand pagination.
+#[derive(Debug, Clone)]
+pub struct ChannelSource {
+  /// The canonical channel URL used with yt-dlp.
+  pub url: String,
+  /// How many videos have been fetched so far.
+  pub total_fetched: usize,
+  /// Whether there might be more videos to load.
+  pub has_more: bool,
+  /// Whether a background "load more" request is in flight.
+  pub loading_more: bool,
+}
 
 // --- Config ---
 
@@ -52,10 +69,10 @@ impl Config {
   pub fn load() -> Self {
     if let Some(proj_dirs) = ProjectDirs::from("", "", "yp") {
       let config_file = proj_dirs.config_dir().join("prefs.toml");
-      if let Ok(content) = std::fs::read_to_string(config_file) {
-        if let Ok(config) = toml::from_str(&content) {
-          return config;
-        }
+      if let Ok(content) = std::fs::read_to_string(config_file)
+        && let Ok(config) = toml::from_str(&content)
+      {
+        return config;
       }
     }
     Self::default()
@@ -87,7 +104,7 @@ pub struct App {
   pub cursor_position: usize,
   pub mode: AppMode,
   pub theme_index: usize,
-  pub search_results: Vec<(String, String)>,
+  pub search_results: Vec<SearchEntry>,
   pub list_state: ListState,
   pub player: MusicPlayer,
   pub last_error: Option<String>,
@@ -95,6 +112,10 @@ pub struct App {
   pub should_quit: bool,
   search_rx: Option<oneshot::Receiver<Result<SearchResult>>>,
   load_rx: Option<oneshot::Receiver<Result<LoadResult>>>,
+  more_rx: Option<oneshot::Receiver<Result<SearchResult>>>,
+  enrich_rx: Option<mpsc::Receiver<VideoMeta>>,
+  enrich_handle: Option<JoinHandle<()>>,
+  pub channel_source: Option<ChannelSource>,
   pub graphics_thumb_area: Option<Rect>,
   pub graphics_last_sent: Option<(String, Rect)>,
   pub cached_resized_thumb: Option<(String, u16, u16, DynamicImage)>,
@@ -107,9 +128,12 @@ impl App {
     let theme_index =
       if let Some(ref name) = config.theme_name { THEMES.iter().position(|t| t.name == name).unwrap_or(0) } else { 0 };
 
+    let default_input = "@ChrisH-v4e".to_string();
+    let default_cursor = default_input.chars().count();
+
     Self {
-      input: String::new(),
-      cursor_position: 0,
+      input: default_input,
+      cursor_position: default_cursor,
       mode: AppMode::Input,
       theme_index,
       search_results: Vec::new(),
@@ -120,6 +144,10 @@ impl App {
       should_quit: false,
       search_rx: None,
       load_rx: None,
+      more_rx: None,
+      enrich_rx: None,
+      enrich_handle: None,
+      channel_source: None,
       graphics_thumb_area: None,
       graphics_last_sent: None,
       cached_resized_thumb: None,
@@ -145,11 +173,23 @@ impl App {
           match result {
             Ok(results) if results.is_empty() => {
               self.last_error = Some("No results found.".to_string());
+              self.channel_source = None;
             }
             Ok(results) => {
+              let is_channel = self.channel_source.is_some();
+              if let Some(ref mut source) = self.channel_source {
+                source.total_fetched = results.len();
+                if results.len() < CHANNEL_INITIAL_SIZE {
+                  source.has_more = false;
+                }
+              }
               self.search_results = results;
               self.list_state.select(Some(0));
               self.mode = AppMode::Results;
+              // Kick off background enrichment for channel results
+              if is_channel {
+                self.trigger_enrich();
+              }
             }
             Err(e) => {
               self.last_error = Some(format!("Search failed: {:#}", e));
@@ -195,6 +235,59 @@ impl App {
       }
     }
 
+    // Check for background "load more" channel results
+    if let Some(mut rx) = self.more_rx.take() {
+      match rx.try_recv() {
+        Ok(result) => {
+          if let Some(ref mut source) = self.channel_source {
+            source.loading_more = false;
+          }
+          let mut should_enrich = false;
+          match result {
+            Ok(new_results) => {
+              if new_results.len() < CHANNEL_PAGE_SIZE
+                && let Some(ref mut source) = self.channel_source
+              {
+                source.has_more = false;
+              }
+              if let Some(ref mut source) = self.channel_source {
+                source.total_fetched += new_results.len();
+              }
+              if !new_results.is_empty() {
+                should_enrich = true;
+              }
+              self.search_results.extend(new_results);
+            }
+            Err(e) => {
+              self.last_error = Some(format!("Failed to load more: {:#}", e));
+            }
+          }
+          if should_enrich {
+            self.trigger_enrich();
+          }
+        }
+        Err(oneshot::error::TryRecvError::Empty) => {
+          self.more_rx = Some(rx);
+        }
+        Err(oneshot::error::TryRecvError::Closed) => {
+          if let Some(ref mut source) = self.channel_source {
+            source.loading_more = false;
+          }
+        }
+      }
+    }
+
+    // Drain enrichment results and apply to matching entries
+    if let Some(ref mut rx) = self.enrich_rx {
+      while let Ok(meta) = rx.try_recv() {
+        if let Some(entry) = self.search_results.iter_mut().find(|e| e.video_id == meta.video_id) {
+          entry.upload_date = meta.upload_date;
+          entry.tags = meta.tags;
+          entry.enriched = true;
+        }
+      }
+    }
+
     Ok(())
   }
 
@@ -205,21 +298,82 @@ impl App {
       return;
     }
     self.search_rx = None;
+    self.more_rx = None;
+    self.cancel_enrich();
     self.last_error = None;
-    self.status_message = Some(format!("Searching '{}'…", query));
+
+    if let Some(channel_url) = detect_channel_url(&query) {
+      // Channel listing mode
+      self.status_message = Some("Loading channel…".to_string());
+      self.channel_source =
+        Some(ChannelSource { url: channel_url.clone(), total_fetched: 0, has_more: true, loading_more: false });
+
+      let (tx, rx) = oneshot::channel();
+      tokio::spawn(async move {
+        let _ = tx.send(list_channel_videos(&channel_url, 1, CHANNEL_INITIAL_SIZE).await);
+      });
+      self.search_rx = Some(rx);
+    } else {
+      // Regular search mode
+      self.status_message = Some(format!("Searching '{}'…", query));
+      self.channel_source = None;
+
+      let (tx, rx) = oneshot::channel();
+      tokio::spawn(async move {
+        let _ = tx.send(search_youtube(&query).await);
+      });
+      self.search_rx = Some(rx);
+    }
+  }
+
+  /// Trigger a background fetch of the next page of channel videos.
+  fn trigger_load_more(&mut self) {
+    let Some(ref mut source) = self.channel_source else { return };
+    if !source.has_more || source.loading_more {
+      return;
+    }
+    source.loading_more = true;
+    let url = source.url.clone();
+    let start = source.total_fetched + 1;
 
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
-      let _ = tx.send(search_youtube(&query).await);
+      let _ = tx.send(list_channel_videos(&url, start, CHANNEL_PAGE_SIZE).await);
     });
-    self.search_rx = Some(rx);
+    self.more_rx = Some(rx);
+  }
+
+  /// Cancel any in-flight enrichment task.
+  fn cancel_enrich(&mut self) {
+    if let Some(handle) = self.enrich_handle.take() {
+      handle.abort();
+    }
+    self.enrich_rx = None;
+  }
+
+  /// Spawn background enrichment for all unenriched entries in `search_results`.
+  /// Existing enrichment tasks are cancelled first.
+  fn trigger_enrich(&mut self) {
+    self.cancel_enrich();
+
+    let ids: Vec<String> = self.search_results.iter().filter(|e| !e.enriched).map(|e| e.video_id.clone()).collect();
+    if ids.is_empty() {
+      return;
+    }
+
+    let (tx, rx) = mpsc::channel(64);
+    let handle = tokio::spawn(async move {
+      enrich_video_metadata(ids, tx).await;
+    });
+    self.enrich_rx = Some(rx);
+    self.enrich_handle = Some(handle);
   }
 
   fn trigger_load(&mut self) {
     let Some(selected) = self.list_state.selected() else { return };
-    let Some((_, video_id)) = self.search_results.get(selected) else { return };
+    let Some(entry) = self.search_results.get(selected) else { return };
 
-    let video_id = video_id.clone();
+    let video_id = entry.video_id.clone();
     let client = self.player.http_client.clone();
     self.last_error = None;
     self.status_message = Some("Loading…".to_string());
@@ -352,6 +506,10 @@ async fn handle_results_key(app: &mut App, key: event::KeyEvent) -> Result<()> {
       if count > 0 {
         let i = app.list_state.selected().map_or(0, |i| (i + 1) % count);
         app.list_state.select(Some(i));
+        // Trigger background load when within 5 items of the bottom
+        if i + 5 >= count {
+          app.trigger_load_more();
+        }
       }
     }
     KeyCode::Up | KeyCode::Char('k') => {
