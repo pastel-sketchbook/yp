@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::{Parser, ValueEnum};
+use color_quant::NeuQuant;
 use image::{DynamicImage, ImageFormat, imageops::FilterType};
 use ratatui::{
   DefaultTerminal, Frame,
@@ -31,7 +32,7 @@ use tokio::{
 #[derive(Parser, Debug)]
 #[command(author, version = env!("CARGO_PKG_VERSION"), about, long_about = None)]
 struct Args {
-  /// Display mode: 'auto', 'kitty', 'direct', or 'ascii' (default: auto-detect)
+  /// Display mode: 'auto', 'kitty', 'sixel', 'direct', or 'ascii' (default: auto-detect)
   #[arg(short, long, default_value = "auto")]
   display_mode: CliDisplayMode,
 }
@@ -40,6 +41,7 @@ struct Args {
 enum CliDisplayMode {
   Auto,
   Kitty,
+  Sixel,
   Direct,
   Ascii,
 }
@@ -48,14 +50,27 @@ enum CliDisplayMode {
 enum DisplayMode {
   Ascii,
   Direct,
+  Sixel,
   Kitty,
+}
+
+impl DisplayMode {
+  fn label(self) -> &'static str {
+    match self {
+      DisplayMode::Ascii => "ASCII",
+      DisplayMode::Direct => "Half-block",
+      DisplayMode::Sixel => "Sixel",
+      DisplayMode::Kitty => "Kitty",
+    }
+  }
 }
 
 /// Detect the best display mode the terminal supports.
 ///
-/// Probe order: Kitty graphics > true-color half-block > ASCII
+/// Probe order: Kitty graphics > Sixel > true-color half-block > ASCII
 ///
 /// - Kitty: `TERM=xterm-kitty`, or `TERM_PROGRAM` is kitty/WezTerm/ghostty
+/// - Sixel: `TERM_PROGRAM` is foot/mlterm, or `TERM` contains "sixel"
 /// - Direct: `COLORTERM` is `truecolor` or `24bit`
 /// - Ascii: fallback
 fn detect_display_mode() -> DisplayMode {
@@ -65,6 +80,11 @@ fn detect_display_mode() -> DisplayMode {
   // Terminals known to support the Kitty graphics protocol
   if term == "xterm-kitty" || matches!(term_program.as_str(), "kitty" | "wezterm" | "ghostty") {
     return DisplayMode::Kitty;
+  }
+
+  // Terminals known to support Sixel graphics
+  if matches!(term_program.as_str(), "foot" | "mlterm" | "contour") || term.contains("sixel") {
+    return DisplayMode::Sixel;
   }
 
   let colorterm = std::env::var("COLORTERM").unwrap_or_default().to_lowercase();
@@ -79,6 +99,7 @@ fn resolve_display_mode(cli: CliDisplayMode) -> DisplayMode {
   match cli {
     CliDisplayMode::Auto => detect_display_mode(),
     CliDisplayMode::Kitty => DisplayMode::Kitty,
+    CliDisplayMode::Sixel => DisplayMode::Sixel,
     CliDisplayMode::Direct => DisplayMode::Direct,
     CliDisplayMode::Ascii => DisplayMode::Ascii,
   }
@@ -319,10 +340,10 @@ struct App {
   should_quit: bool,
   search_rx: Option<oneshot::Receiver<Result<SearchResult>>>,
   load_rx: Option<oneshot::Receiver<Result<LoadResult>>>,
-  /// Set during rendering so the main loop can draw the Kitty image after ratatui's draw pass.
-  kitty_thumb_area: Option<Rect>,
-  /// Track last Kitty image sent: (video_id, area) — skip re-send when unchanged.
-  kitty_last_sent: Option<(String, Rect)>,
+  /// Set during rendering so the main loop can draw the Kitty/Sixel image after ratatui's draw pass.
+  graphics_thumb_area: Option<Rect>,
+  /// Track last Kitty/Sixel image sent: (video_id, area) — skip re-send when unchanged.
+  graphics_last_sent: Option<(String, Rect)>,
 }
 
 impl App {
@@ -340,8 +361,8 @@ impl App {
       should_quit: false,
       search_rx: None,
       load_rx: None,
-      kitty_thumb_area: None,
-      kitty_last_sent: None,
+      graphics_thumb_area: None,
+      graphics_last_sent: None,
     }
   }
 
@@ -561,13 +582,9 @@ impl MusicPlayer {
     let Some(ref socket_path) = self.ipc_socket_path else {
       return Ok(());
     };
-    let stream = tokio::net::UnixStream::connect(socket_path)
-      .await
-      .context("Failed to connect to mpv IPC socket")?;
+    let stream = tokio::net::UnixStream::connect(socket_path).await.context("Failed to connect to mpv IPC socket")?;
     stream.writable().await.context("mpv IPC socket not writable")?;
-    stream
-      .try_write(b"{\"command\":[\"cycle\",\"pause\"]}\n")
-      .context("Failed to send pause command to mpv")?;
+    stream.try_write(b"{\"command\":[\"cycle\",\"pause\"]}\n").context("Failed to send pause command to mpv")?;
     self.paused = !self.paused;
     Ok(())
   }
@@ -724,9 +741,8 @@ impl Widget for ThumbnailWidget<'_> {
     match self.display_mode {
       DisplayMode::Direct => render_direct(self.image, area, buf),
       DisplayMode::Ascii => render_ascii(self.image, area, buf),
-      // Kitty mode: clear the area so ratatui doesn't draw over the image.
-      // The actual image is sent via escape sequences after the draw pass.
-      DisplayMode::Kitty => {}
+      // Kitty and Sixel: image is sent via escape sequences after the draw pass.
+      DisplayMode::Kitty | DisplayMode::Sixel => {}
     }
   }
 }
@@ -752,7 +768,12 @@ fn render_direct(image: &DynamicImage, area: Rect, buf: &mut Buffer) {
       } else {
         Color::Reset
       };
-      buf.set_string(area.x + offset_x as u16 + x as u16, area.y + offset_y as u16 + y as u16, "▀", Style::default().fg(fg).bg(bg));
+      buf.set_string(
+        area.x + offset_x as u16 + x as u16,
+        area.y + offset_y as u16 + y as u16,
+        "▀",
+        Style::default().fg(fg).bg(bg),
+      );
     }
   }
 }
@@ -771,7 +792,12 @@ fn render_ascii(image: &DynamicImage, area: Rect, buf: &mut Buffer) {
       let pixel = resized.get_pixel(x, y)[0];
       let idx = ((pixel as f32 / 255.0) * (ASCII_CHARS.len() - 1) as f32).round() as usize;
       let idx = idx.min(ASCII_CHARS.len() - 1);
-      buf.set_string(area.x + offset_x as u16 + x as u16, area.y + offset_y as u16 + y as u16, ASCII_CHARS[idx], Style::default());
+      buf.set_string(
+        area.x + offset_x as u16 + x as u16,
+        area.y + offset_y as u16 + y as u16,
+        ASCII_CHARS[idx],
+        Style::default(),
+      );
     }
   }
 }
@@ -838,11 +864,134 @@ fn kitty_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
   Ok(())
 }
 
+// --- Sixel Graphics Protocol ---
+//
+// Sixel encodes images at pixel resolution directly in the terminal stream.
+// Each sixel "row" represents 6 vertical pixels. Colors are defined via
+// registers and then pixels are emitted as characters in the range 0x3F–0x7E.
+//
+// Sequence:
+//   DCS q <data> ST
+//   DCS = \x1BP,  ST = \x1B\\
+//
+// Color register:  #<n>;2;<r%>;<g%>;<b%>
+// Sixel data char: offset 0x3F (63) + 6-bit bitmap of which of 6 rows are "on"
+// $  = carriage return (rewind to start of current sixel row)
+// -  = newline (advance to next sixel row)
+//
+// Color quantization uses NeuQuant (neural-network-based, via `color_quant` crate).
+
+const SIXEL_MAX_COLORS: usize = 256;
+
+/// Render an image at `area` using the Sixel graphics protocol.
+fn sixel_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
+  if area.is_empty() {
+    return Ok(());
+  }
+
+  // Estimate pixel dimensions from cell area.
+  // Typical cell is ~8px wide, ~16px tall.
+  let pixel_w = area.width as u32 * 8;
+  let pixel_h = area.height as u32 * 16;
+  let resized = image.resize(pixel_w, pixel_h, FilterType::Lanczos3).into_rgb8();
+  let (w, h) = (resized.width() as usize, resized.height() as usize);
+
+  // Quantize colors using NeuQuant (sample_factor=1 = best quality, 10 = fast)
+  let rgba_pixels: Vec<u8> = resized.pixels().flat_map(|p| [p[0], p[1], p[2], 255]).collect();
+  let nq = NeuQuant::new(3, SIXEL_MAX_COLORS, &rgba_pixels);
+  let palette: Vec<[u8; 3]> = (0..SIXEL_MAX_COLORS).map(|i| {
+    nq.color_map_rgb()[i * 3..i * 3 + 3].try_into().unwrap_or([0, 0, 0])
+  }).collect();
+
+  // Map each pixel to nearest palette index
+  let indices: Vec<u8> = resized
+    .pixels()
+    .map(|p| nq.index_of(&[p[0], p[1], p[2], 255]) as u8)
+    .collect();
+
+  // --- Build sixel stream ---
+  let mut out = String::with_capacity(w * h);
+
+  // DCS q - enter sixel mode
+  out.push_str("\x1BPq");
+
+  // Set raster attributes: "aspect;aspect;width;height
+  out.push_str(&format!("\"1;1;{};{}", w, h));
+
+  // Define color registers
+  for (i, c) in palette.iter().enumerate() {
+    let r_pct = (c[0] as u32 * 100) / 255;
+    let g_pct = (c[1] as u32 * 100) / 255;
+    let b_pct = (c[2] as u32 * 100) / 255;
+    out.push_str(&format!("#{};2;{};{};{}", i, r_pct, g_pct, b_pct));
+  }
+
+  // Emit sixel rows (6 pixel-rows each)
+  let sixel_rows = h.div_ceil(6);
+  for sr in 0..sixel_rows {
+    let y_base = sr * 6;
+
+    for (color_idx, _) in palette.iter().enumerate() {
+      let color_idx_u8 = color_idx as u8;
+      let mut has_pixels = false;
+      let mut row_data = Vec::with_capacity(w);
+
+      for x in 0..w {
+        let mut sixel_val: u8 = 0;
+        for bit in 0..6 {
+          let y = y_base + bit;
+          if y < h && indices[y * w + x] == color_idx_u8 {
+            sixel_val |= 1 << bit;
+            has_pixels = true;
+          }
+        }
+        row_data.push(sixel_val);
+      }
+
+      if !has_pixels {
+        continue;
+      }
+
+      out.push_str(&format!("#{}", color_idx));
+
+      // RLE-encode the sixel data
+      let mut i = 0;
+      while i < row_data.len() {
+        let val = row_data[i];
+        let ch = (val + 0x3F) as char;
+        let mut run = 1usize;
+        while i + run < row_data.len() && row_data[i + run] == val {
+          run += 1;
+        }
+        if run > 3 {
+          out.push_str(&format!("!{}{}", run, ch));
+        } else {
+          for _ in 0..run {
+            out.push(ch);
+          }
+        }
+        i += run;
+      }
+      out.push('$'); // carriage return within sixel row
+    }
+    out.push('-'); // newline to next sixel row
+  }
+
+  // ST - leave sixel mode
+  out.push_str("\x1B\\");
+
+  // Position cursor at target cell, then emit the sixel data
+  let mut stdout = std::io::stdout();
+  write!(stdout, "\x1B[{};{}H{}", area.y + 1, area.x + 1, out)?;
+  stdout.flush().context("Failed to flush sixel image")?;
+  Ok(())
+}
+
 // --- UI Rendering ---
 
 fn ui(frame: &mut Frame, app: &mut App) {
   let theme = app.theme();
-  app.kitty_thumb_area = None;
+  app.graphics_thumb_area = None;
 
   frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), frame.area());
 
@@ -903,14 +1052,21 @@ fn render_welcome(frame: &mut Frame, theme: &Theme, area: Rect) {
 fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
   let theme = app.theme();
   let [thumb_area, info_area] =
-    Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)]).areas(area);
+    Layout::horizontal([Constraint::Percentage(75), Constraint::Percentage(25)]).areas(area);
+
+  // Add 1-line vertical padding to the thumbnail area for breathing room.
+  let thumb_area = Rect {
+    y: thumb_area.y + 1,
+    height: thumb_area.height.saturating_sub(2),
+    ..thumb_area
+  };
 
   if let Some((_, ref image)) = app.player.cached_thumbnail {
     let widget = ThumbnailWidget { image, display_mode: app.player.display_mode };
     frame.render_widget(widget, thumb_area);
 
-    if app.player.display_mode == DisplayMode::Kitty {
-      app.kitty_thumb_area = Some(thumb_area);
+    if matches!(app.player.display_mode, DisplayMode::Kitty | DisplayMode::Sixel) {
+      app.graphics_thumb_area = Some(thumb_area);
     }
   }
 
@@ -946,31 +1102,19 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
         Span::styled(duration.as_str(), Style::default().fg(theme.fg)),
       ]));
     }
+    lines.push(Line::from(vec![
+      Span::styled("Display   ", Style::default().fg(theme.muted)),
+      Span::styled(app.player.display_mode.label(), Style::default().fg(theme.fg)),
+    ]));
     lines.push(Line::from(""));
-    // URL placeholder — will be overwritten with OSC 8 hyperlink below.
     let url_display = truncate_str(&details.url, inner_w);
     lines.push(Line::from(Span::styled(
-      url_display.clone(),
+      url_display,
       Style::default().fg(theme.accent).add_modifier(Modifier::UNDERLINED),
     )));
 
-    let url_line_index = lines.len() - 1;
     let paragraph = Paragraph::new(lines).block(info_block);
     frame.render_widget(paragraph, info_area);
-
-    // Overwrite URL cells with OSC 8 hyperlink escape sequences so the URL is clickable.
-    let content_y = info_area.y + 1 + url_line_index as u16;
-    let content_x = info_area.x + 1;
-    if content_y < info_area.y + info_area.height.saturating_sub(1) {
-      let url = &details.url;
-      for (i, ch) in url_display.chars().enumerate() {
-        let hyperlink = format!("\x1B]8;;{}\x07{}\x1B]8;;\x07", url, ch);
-        let cell = &mut frame.buffer_mut()[(content_x + i as u16, content_y)];
-        cell.set_symbol(&hyperlink);
-        cell.set_fg(theme.accent);
-        cell.set_style(Style::default().fg(theme.accent).add_modifier(Modifier::UNDERLINED));
-      }
-    }
   } else {
     frame.render_widget(info_block, info_area);
   }
@@ -1118,7 +1262,7 @@ async fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()> {
   if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
     if app.player.is_playing() {
       app.player.stop().await.context("Failed to stop playback")?;
-      app.kitty_last_sent = None;
+      app.graphics_last_sent = None;
     }
     return Ok(());
   }
@@ -1232,7 +1376,7 @@ async fn main() -> Result<()> {
 async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
   let display_mode = resolve_display_mode(args.display_mode);
   let mut app = App::new(display_mode);
-  let is_kitty = display_mode == DisplayMode::Kitty;
+  let uses_graphics_protocol = matches!(display_mode, DisplayMode::Kitty | DisplayMode::Sixel);
 
   loop {
     app.check_pending().await?;
@@ -1240,22 +1384,30 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
 
     terminal.draw(|frame| ui(frame, &mut app))?;
 
-    // Kitty graphics: send image after ratatui's draw pass so it isn't overwritten.
+    // Kitty/Sixel graphics: send image after ratatui's draw pass so it isn't overwritten.
     // Only re-send when the image (video_id) or target area changes.
-    if is_kitty {
-      if let Some(area) = app.kitty_thumb_area {
+    if uses_graphics_protocol {
+      if let Some(area) = app.graphics_thumb_area {
         if let Some((ref video_id, ref image)) = app.player.cached_thumbnail {
           let key = (video_id.clone(), area);
-          if app.kitty_last_sent.as_ref() != Some(&key) {
-            kitty_delete_all()?;
-            kitty_render_image(image, area)?;
-            app.kitty_last_sent = Some(key);
+          if app.graphics_last_sent.as_ref() != Some(&key) {
+            if display_mode == DisplayMode::Kitty {
+              kitty_delete_all()?;
+            }
+            match display_mode {
+              DisplayMode::Kitty => kitty_render_image(image, area)?,
+              DisplayMode::Sixel => sixel_render_image(image, area)?,
+              _ => {}
+            }
+            app.graphics_last_sent = Some(key);
           }
         }
-      } else if app.kitty_last_sent.is_some() {
-        // No thumbnail visible this frame — clear any lingering Kitty images.
-        kitty_delete_all()?;
-        app.kitty_last_sent = None;
+      } else if app.graphics_last_sent.is_some() {
+        // No thumbnail visible this frame — clear any lingering images.
+        if display_mode == DisplayMode::Kitty {
+          kitty_delete_all()?;
+        }
+        app.graphics_last_sent = None;
       }
     }
 
@@ -1273,7 +1425,7 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
     }
   }
 
-  if is_kitty {
+  if display_mode == DisplayMode::Kitty {
     kitty_delete_all()?;
   }
   app.player.stop().await?;

@@ -3905,6 +3905,7 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
+ "color_quant",
  "image",
  "ratatui",
  "reqwest",
