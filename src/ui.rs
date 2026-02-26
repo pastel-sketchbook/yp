@@ -138,10 +138,11 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
   let info_block = Block::bordered()
     .title(info_title)
     .border_type(ratatui::widgets::BorderType::Rounded)
-    .border_style(Style::default().fg(theme.border));
+    .border_style(Style::default().fg(theme.border))
+    .padding(Padding::horizontal(1));
 
   if let Some(details) = &app.player.current_details {
-    let inner_w = info_area.width.saturating_sub(2) as usize;
+    let inner_w = info_area.width.saturating_sub(4) as usize;
 
     let mut lines = vec![
       Line::from(""),
