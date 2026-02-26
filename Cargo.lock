@@ -3911,6 +3911,7 @@ dependencies = [
  "reqwest",
  "serde",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]

@@ -714,6 +714,17 @@ async fn fetch_thumbnail(client: &Client, video_id: &str) -> Result<DynamicImage
 
 // --- Helpers ---
 
+/// Convert a char index to a byte offset within the string.
+fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
+  s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
+}
+
+/// Compute the display width of the first `n` chars (accounting for double-width CJK).
+fn display_width(s: &str, n: usize) -> usize {
+  use unicode_width::UnicodeWidthChar;
+  s.chars().take(n).map(|c| c.width().unwrap_or(0)).sum()
+}
+
 /// Truncate a string to `max_width` characters, appending "…" if truncated.
 fn truncate_str(s: &str, max_width: usize) -> String {
   if s.chars().count() <= max_width {
@@ -899,15 +910,11 @@ fn sixel_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
   // Quantize colors using NeuQuant (sample_factor=1 = best quality, 10 = fast)
   let rgba_pixels: Vec<u8> = resized.pixels().flat_map(|p| [p[0], p[1], p[2], 255]).collect();
   let nq = NeuQuant::new(3, SIXEL_MAX_COLORS, &rgba_pixels);
-  let palette: Vec<[u8; 3]> = (0..SIXEL_MAX_COLORS).map(|i| {
-    nq.color_map_rgb()[i * 3..i * 3 + 3].try_into().unwrap_or([0, 0, 0])
-  }).collect();
+  let palette: Vec<[u8; 3]> =
+    (0..SIXEL_MAX_COLORS).map(|i| nq.color_map_rgb()[i * 3..i * 3 + 3].try_into().unwrap_or([0, 0, 0])).collect();
 
   // Map each pixel to nearest palette index
-  let indices: Vec<u8> = resized
-    .pixels()
-    .map(|p| nq.index_of(&[p[0], p[1], p[2], 255]) as u8)
-    .collect();
+  let indices: Vec<u8> = resized.pixels().map(|p| nq.index_of(&[p[0], p[1], p[2], 255]) as u8).collect();
 
   // --- Build sixel stream ---
   let mut out = String::with_capacity(w * h);
@@ -1055,11 +1062,7 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
     Layout::horizontal([Constraint::Percentage(75), Constraint::Percentage(25)]).areas(area);
 
   // Add 1-line vertical padding to the thumbnail area for breathing room.
-  let thumb_area = Rect {
-    y: thumb_area.y + 1,
-    height: thumb_area.height.saturating_sub(2),
-    ..thumb_area
-  };
+  let thumb_area = Rect { y: thumb_area.y + 1, height: thumb_area.height.saturating_sub(2), ..thumb_area };
 
   if let Some((_, ref image)) = app.player.cached_thumbnail {
     let widget = ThumbnailWidget { image, display_mode: app.player.display_mode };
@@ -1070,9 +1073,12 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
     }
   }
 
+  let info_title = Line::from(vec![
+    Span::styled(" Now Playing ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+    Span::styled(format!("[{}] ", app.player.display_mode.label().to_lowercase()), Style::default().fg(theme.muted)),
+  ]);
   let info_block = Block::bordered()
-    .title(" Now Playing ")
-    .title_style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
+    .title(info_title)
     .border_type(ratatui::widgets::BorderType::Rounded)
     .border_style(Style::default().fg(theme.border));
 
@@ -1102,10 +1108,6 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
         Span::styled(duration.as_str(), Style::default().fg(theme.fg)),
       ]));
     }
-    lines.push(Line::from(vec![
-      Span::styled("Display   ", Style::default().fg(theme.muted)),
-      Span::styled(app.player.display_mode.label(), Style::default().fg(theme.fg)),
-    ]));
     lines.push(Line::from(""));
     let url_display = truncate_str(&details.url, inner_w);
     lines.push(Line::from(Span::styled(
@@ -1184,7 +1186,7 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect) {
   frame.render_widget(paragraph, area);
 
   if app.mode == AppMode::Input {
-    frame.set_cursor_position((area.x + app.cursor_position as u16 + 2, area.y + 1));
+    frame.set_cursor_position((area.x + display_width(&app.input, app.cursor_position) as u16 + 2, area.y + 1));
   }
 }
 
@@ -1281,25 +1283,28 @@ fn handle_input_key(app: &mut App, key: event::KeyEvent) {
       app.trigger_search();
     }
     KeyCode::Char(c) => {
-      app.input.insert(app.cursor_position, c);
+      let byte_idx = char_to_byte_index(&app.input, app.cursor_position);
+      app.input.insert(byte_idx, c);
       app.cursor_position += 1;
     }
     KeyCode::Backspace => {
       if app.cursor_position > 0 {
         app.cursor_position -= 1;
-        app.input.remove(app.cursor_position);
+        let byte_idx = char_to_byte_index(&app.input, app.cursor_position);
+        app.input.remove(byte_idx);
       }
     }
     KeyCode::Delete => {
-      if app.cursor_position < app.input.len() {
-        app.input.remove(app.cursor_position);
+      if app.cursor_position < app.input.chars().count() {
+        let byte_idx = char_to_byte_index(&app.input, app.cursor_position);
+        app.input.remove(byte_idx);
       }
     }
     KeyCode::Left => {
       app.cursor_position = app.cursor_position.saturating_sub(1);
     }
     KeyCode::Right => {
-      if app.cursor_position < app.input.len() {
+      if app.cursor_position < app.input.chars().count() {
         app.cursor_position += 1;
       }
     }
@@ -1307,7 +1312,7 @@ fn handle_input_key(app: &mut App, key: event::KeyEvent) {
       app.cursor_position = 0;
     }
     KeyCode::End => {
-      app.cursor_position = app.input.len();
+      app.cursor_position = app.input.chars().count();
     }
     KeyCode::Esc => {
       if !app.input.is_empty() {
