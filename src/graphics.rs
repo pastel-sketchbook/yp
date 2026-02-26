@@ -115,10 +115,12 @@ pub fn kitty_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
     return Ok(());
   }
 
-  let resized = image.resize_to_fill(area.width as u32, (area.height * 2) as u32, FilterType::Lanczos3);
-
+  // Encode the full-resolution image as PNG. The Kitty protocol's c/r
+  // parameters tell the terminal how many columns/rows to scale into,
+  // so sending the original avoids lossy double-resize and produces
+  // the sharpest result at the terminal's native pixel density.
   let mut png_buf = Vec::new();
-  resized
+  image
     .write_to(&mut Cursor::new(&mut png_buf), ImageFormat::Png)
     .context("Failed to encode thumbnail as PNG for kitty")?;
 
