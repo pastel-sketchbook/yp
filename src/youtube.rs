@@ -76,11 +76,11 @@ impl SpriteFrameSource {
 
   /// Compute a global frame index for the given playback time.
   pub fn frame_index_at(&self, time_secs: f64) -> usize {
-    if self.sheets.is_empty() || time_secs < 0.0 {
+    let fps = self.frames_per_sheet() as usize;
+    if self.sheets.is_empty() || fps == 0 || time_secs < 0.0 {
       return 0;
     }
     let interval = self.frame_interval();
-    let fps = self.frames_per_sheet() as usize;
     let mut elapsed = 0.0;
     let mut global_offset = 0usize;
 
@@ -98,11 +98,11 @@ impl SpriteFrameSource {
 
   /// Extract the frame image at the given playback time.
   pub fn frame_at(&self, time_secs: f64) -> Option<DynamicImage> {
-    if self.sheets.is_empty() || time_secs < 0.0 {
+    let fps = self.frames_per_sheet();
+    if self.sheets.is_empty() || fps == 0 || time_secs < 0.0 {
       return None;
     }
     let interval = self.frame_interval();
-    let fps = self.frames_per_sheet();
     let mut elapsed = 0.0;
 
     for (i, sheet) in self.sheets.iter().enumerate() {
@@ -490,6 +490,9 @@ pub async fn enrich_video_metadata(video_ids: Vec<String>, tx: mpsc::Sender<Vide
 /// Results will have titles and IDs but no date/tags (those come from enrichment).
 /// `start` is 1-indexed, `count` is how many to fetch.
 pub async fn list_channel_videos(channel_url: &str, start: usize, count: usize) -> Result<Vec<SearchEntry>> {
+  if count == 0 {
+    return Ok(Vec::new());
+  }
   let end = start + count - 1;
   let playlist_range = format!("{}:{}", start, end);
 
@@ -580,14 +583,7 @@ pub async fn get_video_info(video_id: &str) -> Result<VideoDetails> {
       .unwrap_or_default();
     Ok(VideoDetails { url, title, uploader, duration, upload_date, tags })
   } else {
-    Ok(VideoDetails {
-      url,
-      title: video_id.to_string(),
-      uploader: None,
-      duration: None,
-      upload_date: None,
-      tags: Vec::new(),
-    })
+    Err(anyhow!("yt-dlp failed to get video info: {}", String::from_utf8_lossy(&output.stderr).trim()))
   }
 }
 

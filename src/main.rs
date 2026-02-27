@@ -630,14 +630,22 @@ async fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()> {
       let cmd = "open";
       #[cfg(not(target_os = "macos"))]
       let cmd = "xdg-open";
-      if let Err(e) = std::process::Command::new(cmd)
+      match std::process::Command::new(cmd)
         .arg(&url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
       {
-        app.last_error = Some(format!("Failed to open browser: {}", e));
+        Ok(mut child) => {
+          // Reap the child in a background thread to avoid zombie processes.
+          std::thread::spawn(move || {
+            let _ = child.wait();
+          });
+        }
+        Err(e) => {
+          app.last_error = Some(format!("Failed to open browser: {}", e));
+        }
       }
     }
     return Ok(());
@@ -790,7 +798,7 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
       }
     }
 
-    terminal.draw(|frame| ui::ui(frame, &mut app))?;
+    terminal.draw(|frame| ui::ui(frame, &mut app)).context("Failed to draw terminal frame")?;
 
     if uses_graphics_protocol {
       // Wrap graphics protocol output in synchronized update markers so the
@@ -798,8 +806,8 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
       // frame, preventing visible gaps between cell clear and image render.
       use std::io::Write;
       let mut stdout = std::io::stdout();
-      let _ = write!(stdout, "\x1B[?2026h"); // BeginSynchronizedUpdate
-      let _ = stdout.flush();
+      write!(stdout, "\x1B[?2026h").context("Failed to write BeginSynchronizedUpdate")?;
+      stdout.flush().context("Failed to flush BeginSynchronizedUpdate")?;
 
       if let Some(area) = app.gfx.thumb_area {
         if let Some((ref video_id, ref image)) = app.player.cached_thumbnail {
@@ -822,12 +830,12 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
         app.gfx.last_sent = None;
       }
 
-      let _ = write!(stdout, "\x1B[?2026l"); // EndSynchronizedUpdate
-      let _ = stdout.flush();
+      write!(stdout, "\x1B[?2026l").context("Failed to write EndSynchronizedUpdate")?;
+      stdout.flush().context("Failed to flush EndSynchronizedUpdate")?;
     }
 
-    if event::poll(Duration::from_millis(100))? {
-      match event::read()? {
+    if event::poll(Duration::from_millis(100)).context("Failed to poll for terminal events")? {
+      match event::read().context("Failed to read terminal event")? {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
           handle_key_event(&mut app, key).await?;
         }
@@ -841,9 +849,9 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
   }
 
   if display_mode == DisplayMode::Kitty {
-    kitty_delete_all()?;
+    kitty_delete_all().context("Failed to clean up Kitty graphics on exit")?;
   }
-  app.player.stop().await?;
+  app.player.stop().await.context("Failed to stop player on exit")?;
   Ok(())
 }
 

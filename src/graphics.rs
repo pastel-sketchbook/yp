@@ -55,8 +55,8 @@ fn render_direct(image: &DynamicImage, area: Rect, buf: &mut Buffer) {
         Color::Reset
       };
       buf.set_string(
-        area.x + offset_x as u16 + x as u16,
-        area.y + offset_y as u16 + y as u16,
+        area.x.saturating_add(offset_x as u16).saturating_add(x as u16),
+        area.y.saturating_add(offset_y as u16).saturating_add(y as u16),
         "▀",
         Style::default().fg(fg).bg(bg),
       );
@@ -78,8 +78,8 @@ fn render_ascii(image: &DynamicImage, area: Rect, buf: &mut Buffer) {
       let idx = ((pixel as f32 / 255.0) * (ASCII_CHARS.len() - 1) as f32).round() as usize;
       let idx = idx.min(ASCII_CHARS.len() - 1);
       buf.set_string(
-        area.x + offset_x as u16 + x as u16,
-        area.y + offset_y as u16 + y as u16,
+        area.x.saturating_add(offset_x as u16).saturating_add(x as u16),
+        area.y.saturating_add(offset_y as u16).saturating_add(y as u16),
         ASCII_CHARS[idx],
         Style::default(),
       );
@@ -143,16 +143,17 @@ pub fn kitty_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
 
   let mut stdout = std::io::stdout();
 
-  write!(stdout, "\x1B[{};{}H", area.y + 1, area.x + 1)?;
+  write!(stdout, "\x1B[{};{}H", area.y + 1, area.x + 1).context("Failed to position cursor for kitty image")?;
 
   for (i, chunk) in chunks.iter().enumerate() {
     let data = std::str::from_utf8(chunk).context("base64 chunk was not valid UTF-8")?;
     let more = if i < last { 1 } else { 0 };
 
     if i == 0 {
-      write!(stdout, "\x1B_Ga=T,f=100,t=d,i=1,p=1,c={},r={},q=2,m={};{}\x1B\\", area.width, area.height, more, data)?;
+      write!(stdout, "\x1B_Ga=T,f=100,t=d,i=1,p=1,c={},r={},q=2,m={};{}\x1B\\", area.width, area.height, more, data)
+        .context("Failed to write kitty image header chunk")?;
     } else {
-      write!(stdout, "\x1B_Gm={};{}\x1B\\", more, data)?;
+      write!(stdout, "\x1B_Gm={};{}\x1B\\", more, data).context("Failed to write kitty image continuation chunk")?;
     }
   }
 
@@ -192,8 +193,13 @@ pub fn sixel_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
 
   let rgba_pixels: Vec<u8> = resized.pixels().flat_map(|p| [p[0], p[1], p[2], 255]).collect();
   let nq = NeuQuant::new(3, SIXEL_MAX_COLORS, &rgba_pixels);
-  let palette: Vec<[u8; 3]> =
-    (0..SIXEL_MAX_COLORS).map(|i| nq.color_map_rgb()[i * 3..i * 3 + 3].try_into().unwrap_or([0, 0, 0])).collect();
+  let color_map = nq.color_map_rgb();
+  let palette: Vec<[u8; 3]> = (0..SIXEL_MAX_COLORS)
+    .map(|i| {
+      let start = i * 3;
+      color_map.get(start..start + 3).and_then(|s| s.try_into().ok()).unwrap_or([0, 0, 0])
+    })
+    .collect();
 
   let indices: Vec<u8> = resized.pixels().map(|p| nq.index_of(&[p[0], p[1], p[2], 255]) as u8).collect();
 

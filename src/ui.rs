@@ -80,7 +80,7 @@ fn render_welcome(frame: &mut Frame, theme: &Theme, area: Rect) {
     Line::from(""),
     Line::from(Span::styled("▶  Welcome to yp", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))),
     Line::from(""),
-    Line::from(Span::styled("Search YouTube. Play audio. In the terminal.", Style::default().fg(theme.fg))),
+    Line::from(Span::styled("Search YouTube. Play audio/video. In the terminal.", Style::default().fg(theme.fg))),
     Line::from(""),
     Line::from(Span::styled("Type a query below and press Enter.", Style::default().fg(theme.muted))),
   ];

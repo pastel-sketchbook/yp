@@ -86,7 +86,9 @@ impl MusicPlayer {
     ]);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    // Send stderr to null — if piped but never drained, the pipe buffer
+    // fills and mpv blocks.
+    cmd.stderr(Stdio::null());
 
     let mut child = cmd.spawn().map_err(|e| {
       if e.kind() == std::io::ErrorKind::NotFound {
@@ -122,7 +124,11 @@ impl MusicPlayer {
     };
     let stream = tokio::net::UnixStream::connect(socket_path).await.context("Failed to connect to mpv IPC socket")?;
     stream.writable().await.context("mpv IPC socket not writable")?;
-    stream.try_write(b"{\"command\":[\"cycle\",\"pause\"]}\n").context("Failed to send pause command to mpv")?;
+    let cmd = b"{\"command\":[\"cycle\",\"pause\"]}\n";
+    let written = stream.try_write(cmd).context("Failed to send pause command to mpv")?;
+    if written < cmd.len() {
+      return Err(anyhow!("Partial write to mpv IPC socket: wrote {} of {} bytes", written, cmd.len()));
+    }
     self.paused = !self.paused;
     Ok(())
   }
