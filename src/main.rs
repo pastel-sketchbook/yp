@@ -17,6 +17,7 @@ use ratatui::{
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tracing::{debug, error, info};
 
 use display::{CliDisplayMode, DisplayMode};
 use graphics::{kitty_delete_all, kitty_delete_placement, kitty_render_image, sixel_render_image};
@@ -407,6 +408,7 @@ impl App {
   /// Start recording audio via sox `rec` with auto-silence detection.
   fn voice_start_recording(&mut self) {
     let wav_path = std::env::temp_dir().join(format!("yp-voice-{}.wav", std::process::id()));
+    info!(path = %wav_path.display(), "voice: start recording");
     // Remove stale file from previous recording
     let _ = std::fs::remove_file(&wav_path);
 
@@ -438,11 +440,13 @@ impl App {
 
     match child {
       Ok(child) => {
+        debug!(pid = child.id(), "voice: sox spawned");
         self.voice = VoiceState::Recording { child, wav_path, started: Instant::now() };
         self.status_message = Some("Recording…".to_string());
         self.last_error = None;
       }
       Err(e) => {
+        error!(err = %e, "voice: failed to spawn sox");
         if e.kind() == std::io::ErrorKind::NotFound {
           self.last_error = Some("sox not found. Install with: brew install sox".to_string());
         } else {
@@ -456,19 +460,32 @@ impl App {
   /// Sends SIGTERM so sox can finalize the WAV header; falls back to SIGKILL after timeout.
   async fn voice_stop_recording(&mut self) {
     let state = std::mem::replace(&mut self.voice, VoiceState::Idle);
-    if let VoiceState::Recording { mut child, wav_path, .. } = state {
+    if let VoiceState::Recording { mut child, wav_path, started } = state {
+      let elapsed = started.elapsed();
+      info!(elapsed_ms = elapsed.as_millis() as u64, path = %wav_path.display(), "voice: stop recording");
       // Send SIGTERM to let sox finalize the WAV file header.
       // SIGKILL would corrupt the header, causing whisper to read garbage.
       if let Some(pid) = child.id() {
+        debug!(pid, "voice: sending SIGTERM to sox");
         let _ = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status();
       }
       // Wait up to 2 seconds for graceful exit, then force kill.
       match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
-        Ok(_) => {}
+        Ok(Ok(status)) => {
+          debug!(code = ?status.code(), "voice: sox exited gracefully");
+        }
+        Ok(Err(e)) => {
+          error!(err = %e, "voice: sox wait error");
+        }
         Err(_) => {
+          error!("voice: sox did not exit in 2s, sending SIGKILL");
           let _ = child.kill().await;
           let _ = child.wait().await;
         }
+      }
+      // Log WAV file size for debugging
+      if let Ok(meta) = std::fs::metadata(&wav_path) {
+        debug!(size_bytes = meta.len(), "voice: WAV file written");
       }
       self.voice_ensure_model_then_transcribe(wav_path);
     }
@@ -478,8 +495,10 @@ impl App {
   fn voice_ensure_model_then_transcribe(&mut self, wav_path: std::path::PathBuf) {
     let model_path = whisper_model_path();
     if model_path.exists() {
+      debug!(model = %model_path.display(), "voice: model exists, starting transcription");
       self.voice_start_transcription(wav_path);
     } else {
+      info!(model = %model_path.display(), "voice: model not found, starting download");
       self.voice_download_model(wav_path);
     }
   }
@@ -488,9 +507,15 @@ impl App {
   fn voice_download_model(&mut self, wav_path: std::path::PathBuf) {
     let (tx, rx) = mpsc::unbounded_channel();
     let model_path = whisper_model_path();
+    info!(model = %model_path.display(), "voice: starting model download");
 
     tokio::spawn(async move {
       let result = download_whisper_model(&model_path, &tx).await;
+      if let Err(ref e) = result {
+        error!(err = %e, "voice: model download failed");
+      } else {
+        info!("voice: model download complete");
+      }
       // Send completion event — if receiver is dropped (user cancelled), that's fine.
       let _ = tx.send(DownloadEvent::Complete(result));
     });
@@ -501,6 +526,7 @@ impl App {
 
   /// Spawn whisper-cli to transcribe the WAV file.
   fn voice_start_transcription(&mut self, wav_path: std::path::PathBuf) {
+    info!(path = %wav_path.display(), "voice: start transcription");
     self.status_message = Some("Transcribing…".to_string());
 
     let (tx, rx) = oneshot::channel();
@@ -508,6 +534,7 @@ impl App {
     let model = whisper_model_path();
     tokio::spawn(async move {
       let model_str = model.to_string_lossy().to_string();
+      debug!(model = %model_str, wav = %wav.display(), "voice: spawning whisper-cli");
       let result = tokio::process::Command::new("whisper-cli")
         .args(["-m", &model_str, "-f", wav.to_str().unwrap_or(""), "--no-timestamps", "-l", "auto"])
         .stdin(std::process::Stdio::null())
@@ -519,13 +546,18 @@ impl App {
       let text = match result {
         Ok(output) if output.status.success() => {
           let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+          let stderr_raw = String::from_utf8_lossy(&output.stderr).trim().to_string();
+          debug!(stdout_len = raw.len(), stderr_len = stderr_raw.len(), "voice: whisper-cli succeeded");
+          debug!(raw_stdout = %raw, "voice: whisper raw output");
           // whisper-cli may output bracketed markers like [BLANK_AUDIO] — filter them
           let cleaned: String =
             raw.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('[')).collect::<Vec<_>>().join(" ");
+          info!(cleaned_len = cleaned.len(), cleaned = %cleaned, "voice: transcription result");
           Ok(cleaned)
         }
         Ok(output) => {
           let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+          error!(code = ?output.status.code(), stderr = %stderr, "voice: whisper-cli failed");
           if stderr.contains("failed to open") || stderr.contains("no such file") {
             Err(anyhow::anyhow!("Whisper model not found at {}", model_str))
           } else {
@@ -533,6 +565,7 @@ impl App {
           }
         }
         Err(e) => {
+          error!(err = %e, "voice: failed to spawn whisper-cli");
           if e.kind() == std::io::ErrorKind::NotFound {
             Err(anyhow::anyhow!("whisper-cli not found. Install with: brew install whisper-cpp"))
           } else {
@@ -548,10 +581,16 @@ impl App {
   /// Handle Ctrl+A toggle: start recording or stop recording.
   async fn voice_toggle(&mut self) {
     match self.voice {
-      VoiceState::Idle => self.voice_start_recording(),
-      VoiceState::Recording { .. } => self.voice_stop_recording().await,
+      VoiceState::Idle => {
+        debug!("voice: toggle -> start recording");
+        self.voice_start_recording();
+      }
+      VoiceState::Recording { .. } => {
+        debug!("voice: toggle -> stop recording");
+        self.voice_stop_recording().await;
+      }
       VoiceState::Downloading { .. } | VoiceState::Transcribing { .. } => {
-        // Already downloading or transcribing — ignore
+        debug!("voice: toggle ignored (busy)");
       }
     }
   }
@@ -726,16 +765,21 @@ impl App {
     if let VoiceState::Recording { ref started, .. } = self.voice
       && started.elapsed() >= Duration::from_secs(VOICE_MAX_DURATION_SECS)
     {
+      info!(max_secs = VOICE_MAX_DURATION_SECS, "voice: max duration reached, stopping");
       self.voice_stop_recording().await;
     }
 
     // Check if sox recording process has exited (auto-silence triggered)
     if let VoiceState::Recording { ref mut child, .. } = self.voice
-      && let Some(_status) = child.try_wait().ok().flatten()
+      && let Some(status) = child.try_wait().ok().flatten()
     {
+      info!(code = ?status.code(), "voice: sox exited (auto-silence)");
       // sox exited — take the state and check model before transcription
       let state = std::mem::replace(&mut self.voice, VoiceState::Idle);
       if let VoiceState::Recording { wav_path, .. } = state {
+        if let Ok(meta) = std::fs::metadata(&wav_path) {
+          debug!(size_bytes = meta.len(), "voice: WAV file from auto-silence");
+        }
         self.voice_ensure_model_then_transcribe(wav_path);
       }
     }
@@ -775,17 +819,21 @@ impl App {
     {
       let state = std::mem::replace(&mut self.voice, VoiceState::Idle);
       if let VoiceState::Transcribing { wav_path, .. } = state {
+        debug!(path = %wav_path.display(), "voice: cleaning up WAV file");
         let _ = std::fs::remove_file(&wav_path);
       }
       self.status_message = None;
       match result {
         Ok(text) if text.is_empty() => {
+          info!("voice: no speech detected (empty transcription)");
           self.status_message = Some("No speech detected".to_string());
         }
         Ok(text) => {
+          info!(len = text.len(), text = %text, "voice: inserting transcribed text");
           self.voice_insert_text(&text);
         }
         Err(e) => {
+          error!(err = %e, "voice: transcription error");
           self.last_error = Some(format!("{}", e));
         }
       }
@@ -800,6 +848,7 @@ impl App {
       self.last_error = Some("Enter a search term.".to_string());
       return;
     }
+    info!(query = %query, "search triggered");
     self.tasks.search_rx = None;
     self.tasks.more_rx = None;
     self.cancel_enrich();
@@ -1255,6 +1304,33 @@ async fn download_whisper_model(model_path: &std::path::Path, tx: &mpsc::Unbound
 
 #[tokio::main]
 async fn main() -> Result<()> {
+  // --- Daily file logging ---
+  let log_dir = directories::BaseDirs::new()
+    .map(|d| d.data_dir().join("yp/logs"))
+    .unwrap_or_else(|| std::path::PathBuf::from("/tmp/yp/logs"));
+  let file_appender = tracing_appender::rolling::daily(&log_dir, "yp.log");
+  let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+  tracing_subscriber::fmt()
+    .with_writer(non_blocking)
+    .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("yp=debug".parse().unwrap()))
+    .with_ansi(false)
+    .with_target(false)
+    .init();
+
+  info!("yp v{} starting", env!("CARGO_PKG_VERSION"));
+
+  // Remove old log files (keep only today's)
+  let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+  if let Ok(entries) = std::fs::read_dir(&log_dir) {
+    for entry in entries.flatten() {
+      let name = entry.file_name();
+      let name = name.to_string_lossy();
+      if name.starts_with("yp.log.") && !name.ends_with(&today) {
+        let _ = std::fs::remove_file(entry.path());
+      }
+    }
+  }
+
   let args = Args::parse();
 
   let default_hook = std::panic::take_hook();
@@ -1271,6 +1347,7 @@ async fn main() -> Result<()> {
 
 async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
   let display_mode = display::resolve_display_mode(args.display_mode);
+  info!(display_mode = ?display_mode, "display mode resolved");
   let mut app = App::new(display_mode);
   let uses_graphics_protocol = matches!(display_mode, DisplayMode::Kitty | DisplayMode::Sixel);
 
