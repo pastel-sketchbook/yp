@@ -237,6 +237,10 @@ pub async fn get_video_info(video_id: &str) -> Result<VideoDetails> {
       "%(uploader)s",
       "--print",
       "%(duration_string)s",
+      "--print",
+      "%(upload_date>%Y-%m-%d)s",
+      "--print",
+      "%(tags)s",
       "--no-warnings",
       "--",
       &url,
@@ -254,15 +258,32 @@ pub async fn get_video_info(video_id: &str) -> Result<VideoDetails> {
       }
     })?;
 
+  let opt = |s: Option<&str>| -> Option<String> {
+    s.map(str::trim).filter(|s| !s.is_empty() && *s != "NA").map(|s| s.to_string())
+  };
+
   if output.status.success() {
     let info_str = String::from_utf8(output.stdout).context("Failed to parse yt-dlp info output as UTF-8")?;
     let mut lines = info_str.lines();
     let title = lines.next().map(|s| s.trim().to_string()).ok_or_else(|| anyhow!("Missing title in yt-dlp output"))?;
-    let uploader = lines.next().map(|s| s.trim().to_string()).filter(|s| s != "NA");
-    let duration = lines.next().map(|s| s.trim().to_string()).filter(|s| s != "NA");
-    Ok(VideoDetails { url, title, uploader, duration })
+    let uploader = opt(lines.next());
+    let duration = opt(lines.next());
+    let upload_date = opt(lines.next());
+    let tags = opt(lines.next())
+      .map(|s| clean_tags(&s))
+      .filter(|s| !s.is_empty())
+      .map(|s| s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
+      .unwrap_or_default();
+    Ok(VideoDetails { url, title, uploader, duration, upload_date, tags })
   } else {
-    Ok(VideoDetails { url, title: video_id.to_string(), uploader: None, duration: None })
+    Ok(VideoDetails {
+      url,
+      title: video_id.to_string(),
+      uploader: None,
+      duration: None,
+      upload_date: None,
+      tags: Vec::new(),
+    })
   }
 }
 

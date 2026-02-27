@@ -15,6 +15,7 @@ pub struct Theme {
   pub stripe_bg: Color,
   pub key_bg: Color,
   pub key_fg: Color,
+  pub tag: Color,
 }
 
 pub const THEMES: &[Theme] = &[
@@ -33,6 +34,7 @@ pub const THEMES: &[Theme] = &[
     stripe_bg: Color::Rgb(28, 28, 34),
     key_bg: Color::DarkGray,
     key_fg: Color::Black,
+    tag: Color::Rgb(180, 140, 255),
   },
   // Gruvbox Dark
   Theme {
@@ -49,6 +51,7 @@ pub const THEMES: &[Theme] = &[
     stripe_bg: Color::Rgb(40, 40, 40),
     key_bg: Color::Rgb(80, 73, 69),
     key_fg: Color::Rgb(235, 219, 178),
+    tag: Color::Rgb(131, 165, 152),
   },
   // Solarized Dark
   Theme {
@@ -65,6 +68,7 @@ pub const THEMES: &[Theme] = &[
     stripe_bg: Color::Rgb(3, 48, 58),
     key_bg: Color::Rgb(88, 110, 117),
     key_fg: Color::Rgb(253, 246, 227),
+    tag: Color::Rgb(108, 113, 196),
   },
   // Flexoki Dark
   Theme {
@@ -81,6 +85,7 @@ pub const THEMES: &[Theme] = &[
     stripe_bg: Color::Rgb(22, 21, 20),
     key_bg: Color::Rgb(52, 51, 49),
     key_fg: Color::Rgb(206, 205, 195),
+    tag: Color::Rgb(142, 139, 206),
   },
   // Ayu Dark
   Theme {
@@ -97,6 +102,7 @@ pub const THEMES: &[Theme] = &[
     stripe_bg: Color::Rgb(15, 19, 26),
     key_bg: Color::Rgb(60, 66, 76),
     key_fg: Color::Rgb(191, 191, 191),
+    tag: Color::Rgb(210, 154, 230),
   },
   // Zoegi Dark
   Theme {
@@ -113,6 +119,7 @@ pub const THEMES: &[Theme] = &[
     stripe_bg: Color::Rgb(27, 27, 27),
     key_bg: Color::Rgb(64, 64, 64),
     key_fg: Color::Rgb(204, 204, 204),
+    tag: Color::Rgb(150, 180, 210),
   },
   // --- Light themes ---
   // Gruvbox Light
@@ -130,6 +137,7 @@ pub const THEMES: &[Theme] = &[
     stripe_bg: Color::Rgb(249, 236, 186),
     key_bg: Color::Rgb(213, 196, 161),
     key_fg: Color::Rgb(60, 56, 54),
+    tag: Color::Rgb(69, 133, 136),
   },
   // Solarized Light
   Theme {
@@ -146,6 +154,7 @@ pub const THEMES: &[Theme] = &[
     stripe_bg: Color::Rgb(245, 239, 218),
     key_bg: Color::Rgb(220, 212, 188),
     key_fg: Color::Rgb(88, 110, 117),
+    tag: Color::Rgb(108, 113, 196),
   },
   // Flexoki Light
   Theme {
@@ -162,6 +171,7 @@ pub const THEMES: &[Theme] = &[
     stripe_bg: Color::Rgb(247, 245, 234),
     key_bg: Color::Rgb(230, 228, 217),
     key_fg: Color::Rgb(16, 15, 15),
+    tag: Color::Rgb(100, 92, 187),
   },
   // Ayu Light
   Theme {
@@ -178,6 +188,7 @@ pub const THEMES: &[Theme] = &[
     stripe_bg: Color::Rgb(243, 244, 245),
     key_bg: Color::Rgb(207, 209, 210),
     key_fg: Color::Rgb(92, 97, 102),
+    tag: Color::Rgb(163, 122, 204),
   },
   // Zoegi Light
   Theme {
@@ -194,5 +205,6 @@ pub const THEMES: &[Theme] = &[
     stripe_bg: Color::Rgb(247, 247, 247),
     key_bg: Color::Rgb(230, 230, 230),
     key_fg: Color::Rgb(51, 51, 51),
+    tag: Color::Rgb(80, 120, 160),
   },
 ];

@@ -374,6 +374,12 @@ impl App {
     let Some(entry) = self.search_results.get(selected) else { return };
 
     let video_id = entry.video_id.clone();
+    let upload_date = entry.upload_date.clone();
+    let tags: Vec<String> = entry
+      .tags
+      .as_deref()
+      .map(|s| s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
+      .unwrap_or_default();
     let client = self.player.http_client.clone();
     self.last_error = None;
     self.status_message = Some("Loading…".to_string());
@@ -382,7 +388,13 @@ impl App {
     tokio::spawn(async move {
       let details = get_video_info(&video_id).await;
       match details {
-        Ok(d) => {
+        Ok(mut d) => {
+          if upload_date.is_some() {
+            d.upload_date = upload_date;
+          }
+          if !tags.is_empty() {
+            d.tags = tags;
+          }
           let thumb = fetch_thumbnail(&client, &video_id).await.ok();
           let _ = tx.send(Ok((video_id, d, thumb)));
         }

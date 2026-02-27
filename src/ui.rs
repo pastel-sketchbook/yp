@@ -166,12 +166,28 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
         Span::styled(duration.as_str(), Style::default().fg(theme.fg)),
       ]));
     }
+    if let Some(date) = &details.upload_date {
+      lines.push(Line::from(vec![
+        Span::styled("Published ", Style::default().fg(theme.muted)),
+        Span::styled(date.as_str(), Style::default().fg(theme.fg)),
+      ]));
+    }
     lines.push(Line::from(""));
     let url_display = truncate_str(&details.url, inner_w);
     lines.push(Line::from(Span::styled(
       url_display,
       Style::default().fg(theme.accent).add_modifier(Modifier::UNDERLINED),
     )));
+    if !details.tags.is_empty() {
+      lines.push(Line::from(""));
+      lines.push(Line::from(Span::styled("Tags", Style::default().fg(theme.muted))));
+      for tag in &details.tags {
+        lines.push(Line::from(Span::styled(
+          format!("  {}", truncate_str(tag, inner_w.saturating_sub(2))),
+          Style::default().fg(theme.tag),
+        )));
+      }
+    }
 
     let paragraph = Paragraph::new(lines).block(info_block);
     frame.render_widget(paragraph, info_area);

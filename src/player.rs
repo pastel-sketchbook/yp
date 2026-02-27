@@ -21,6 +21,8 @@ pub struct VideoDetails {
   pub title: String,
   pub uploader: Option<String>,
   pub duration: Option<String>,
+  pub upload_date: Option<String>,
+  pub tags: Vec<String>,
 }
 
 pub struct MusicPlayer {
