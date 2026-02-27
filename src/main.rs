@@ -130,6 +130,7 @@ impl Config {
 pub enum AppMode {
   Input,
   Results,
+  Filter,
 }
 
 /// Terminal graphics protocol rendering state (Kitty/Sixel).
@@ -176,6 +177,15 @@ pub struct App {
   pub channel_source: Option<ChannelSource>,
   pub input_scroll: usize,
   pub gfx: GraphicsCache,
+  /// Filter text for narrowing search results by title/tags.
+  pub filter: String,
+  /// Cursor position within the filter input (char index).
+  pub filter_cursor: usize,
+  /// Horizontal scroll offset for the filter input.
+  pub filter_scroll: usize,
+  /// Indices into `search_results` that match the current filter.
+  /// When filter is empty, contains all indices.
+  pub filtered_indices: Vec<usize>,
   frames: FrameState,
   tasks: AsyncTasks,
 }
@@ -206,6 +216,10 @@ impl App {
       channel_source: None,
       input_scroll: 0,
       gfx: GraphicsCache::default(),
+      filter: String::new(),
+      filter_cursor: 0,
+      filter_scroll: 0,
+      filtered_indices: Vec::new(),
       frames: FrameState::default(),
       tasks: AsyncTasks::default(),
     }
@@ -219,6 +233,49 @@ impl App {
     let config =
       Config { theme_name: Some(self.theme().name.to_string()), frame_mode: Some(self.frame_mode.label().to_string()) };
     config.save();
+  }
+
+  /// Check if a search entry matches the given filter string.
+  /// Matches case-insensitively against both title and tags.
+  fn matches_filter(entry: &SearchEntry, filter: &str) -> bool {
+    if filter.is_empty() {
+      return true;
+    }
+    let needle = filter.to_lowercase();
+    if entry.title.to_lowercase().contains(&needle) {
+      return true;
+    }
+    if let Some(ref tags) = entry.tags
+      && tags.to_lowercase().contains(&needle)
+    {
+      return true;
+    }
+    false
+  }
+
+  /// Rebuild `filtered_indices` from `search_results` and the current filter.
+  /// Clamps the list selection to stay within the filtered range.
+  fn recompute_filter(&mut self) {
+    if self.filter.is_empty() {
+      self.filtered_indices = (0..self.search_results.len()).collect();
+    } else {
+      self.filtered_indices = self
+        .search_results
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| Self::matches_filter(entry, &self.filter))
+        .map(|(i, _)| i)
+        .collect();
+    }
+    // Clamp selection to new filtered range
+    if self.filtered_indices.is_empty() {
+      self.list_state.select(None);
+    } else {
+      let sel = self.list_state.selected().unwrap_or(0);
+      if sel >= self.filtered_indices.len() {
+        self.list_state.select(Some(self.filtered_indices.len().saturating_sub(1)));
+      }
+    }
   }
 
   fn next_theme(&mut self) {
@@ -313,6 +370,7 @@ impl App {
                 }
               }
               self.search_results = results;
+              self.recompute_filter();
               self.list_state.select(Some(0));
               self.mode = AppMode::Results;
               // Kick off background enrichment for channel results
@@ -387,6 +445,7 @@ impl App {
                 should_enrich = true;
               }
               self.search_results.extend(new_results);
+              self.recompute_filter();
             }
             Err(e) => {
               self.last_error = Some(format!("Failed to load more: {:#}", e));
@@ -425,12 +484,18 @@ impl App {
 
     // Drain enrichment results and apply to matching entries
     if let Some(ref mut rx) = self.tasks.enrich_rx {
+      let mut updated = false;
       while let Ok(meta) = rx.try_recv() {
         if let Some(entry) = self.search_results.iter_mut().find(|e| e.video_id == meta.video_id) {
           entry.upload_date = meta.upload_date;
           entry.tags = meta.tags;
           entry.enriched = true;
+          updated = true;
         }
+      }
+      // Recompute filter when enrichment adds tags that might match/unmatch
+      if updated && !self.filter.is_empty() {
+        self.recompute_filter();
       }
     }
 
@@ -447,6 +512,10 @@ impl App {
     self.tasks.more_rx = None;
     self.cancel_enrich();
     self.last_error = None;
+    // Clear filter state on new search
+    self.filter.clear();
+    self.filter_cursor = 0;
+    self.filter_scroll = 0;
 
     if let Some(channel_url) = detect_channel_url(&query) {
       // Channel listing mode
@@ -517,7 +586,14 @@ impl App {
 
   fn trigger_load(&mut self) {
     let Some(selected) = self.list_state.selected() else { return };
-    let Some(entry) = self.search_results.get(selected) else { return };
+    // Map through filtered_indices to get the actual search_results index
+    let actual_idx = if self.filtered_indices.is_empty() {
+      return;
+    } else {
+      let Some(&idx) = self.filtered_indices.get(selected) else { return };
+      idx
+    };
+    let Some(entry) = self.search_results.get(actual_idx) else { return };
 
     let video_id = entry.video_id.clone();
     let upload_date = entry.upload_date.clone();
@@ -654,6 +730,7 @@ async fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()> {
   match app.mode {
     AppMode::Input => handle_input_key(app, key),
     AppMode::Results => handle_results_key(app, key).await?,
+    AppMode::Filter => handle_filter_key(app, key).await?,
   }
   Ok(())
 }
@@ -728,19 +805,24 @@ async fn handle_results_key(app: &mut App, key: event::KeyEvent) -> Result<()> {
         app.last_error = Some(format!("Pause error: {}", e));
       }
     }
+    KeyCode::Char('/') => {
+      app.mode = AppMode::Filter;
+    }
     KeyCode::Down | KeyCode::Char('j') => {
-      let count = app.search_results.len();
+      let count = app.filtered_indices.len();
       if count > 0 {
         let i = app.list_state.selected().map_or(0, |i| (i + 1) % count);
         app.list_state.select(Some(i));
-        // Trigger background load when within 5 items of the bottom
-        if i + 5 >= count {
+        // Trigger background load when within 5 items of the bottom (use actual index)
+        if let Some(&actual_idx) = app.filtered_indices.get(i)
+          && actual_idx + 5 >= app.search_results.len()
+        {
           app.trigger_load_more();
         }
       }
     }
     KeyCode::Up | KeyCode::Char('k') => {
-      let count = app.search_results.len();
+      let count = app.filtered_indices.len();
       if count > 0 {
         let i = app.list_state.selected().map_or(0, |i| if i == 0 { count - 1 } else { i - 1 });
         app.list_state.select(Some(i));
@@ -748,6 +830,81 @@ async fn handle_results_key(app: &mut App, key: event::KeyEvent) -> Result<()> {
     }
     KeyCode::Esc => {
       app.mode = AppMode::Input;
+    }
+    _ => {}
+  }
+  Ok(())
+}
+
+async fn handle_filter_key(app: &mut App, key: event::KeyEvent) -> Result<()> {
+  match key.code {
+    KeyCode::Char(c) => {
+      let byte_idx = char_to_byte_index(&app.filter, app.filter_cursor);
+      app.filter.insert(byte_idx, c);
+      app.filter_cursor += 1;
+      app.recompute_filter();
+    }
+    KeyCode::Backspace => {
+      if app.filter_cursor > 0 {
+        app.filter_cursor -= 1;
+        let byte_idx = char_to_byte_index(&app.filter, app.filter_cursor);
+        app.filter.remove(byte_idx);
+        app.recompute_filter();
+      }
+    }
+    KeyCode::Delete => {
+      if app.filter_cursor < app.filter.chars().count() {
+        let byte_idx = char_to_byte_index(&app.filter, app.filter_cursor);
+        app.filter.remove(byte_idx);
+        app.recompute_filter();
+      }
+    }
+    KeyCode::Left => {
+      app.filter_cursor = app.filter_cursor.saturating_sub(1);
+    }
+    KeyCode::Right => {
+      if app.filter_cursor < app.filter.chars().count() {
+        app.filter_cursor += 1;
+      }
+    }
+    KeyCode::Home => {
+      app.filter_cursor = 0;
+    }
+    KeyCode::End => {
+      app.filter_cursor = app.filter.chars().count();
+    }
+    KeyCode::Down => {
+      // Navigate filtered results while typing
+      let count = app.filtered_indices.len();
+      if count > 0 {
+        let i = app.list_state.selected().map_or(0, |i| (i + 1) % count);
+        app.list_state.select(Some(i));
+        // Trigger pagination if near bottom of actual results
+        if let Some(&actual_idx) = app.filtered_indices.get(i)
+          && actual_idx + 5 >= app.search_results.len()
+        {
+          app.trigger_load_more();
+        }
+      }
+    }
+    KeyCode::Up => {
+      let count = app.filtered_indices.len();
+      if count > 0 {
+        let i = app.list_state.selected().map_or(0, |i| if i == 0 { count - 1 } else { i - 1 });
+        app.list_state.select(Some(i));
+      }
+    }
+    KeyCode::Enter => {
+      // Apply filter and return to Results mode
+      app.mode = AppMode::Results;
+    }
+    KeyCode::Esc => {
+      // Clear filter and return to Results mode
+      app.filter.clear();
+      app.filter_cursor = 0;
+      app.filter_scroll = 0;
+      app.recompute_filter();
+      app.mode = AppMode::Results;
     }
     _ => {}
   }
@@ -937,5 +1094,61 @@ mod tests {
   fn frame_mode_from_config_unknown_defaults_to_thumbnail() {
     assert_eq!(FrameMode::from_config("invalid"), FrameMode::Thumbnail);
     assert_eq!(FrameMode::from_config(""), FrameMode::Thumbnail);
+  }
+
+  // --- matches_filter ---
+
+  fn make_entry(title: &str, tags: Option<&str>) -> SearchEntry {
+    SearchEntry {
+      title: title.to_string(),
+      video_id: "test123".to_string(),
+      upload_date: None,
+      tags: tags.map(|s| s.to_string()),
+      enriched: false,
+    }
+  }
+
+  #[test]
+  fn matches_filter_empty_filter_matches_all() {
+    let entry = make_entry("Any Title", None);
+    assert!(App::matches_filter(&entry, ""));
+  }
+
+  #[test]
+  fn matches_filter_title_match() {
+    let entry = make_entry("Rock Music Mix", None);
+    assert!(App::matches_filter(&entry, "rock"));
+    assert!(App::matches_filter(&entry, "MUSIC"));
+    assert!(App::matches_filter(&entry, "mix"));
+  }
+
+  #[test]
+  fn matches_filter_tag_match() {
+    let entry = make_entry("Some Video", Some("rock, guitar, blues"));
+    assert!(App::matches_filter(&entry, "guitar"));
+    assert!(App::matches_filter(&entry, "BLUES"));
+  }
+
+  #[test]
+  fn matches_filter_no_match() {
+    let entry = make_entry("Piano Sonata", Some("classical, piano"));
+    assert!(!App::matches_filter(&entry, "rock"));
+    assert!(!App::matches_filter(&entry, "guitar"));
+  }
+
+  #[test]
+  fn matches_filter_no_tags() {
+    let entry = make_entry("Guitar Solo", None);
+    assert!(App::matches_filter(&entry, "guitar"));
+    assert!(!App::matches_filter(&entry, "piano"));
+  }
+
+  #[test]
+  fn matches_filter_case_insensitive() {
+    let entry = make_entry("ABC Def GHI", Some("Jazz, Funk"));
+    assert!(App::matches_filter(&entry, "abc"));
+    assert!(App::matches_filter(&entry, "DEF"));
+    assert!(App::matches_filter(&entry, "jazz"));
+    assert!(App::matches_filter(&entry, "FUNK"));
   }
 }
