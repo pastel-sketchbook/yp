@@ -228,7 +228,7 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
     app.transcript_visible && (!app.utterances.is_empty() || !matches!(app.transcript_state, TranscriptState::Idle));
 
   let (np_area, transcript_area) = if show_transcript {
-    let [top, bottom] = Layout::vertical([Constraint::Percentage(65), Constraint::Percentage(35)]).areas(info_area);
+    let [top, bottom] = Layout::vertical([Constraint::Percentage(62), Constraint::Percentage(38)]).areas(info_area);
     (top, Some(bottom))
   } else {
     (info_area, None)
