@@ -410,6 +410,8 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     (format!(" {voice_icon}⏳ {}", msg), Style::default().fg(theme.status))
   } else if let Some(err) = &app.last_error {
     (format!(" ⚠  {}", err), Style::default().fg(theme.error))
+  } else if let Some(msg) = &app.info_message {
+    (format!(" ℹ  {}", msg), Style::default().fg(theme.muted))
   } else {
     let mpv_status = app.player.get_last_mpv_status();
     match mpv_status {

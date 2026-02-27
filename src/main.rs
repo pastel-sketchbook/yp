@@ -219,6 +219,8 @@ pub struct App {
   pub player: MusicPlayer,
   pub last_error: Option<String>,
   pub status_message: Option<String>,
+  /// Informational message — shown with ℹ icon, lower priority than status/error.
+  pub info_message: Option<String>,
   pub should_quit: bool,
   pub channel_source: Option<ChannelSource>,
   pub input_scroll: usize,
@@ -259,6 +261,7 @@ impl App {
       player: MusicPlayer::new(display_mode),
       last_error: None,
       status_message: None,
+      info_message: None,
       should_quit: false,
       channel_source: None,
       input_scroll: 0,
@@ -444,6 +447,7 @@ impl App {
         self.voice = VoiceState::Recording { child, wav_path, started: Instant::now() };
         self.status_message = Some("Recording…".to_string());
         self.last_error = None;
+        self.info_message = None;
       }
       Err(e) => {
         error!(err = %e, "voice: failed to spawn sox");
@@ -492,7 +496,19 @@ impl App {
   }
 
   /// Check if whisper model exists; if not, start downloading it; otherwise start transcription.
+  /// Skips transcription entirely if the WAV file is empty (header-only, no audio data).
   fn voice_ensure_model_then_transcribe(&mut self, wav_path: std::path::PathBuf) {
+    // A WAV header with no audio data is ~44-80 bytes. Skip transcription for empty recordings.
+    const MIN_WAV_SIZE: u64 = 256;
+    let wav_size = std::fs::metadata(&wav_path).map(|m| m.len()).unwrap_or(0);
+    if wav_size < MIN_WAV_SIZE {
+      info!(size_bytes = wav_size, "voice: WAV too small, skipping transcription");
+      let _ = std::fs::remove_file(&wav_path);
+      self.status_message = None;
+      self.info_message = Some("No speech detected".to_string());
+      return;
+    }
+
     let model_path = whisper_model_path();
     if model_path.exists() {
       debug!(model = %model_path.display(), "voice: model exists, starting transcription");
@@ -826,7 +842,7 @@ impl App {
       match result {
         Ok(text) if text.is_empty() => {
           info!("voice: no speech detected (empty transcription)");
-          self.status_message = Some("No speech detected".to_string());
+          self.info_message = Some("No speech detected".to_string());
         }
         Ok(text) => {
           info!(len = text.len(), text = %text, "voice: inserting transcribed text");
@@ -853,6 +869,7 @@ impl App {
     self.tasks.more_rx = None;
     self.cancel_enrich();
     self.last_error = None;
+    self.info_message = None;
     // Clear filter state on new search
     self.filter.clear();
     self.filter_cursor = 0;
