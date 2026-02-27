@@ -501,8 +501,7 @@ impl App {
             let whisper = lock.as_mut().expect("whisper instance just set above");
 
             info!(wav = %wav_for_whisper.display(), "transcript: starting whisper transcription");
-            let transcript =
-              whisper.transcribe(&wav_for_whisper, false, false).context("Whisper transcription failed");
+            let transcript = whisper.transcribe(&wav_for_whisper, false, false).context("Whisper transcription failed");
 
             // Clean up WAV file
             let _ = std::fs::remove_file(&wav_for_whisper);
@@ -1314,7 +1313,10 @@ async fn main() -> Result<()> {
   tracing_subscriber::fmt()
     .with_writer(non_blocking)
     // Safety: "yp=debug" is a valid static tracing directive — parse cannot fail.
-    .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("yp=debug".parse().expect("valid tracing directive")))
+    .with_env_filter(
+      tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive("yp=debug".parse().expect("valid tracing directive")),
+    )
     .with_ansi(false)
     .with_target(false)
     .init();

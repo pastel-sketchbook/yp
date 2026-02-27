@@ -143,7 +143,8 @@ pub fn kitty_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
 
   let mut stdout = std::io::stdout();
 
-  write!(stdout, "\x1B[{};{}H", area.y.saturating_add(1), area.x.saturating_add(1)).context("Failed to position cursor for kitty image")?;
+  write!(stdout, "\x1B[{};{}H", area.y.saturating_add(1), area.x.saturating_add(1))
+    .context("Failed to position cursor for kitty image")?;
 
   for (i, chunk) in chunks.iter().enumerate() {
     let data = std::str::from_utf8(chunk).context("base64 chunk was not valid UTF-8")?;
@@ -274,7 +275,8 @@ pub fn sixel_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
   out.push_str("\x1B\\");
 
   let mut stdout = std::io::stdout();
-  write!(stdout, "\x1B[{};{}H{}", area.y.saturating_add(1), area.x.saturating_add(1), out).context("Failed to write sixel image")?;
+  write!(stdout, "\x1B[{};{}H{}", area.y.saturating_add(1), area.x.saturating_add(1), out)
+    .context("Failed to write sixel image")?;
   stdout.flush().context("Failed to flush sixel image")?;
   Ok(())
 }

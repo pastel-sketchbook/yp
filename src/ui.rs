@@ -392,27 +392,31 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
   }
 
   // Auto-scroll: compute total visual lines after word-wrap,
-  // then scroll so the currently active line is visible.
+  // then scroll so the currently active line is centered vertically.
   let inner_height = area.height.saturating_sub(2) as usize;
   let inner_width = area.width.saturating_sub(4).max(1) as usize;
 
-  // Find the visual line offset of the active utterance for smart scrolling
+  // Find the visual line offset of the active utterance for smart scrolling.
+  // Use unicode display width (not byte length) to match ratatui's Wrap behavior.
   let mut total_visual_lines: usize = 0;
   let mut active_visual_line: usize = 0;
+  let mut active_visual_rows: usize = 0;
   for (line_i, line) in lines.iter().enumerate() {
-    let line_width: usize = line.spans.iter().map(|s| s.content.len()).sum();
+    let line_width: usize = line.spans.iter().map(|s| display_width(&s.content, s.content.chars().count())).sum();
     let visual_rows = if line_width == 0 { 1 } else { (line_width.saturating_sub(1) / inner_width).saturating_add(1) };
 
     if active_line_idx == Some(line_i) {
       active_visual_line = total_visual_lines;
+      active_visual_rows = visual_rows;
     }
     total_visual_lines += visual_rows;
   }
 
-  // Scroll to keep active line visible, falling back to bottom-scroll
+  // Scroll to keep active line centered, falling back to bottom-scroll
   let scroll = if active_line_idx.is_some() {
-    // Center the active line in the visible area
-    active_visual_line.saturating_sub(inner_height / 2).min(u16::MAX as usize) as u16
+    // Place the middle of the active utterance at the middle of the pane
+    let active_center = active_visual_line.saturating_add(active_visual_rows / 2);
+    active_center.saturating_sub(inner_height / 2).min(u16::MAX as usize) as u16
   } else {
     // No active line — scroll to bottom
     total_visual_lines.saturating_sub(inner_height).min(u16::MAX as usize) as u16
