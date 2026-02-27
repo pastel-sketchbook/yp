@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use color_quant::NeuQuant;
-use image::{DynamicImage, ImageFormat, imageops::FilterType};
+use image::{imageops::FilterType, DynamicImage, ImageFormat};
 use ratatui::{
   buffer::Buffer,
   layout::Rect,
@@ -55,8 +55,8 @@ fn render_direct(image: &DynamicImage, area: Rect, buf: &mut Buffer) {
         Color::Reset
       };
       buf.set_string(
-        area.x.saturating_add(offset_x as u16).saturating_add(x as u16),
-        area.y.saturating_add(offset_y as u16).saturating_add(y as u16),
+        area.x.saturating_add((offset_x.min(u16::MAX as u32)) as u16).saturating_add((x.min(u16::MAX as u32)) as u16),
+        area.y.saturating_add((offset_y.min(u16::MAX as u32)) as u16).saturating_add((y.min(u16::MAX as u32)) as u16),
         "▀",
         Style::default().fg(fg).bg(bg),
       );
@@ -78,8 +78,8 @@ fn render_ascii(image: &DynamicImage, area: Rect, buf: &mut Buffer) {
       let idx = ((pixel as f32 / 255.0) * (ASCII_CHARS.len() - 1) as f32).round() as usize;
       let idx = idx.min(ASCII_CHARS.len() - 1);
       buf.set_string(
-        area.x.saturating_add(offset_x as u16).saturating_add(x as u16),
-        area.y.saturating_add(offset_y as u16).saturating_add(y as u16),
+        area.x.saturating_add((offset_x.min(u16::MAX as u32)) as u16).saturating_add((x.min(u16::MAX as u32)) as u16),
+        area.y.saturating_add((offset_y.min(u16::MAX as u32)) as u16).saturating_add((y.min(u16::MAX as u32)) as u16),
         ASCII_CHARS[idx],
         Style::default(),
       );
@@ -109,7 +109,7 @@ const KITTY_CHUNK_SIZE: usize = 4096;
 /// Use this when leaving the player view or clearing the thumbnail area.
 pub fn kitty_delete_placement() -> Result<()> {
   let mut stdout = std::io::stdout();
-  write!(stdout, "\x1B_Ga=d,d=i,i=1,q=2\x1B\\")?;
+  write!(stdout, "\x1B_Ga=d,d=i,i=1,q=2\x1B\\").context("Failed to write kitty delete placement")?;
   stdout.flush().context("Failed to flush kitty delete placement")?;
   Ok(())
 }
@@ -117,7 +117,7 @@ pub fn kitty_delete_placement() -> Result<()> {
 /// Delete all Kitty images currently displayed (used on app exit).
 pub fn kitty_delete_all() -> Result<()> {
   let mut stdout = std::io::stdout();
-  write!(stdout, "\x1B_Ga=d,d=a,q=2\x1B\\")?;
+  write!(stdout, "\x1B_Ga=d,d=a,q=2\x1B\\").context("Failed to write kitty delete all")?;
   stdout.flush().context("Failed to flush kitty delete")?;
   Ok(())
 }
@@ -201,7 +201,10 @@ pub fn sixel_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
     })
     .collect();
 
-  let indices: Vec<u8> = resized.pixels().map(|p| nq.index_of(&[p[0], p[1], p[2], 255]) as u8).collect();
+  // Safety: NeuQuant is initialized with SIXEL_MAX_COLORS (256), so index_of() returns 0..255.
+  // Clamp to u8::MAX as a defensive guard in case the constant is ever changed.
+  let indices: Vec<u8> =
+    resized.pixels().map(|p| nq.index_of(&[p[0], p[1], p[2], 255]).min(u8::MAX as usize) as u8).collect();
 
   let mut out = String::with_capacity(w * h);
 
@@ -220,7 +223,8 @@ pub fn sixel_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
     let y_base = sr * 6;
 
     for (color_idx, _) in palette.iter().enumerate() {
-      let color_idx_u8 = color_idx as u8;
+      // Safety: palette has at most SIXEL_MAX_COLORS (256) entries, so color_idx fits in u8.
+      let color_idx_u8 = color_idx.min(u8::MAX as usize) as u8;
       let mut has_pixels = false;
       let mut row_data = Vec::with_capacity(w);
 
@@ -228,7 +232,10 @@ pub fn sixel_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
         let mut sixel_val: u8 = 0;
         for bit in 0..6 {
           let y = y_base + bit;
-          if y < h && indices[y * w + x] == color_idx_u8 {
+          if y < h
+            && let Some(&idx) = indices.get(y * w + x)
+            && idx == color_idx_u8
+          {
             sixel_val |= 1 << bit;
             has_pixels = true;
           }
@@ -267,7 +274,7 @@ pub fn sixel_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
   out.push_str("\x1B\\");
 
   let mut stdout = std::io::stdout();
-  write!(stdout, "\x1B[{};{}H{}", area.y + 1, area.x + 1, out)?;
+  write!(stdout, "\x1B[{};{}H{}", area.y + 1, area.x + 1, out).context("Failed to write sixel image")?;
   stdout.flush().context("Failed to flush sixel image")?;
   Ok(())
 }

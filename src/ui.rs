@@ -1,10 +1,10 @@
 use image::imageops::FilterType;
 use ratatui::{
-  Frame,
   layout::{Alignment, Constraint, Layout, Rect},
   style::{Modifier, Style, Stylize},
   text::{Line, Span},
   widgets::{Block, List, ListItem, Padding, Paragraph},
+  Frame,
 };
 
 use crate::display::DisplayMode;
@@ -122,9 +122,9 @@ fn render_header(frame: &mut Frame, theme: &Theme, area: Rect) {
   frame.render_widget(left, area);
 
   let version = format!("v{} ", env!("CARGO_PKG_VERSION"));
+  let version_w = (version.len().min(u16::MAX as usize)) as u16;
   let right = Line::from(Span::styled(&version, Style::default().fg(theme.muted)));
-  let right_area =
-    Rect { x: area.x + area.width.saturating_sub(version.len() as u16), width: version.len() as u16, ..area };
+  let right_area = Rect { x: area.x + area.width.saturating_sub(version_w), width: version_w, ..area };
   frame.render_widget(right, right_area);
 }
 
@@ -239,6 +239,12 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
       lines.push(Line::from(vec![
         Span::styled("Published ", Style::default().fg(theme.muted)),
         Span::styled(date.as_str(), Style::default().fg(theme.fg)),
+      ]));
+    }
+    if let Some(views) = &details.view_count {
+      lines.push(Line::from(vec![
+        Span::styled("Views     ", Style::default().fg(theme.muted)),
+        Span::styled(views.as_str(), Style::default().fg(theme.fg)),
       ]));
     }
     lines.push(Line::from(""));
@@ -451,7 +457,8 @@ fn render_input(frame: &mut Frame, app: &mut App, area: Rect) {
   frame.render_widget(paragraph, area);
 
   if is_active {
-    let cursor_x = area.x + 2 + (cursor_col - scroll_val) as u16;
+    let cursor_offset = cursor_col.saturating_sub(scroll_val).min(u16::MAX as usize) as u16;
+    let cursor_x = area.x.saturating_add(2).saturating_add(cursor_offset);
     frame.set_cursor_position((cursor_x, area.y + 1));
   }
 }
@@ -508,7 +515,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(format!(" {} ", key), Style::default().fg(theme.key_fg).bg(theme.key_bg)),
         Span::styled(format!(" {} ", action), Style::default().fg(theme.muted)),
       ];
-      if i < keys.len() - 1 {
+      if i < keys.len().saturating_sub(1) {
         s.push(Span::raw("  "));
       }
       s
@@ -518,9 +525,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
   frame.render_widget(Line::from(spans), area);
 
   let right_label = format!("{} | {} ", app.frame_mode.label(), theme.name);
+  let right_w = (right_label.len().min(u16::MAX as usize)) as u16;
   let right = Line::from(Span::styled(&right_label, Style::default().fg(theme.muted)));
-  let right_area =
-    Rect { x: area.x + area.width.saturating_sub(right_label.len() as u16), width: right_label.len() as u16, ..area };
+  let right_area = Rect { x: area.x + area.width.saturating_sub(right_w), width: right_w, ..area };
   frame.render_widget(right, right_area);
 }
 

@@ -226,6 +226,8 @@ impl App {
   }
 
   pub fn theme(&self) -> &'static theme::Theme {
+    // Safety: theme_index is always bounded by modular arithmetic in next_theme()
+    // and clamped to THEMES.len() - 1 on initialization.
     &THEMES[self.theme_index]
   }
 
@@ -284,6 +286,8 @@ impl App {
   }
 
   fn next_frame_mode(&mut self) {
+    // Safety: idx is bounded by position() returning 0..ALL.len()-1, and modular arithmetic
+    // ensures (idx + 1) % ALL.len() is always in bounds. ALL is a non-empty const array.
     let idx = FrameMode::ALL.iter().position(|m| *m == self.frame_mode).unwrap_or(0);
     self.frame_mode = FrameMode::ALL[(idx + 1) % FrameMode::ALL.len()];
 

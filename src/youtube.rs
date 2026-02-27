@@ -142,7 +142,7 @@ impl VideoFrameSource {
     if time_secs < 0.0 {
       return 1;
     }
-    (time_secs / self.frame_interval) as usize + 1
+    ((time_secs / self.frame_interval) as usize).saturating_add(1)
   }
 
   /// Load the frame image at the given playback time from disk.
@@ -223,10 +223,30 @@ fn parse_storyboard_meta(json: &Value) -> Result<StoryboardMeta> {
     })
     .context("No storyboard format found")?;
 
-  let frame_width = sb_format.get("width").and_then(Value::as_u64).context("Missing storyboard width")? as u32;
-  let frame_height = sb_format.get("height").and_then(Value::as_u64).context("Missing storyboard height")? as u32;
-  let rows = sb_format.get("rows").and_then(Value::as_u64).context("Missing storyboard rows")? as u32;
-  let cols = sb_format.get("columns").and_then(Value::as_u64).context("Missing storyboard columns")? as u32;
+  let frame_width: u32 = sb_format
+    .get("width")
+    .and_then(Value::as_u64)
+    .context("Missing storyboard width")?
+    .try_into()
+    .context("Storyboard width exceeds u32 range")?;
+  let frame_height: u32 = sb_format
+    .get("height")
+    .and_then(Value::as_u64)
+    .context("Missing storyboard height")?
+    .try_into()
+    .context("Storyboard height exceeds u32 range")?;
+  let rows: u32 = sb_format
+    .get("rows")
+    .and_then(Value::as_u64)
+    .context("Missing storyboard rows")?
+    .try_into()
+    .context("Storyboard rows exceeds u32 range")?;
+  let cols: u32 = sb_format
+    .get("columns")
+    .and_then(Value::as_u64)
+    .context("Missing storyboard columns")?
+    .try_into()
+    .context("Storyboard columns exceeds u32 range")?;
   let fps = sb_format.get("fps").and_then(Value::as_f64).context("Missing storyboard fps")?;
 
   let fragments = sb_format
@@ -375,6 +395,23 @@ pub struct SearchEntry {
 /// e.g. `['rock', 'music', 'guitar']` → `rock, music, guitar`
 pub(crate) fn clean_tags(raw: &str) -> String {
   raw.trim_start_matches('[').trim_end_matches(']').replace('\'', "")
+}
+
+/// Format a numeric view count string with comma separators.
+/// e.g. `"1234567"` → `"1,234,567"`
+pub(crate) fn format_view_count(raw: &str) -> String {
+  let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+  if digits.is_empty() {
+    return raw.to_string();
+  }
+  let mut result = String::with_capacity(digits.len() + digits.len() / 3);
+  for (i, ch) in digits.chars().enumerate() {
+    if i > 0 && (digits.len() - i).is_multiple_of(3) {
+      result.push(',');
+    }
+    result.push(ch);
+  }
+  result
 }
 
 /// Parse a single tab-separated yt-dlp output line into a SearchEntry.
@@ -560,6 +597,8 @@ pub async fn get_video_info(video_id: &str) -> Result<VideoDetails> {
       "--print",
       "%(upload_date>%Y-%m-%d)s",
       "--print",
+      "%(view_count)s",
+      "--print",
       "%(tags)s",
       "--no-warnings",
       "--",
@@ -576,12 +615,13 @@ pub async fn get_video_info(video_id: &str) -> Result<VideoDetails> {
     let uploader = opt_field(lines.next());
     let duration = opt_field(lines.next());
     let upload_date = opt_field(lines.next());
+    let view_count = opt_field(lines.next()).map(|s| format_view_count(&s));
     let tags = opt_field(lines.next())
       .map(|s| clean_tags(&s))
       .filter(|s| !s.is_empty())
       .map(|s| s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
       .unwrap_or_default();
-    Ok(VideoDetails { url, title, uploader, duration, upload_date, tags })
+    Ok(VideoDetails { url, title, uploader, duration, upload_date, view_count, tags })
   } else {
     Err(anyhow!("yt-dlp failed to get video info: {}", String::from_utf8_lossy(&output.stderr).trim()))
   }
@@ -740,5 +780,32 @@ mod tests {
   fn detect_channel_bare_at_sign() {
     // Single @ with nothing else
     assert_eq!(detect_channel_url("@"), None);
+  }
+
+  // --- format_view_count ---
+
+  #[test]
+  fn format_view_count_millions() {
+    assert_eq!(format_view_count("1234567"), "1,234,567");
+  }
+
+  #[test]
+  fn format_view_count_thousands() {
+    assert_eq!(format_view_count("45678"), "45,678");
+  }
+
+  #[test]
+  fn format_view_count_small() {
+    assert_eq!(format_view_count("999"), "999");
+  }
+
+  #[test]
+  fn format_view_count_single_digit() {
+    assert_eq!(format_view_count("5"), "5");
+  }
+
+  #[test]
+  fn format_view_count_empty() {
+    assert_eq!(format_view_count(""), "");
   }
 }
