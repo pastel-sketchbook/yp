@@ -314,21 +314,7 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
 fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
   let theme = app.theme();
 
-  let title_text = match &app.transcript_state {
-    TranscriptState::ExtractingAudio { .. } => " Extracting... ",
-    TranscriptState::Transcribing { .. } => {
-      if app.download_progress.is_some() {
-        " Downloading... "
-      } else {
-        " Transcribing... "
-      }
-    }
-    TranscriptState::Ready => " Transcript ",
-    TranscriptState::Idle => " Transcript ",
-  };
-  let title = Line::from(Span::styled(title_text, Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
-  let block = Block::bordered()
-    .title(title)
+  let mut block = Block::bordered()
     .border_type(ratatui::widgets::BorderType::Rounded)
     .border_style(Style::default().fg(theme.border))
     .padding(Padding::horizontal(1))
@@ -353,9 +339,54 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
   }
 
   if app.utterances.is_empty() {
-    frame.render_widget(block, area);
+    // Show animated progress indicator when transcript pipeline is active
+    let is_busy = !matches!(app.transcript_state, TranscriptState::Idle);
+    if is_busy {
+      let inner = block.inner(area);
+      frame.render_widget(block, area);
+
+      // Build pulsing ..:..:..:..:.. pattern
+      let pattern = "..:..:..:..:..";
+      let pattern_len = pattern.len();
+      let elapsed_ms = app.started_at.elapsed().as_millis() as usize;
+      // Shift the "lit" position every 150ms
+      let phase = (elapsed_ms / 150) % pattern_len;
+
+      let accent = theme.accent;
+      let muted = dim_color(theme.border, 0.5);
+
+      let spans: Vec<Span> = pattern
+        .chars()
+        .enumerate()
+        .map(|(i, c)| {
+          // Light up 3 adjacent chars in a sliding window
+          let dist = ((i as isize) - (phase as isize)).unsigned_abs();
+          let dist = dist.min(pattern_len.abs_diff(dist)); // wrap around
+          let color = if dist == 0 {
+            accent
+          } else if dist <= 2 {
+            dim_color(accent, 0.6)
+          } else {
+            muted
+          };
+          Span::styled(c.to_string(), Style::default().fg(color))
+        })
+        .collect();
+
+      // Center vertically and horizontally
+      let mid_y = inner.y.saturating_add(inner.height / 2);
+      let text_w = pattern_len.min(u16::MAX as usize) as u16;
+      let mid_x = inner.x.saturating_add(inner.width.saturating_sub(text_w) / 2);
+      let indicator_area = Rect { x: mid_x, y: mid_y, width: text_w.min(inner.width), height: 1 };
+      frame.render_widget(Line::from(spans), indicator_area);
+    } else {
+      frame.render_widget(block, area);
+    }
     return;
   }
+
+  let title = Line::from(Span::styled(" Transcript ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
+  block = block.title(title);
 
   // Determine current playback time for highlighting
   let current_time_cs: Option<i64> =
@@ -566,6 +597,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let mpv_status = app.player.get_last_mpv_status();
     match mpv_status {
       Some(status) => (format!(" ♪ {}", status), Style::default().fg(theme.status)),
+      None if app.player.is_playing() => (" ♪ Buffering...".to_string(), Style::default().fg(theme.muted)),
       None => (" Ready".to_string(), Style::default().fg(theme.muted)),
     }
   };

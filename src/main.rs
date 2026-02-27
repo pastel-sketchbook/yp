@@ -15,7 +15,7 @@ use ratatui::{
   widgets::ListState,
 };
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -237,6 +237,8 @@ pub struct App {
   /// Cached whisper model instance — loaded once, reused across transcriptions.
   /// The ~460MB model is expensive to load from disk; caching avoids repeated loads.
   whisper_cache: Arc<StdMutex<Option<whisper_cli::Whisper>>>,
+  /// App start instant, used to drive UI animations (e.g. transcript progress indicator).
+  pub started_at: Instant,
 }
 
 impl App {
@@ -278,6 +280,7 @@ impl App {
       transcript_visible: true,
       download_progress: None,
       whisper_cache: Arc::new(StdMutex::new(None)),
+      started_at: Instant::now(),
     }
   }
 
@@ -979,39 +982,33 @@ async fn download_whisper_model(
 /// Restores original file descriptors on drop.
 /// Used to suppress whisper.cpp C library logging that writes directly to fd 1/2.
 struct SuppressStdio {
-  saved_stdout: libc::c_int,
   saved_stderr: libc::c_int,
 }
 
 impl SuppressStdio {
   fn new() -> Self {
     // Safety: dup() and dup2() are standard POSIX calls. We save the original
-    // fd's and redirect to /dev/null. If any call fails, we log a warning
-    // but continue (the worst case is some C logging leaks through).
+    // stderr fd and redirect to /dev/null. We only suppress stderr (fd 2)
+    // because stdout (fd 1) is used by the TUI — redirecting it would make
+    // terminal rendering invisible while whisper transcription runs.
     unsafe {
-      let saved_stdout = libc::dup(1);
       let saved_stderr = libc::dup(2);
       let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
       if devnull >= 0 {
-        libc::dup2(devnull, 1);
         libc::dup2(devnull, 2);
         libc::close(devnull);
       } else {
         warn!("transcript: failed to open /dev/null for stdio suppression");
       }
-      Self { saved_stdout, saved_stderr }
+      Self { saved_stderr }
     }
   }
 }
 
 impl Drop for SuppressStdio {
   fn drop(&mut self) {
-    // Safety: restoring the saved file descriptors to their original values.
+    // Safety: restoring the saved file descriptor to its original value.
     unsafe {
-      if self.saved_stdout >= 0 {
-        libc::dup2(self.saved_stdout, 1);
-        libc::close(self.saved_stdout);
-      }
       if self.saved_stderr >= 0 {
         libc::dup2(self.saved_stderr, 2);
         libc::close(self.saved_stderr);
