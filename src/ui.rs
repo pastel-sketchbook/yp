@@ -613,7 +613,7 @@ fn render_input(frame: &mut Frame, app: &mut App, area: Rect) {
   if is_active {
     let cursor_offset = cursor_col.saturating_sub(scroll_val).min(u16::MAX as usize) as u16;
     let cursor_x = area.x.saturating_add(2).saturating_add(cursor_offset);
-    frame.set_cursor_position((cursor_x, area.y + 1));
+    frame.set_cursor_position((cursor_x, area.y.saturating_add(1)));
   }
 }
 

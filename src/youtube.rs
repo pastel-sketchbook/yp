@@ -282,7 +282,7 @@ pub async fn fetch_sprite_frames(client: &Client, video_id: &str) -> Result<Fram
   }
 
   let json: Value = serde_json::from_slice(&output.stdout).context("Failed to parse yt-dlp JSON for storyboard")?;
-  let meta = parse_storyboard_meta(&json)?;
+  let meta = parse_storyboard_meta(&json).context("Failed to parse storyboard metadata")?;
 
   // Download fragments sequentially to preserve order (they're small images)
   let mut sheets = Vec::with_capacity(meta.fragments.len());

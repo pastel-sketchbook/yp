@@ -14,6 +14,7 @@ use ratatui::{
   layout::Rect,
   widgets::ListState,
 };
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -233,6 +234,9 @@ pub struct App {
   pub transcript_visible: bool,
   /// Whisper model download progress (downloaded, total) for progress bar display.
   pub download_progress: Option<(u64, u64)>,
+  /// Cached whisper model instance — loaded once, reused across transcriptions.
+  /// The ~460MB model is expensive to load from disk; caching avoids repeated loads.
+  whisper_cache: Arc<StdMutex<Option<whisper_cli::Whisper>>>,
 }
 
 impl App {
@@ -273,6 +277,7 @@ impl App {
       utterances: Vec::new(),
       transcript_visible: true,
       download_progress: None,
+      whisper_cache: Arc::new(StdMutex::new(None)),
     }
   }
 
@@ -427,6 +432,7 @@ impl App {
 
     let url = url.to_string();
     let wav = wav_path.clone();
+    let whisper_cache = Arc::clone(&self.whisper_cache);
 
     info!(url = %url, wav = %wav.display(), "transcript: starting audio extraction");
 
@@ -465,26 +471,34 @@ impl App {
             }
           }
 
-          // Stage 3: Transcribe via whisper-cli-rs (with C logging suppressed)
+          // Stage 3: Transcribe via whisper-cli-rs (with C logging suppressed).
+          // Reuse cached Whisper instance to avoid reloading the ~460MB model each time.
           let wav_for_whisper = wav.clone();
+          let cache = Arc::clone(&whisper_cache);
           let transcribe_result = tokio::task::spawn_blocking(move || {
             // Suppress whisper.cpp C library logging (writes directly to stdout/stderr)
             let _guard = SuppressStdio::new();
 
-            info!("transcript: loading whisper model (Small)");
-            let model = whisper_cli::Model::new(whisper_cli::Size::Small);
+            let mut lock = cache.lock().expect("whisper cache mutex poisoned");
+            if lock.is_none() {
+              info!("transcript: loading whisper model (Small) — first time, will be cached");
+              let model = whisper_cli::Model::new(whisper_cli::Size::Small);
 
-            // Model is already downloaded; Whisper::new() will skip download.
-            // We use a nested tokio runtime since Whisper::new() is async but
-            // we're inside spawn_blocking (sync context).
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
-            let whisper = match rt {
-              Ok(rt) => rt.block_on(whisper_cli::Whisper::new(model, Some(whisper_cli::Language::Auto))),
-              Err(e) => {
-                return Err(anyhow::anyhow!("Failed to create tokio runtime for model init: {}", e));
-              }
-            };
-            let mut whisper = whisper;
+              // Model is already downloaded; Whisper::new() will skip download.
+              // We use a nested tokio runtime since Whisper::new() is async but
+              // we're inside spawn_blocking (sync context).
+              let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("Failed to create tokio runtime for model init")?;
+              let whisper = rt.block_on(whisper_cli::Whisper::new(model, Some(whisper_cli::Language::Auto)));
+              *lock = Some(whisper);
+              info!("transcript: whisper model loaded and cached");
+            } else {
+              info!("transcript: reusing cached whisper model");
+            }
+
+            let whisper = lock.as_mut().expect("whisper instance just set above");
 
             info!(wav = %wav_for_whisper.display(), "transcript: starting whisper transcription");
             let transcript =
@@ -1299,7 +1313,8 @@ async fn main() -> Result<()> {
   let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
   tracing_subscriber::fmt()
     .with_writer(non_blocking)
-    .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("yp=debug".parse().unwrap()))
+    // Safety: "yp=debug" is a valid static tracing directive — parse cannot fail.
+    .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("yp=debug".parse().expect("valid tracing directive")))
     .with_ansi(false)
     .with_target(false)
     .init();
@@ -1386,7 +1401,7 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
         }
       } else if app.gfx.last_sent.is_some() {
         if display_mode == DisplayMode::Kitty {
-          kitty_delete_placement()?;
+          kitty_delete_placement().context("Failed to delete kitty image placement")?;
         }
         app.gfx.last_sent = None;
       }
