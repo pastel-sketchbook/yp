@@ -530,7 +530,7 @@ pub async fn list_channel_videos(channel_url: &str, start: usize, count: usize) 
   if count == 0 {
     return Ok(Vec::new());
   }
-  let end = start + count - 1;
+  let end = start.saturating_add(count).saturating_sub(1);
   let playlist_range = format!("{}:{}", start, end);
 
   let output = run_yt_dlp(

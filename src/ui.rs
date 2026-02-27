@@ -133,7 +133,7 @@ fn render_header(frame: &mut Frame, theme: &Theme, area: Rect) {
   let version = format!("v{} ", env!("CARGO_PKG_VERSION"));
   let version_w = (version.len().min(u16::MAX as usize)) as u16;
   let right = Line::from(Span::styled(&version, Style::default().fg(theme.muted)));
-  let right_area = Rect { x: area.x + area.width.saturating_sub(version_w), width: version_w, ..area };
+  let right_area = Rect { x: area.x.saturating_add(area.width.saturating_sub(version_w)), width: version_w, ..area };
   frame.render_widget(right, right_area);
 }
 
@@ -187,7 +187,7 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
   let ideal_h = (thumb_area.width as f32 * 9.0 / 32.0).round() as u16;
   if ideal_h < thumb_area.height {
     let diff = thumb_area.height - ideal_h;
-    thumb_area.y += diff / 2;
+    thumb_area.y = thumb_area.y.saturating_add(diff / 2);
     thumb_area.height = ideal_h;
   }
 
@@ -401,7 +401,7 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
   let mut active_visual_line: usize = 0;
   for (line_i, line) in lines.iter().enumerate() {
     let line_width: usize = line.spans.iter().map(|s| s.content.len()).sum();
-    let visual_rows = if line_width == 0 { 1 } else { line_width.saturating_sub(1) / inner_width + 1 };
+    let visual_rows = if line_width == 0 { 1 } else { (line_width.saturating_sub(1) / inner_width).saturating_add(1) };
 
     if active_line_idx == Some(line_i) {
       active_visual_line = total_visual_lines;
@@ -412,10 +412,10 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
   // Scroll to keep active line visible, falling back to bottom-scroll
   let scroll = if active_line_idx.is_some() {
     // Center the active line in the visible area
-    active_visual_line.saturating_sub(inner_height / 2) as u16
+    active_visual_line.saturating_sub(inner_height / 2).min(u16::MAX as usize) as u16
   } else {
     // No active line — scroll to bottom
-    total_visual_lines.saturating_sub(inner_height) as u16
+    total_visual_lines.saturating_sub(inner_height).min(u16::MAX as usize) as u16
   };
 
   let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false }).scroll((scroll, 0));
@@ -473,10 +473,10 @@ fn render_results(frame: &mut Frame, app: &mut App, area: Rect) {
       } else {
         // Reserve space for right side + 2-char gap
         let right_w = right.chars().count();
-        let title_max = inner_w.saturating_sub(right_w + 2);
+        let title_max = inner_w.saturating_sub(right_w).saturating_sub(2);
         let title = truncate_str(&entry.title, title_max);
         let title_w = title.chars().count();
-        let gap = inner_w.saturating_sub(title_w + right_w);
+        let gap = inner_w.saturating_sub(title_w).saturating_sub(right_w);
 
         let padding: String = " ".repeat(gap);
 
@@ -694,7 +694,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
   let right_label = format!("{} | {} ", app.frame_mode.label(), theme.name);
   let right_w = (right_label.len().min(u16::MAX as usize)) as u16;
   let right = Line::from(Span::styled(&right_label, Style::default().fg(theme.muted)));
-  let right_area = Rect { x: area.x + area.width.saturating_sub(right_w), width: right_w, ..area };
+  let right_area = Rect { x: area.x.saturating_add(area.width.saturating_sub(right_w)), width: right_w, ..area };
   frame.render_widget(right, right_area);
 }
 

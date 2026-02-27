@@ -1119,8 +1119,8 @@ async fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()> {
 
   match app.mode {
     AppMode::Input => handle_input_key(app, key),
-    AppMode::Results => handle_results_key(app, key).await?,
-    AppMode::Filter => handle_filter_key(app, key).await?,
+    AppMode::Results => handle_results_key(app, key).await.context("Failed to handle results key event")?,
+    AppMode::Filter => handle_filter_key(app, key).await.context("Failed to handle filter key event")?,
   }
   Ok(())
 }
@@ -1205,7 +1205,7 @@ async fn handle_results_key(app: &mut App, key: event::KeyEvent) -> Result<()> {
         app.list_state.select(Some(i));
         // Trigger background load when within 5 items of the bottom (use actual index)
         if let Some(&actual_idx) = app.filtered_indices.get(i)
-          && actual_idx + 5 >= app.search_results.len()
+          && actual_idx >= app.search_results.len().saturating_sub(5)
         {
           app.trigger_load_more();
         }
@@ -1271,7 +1271,7 @@ async fn handle_filter_key(app: &mut App, key: event::KeyEvent) -> Result<()> {
         app.list_state.select(Some(i));
         // Trigger pagination if near bottom of actual results
         if let Some(&actual_idx) = app.filtered_indices.get(i)
-          && actual_idx + 5 >= app.search_results.len()
+          && actual_idx >= app.search_results.len().saturating_sub(5)
         {
           app.trigger_load_more();
         }
@@ -1354,7 +1354,7 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
   let uses_graphics_protocol = matches!(display_mode, DisplayMode::Kitty | DisplayMode::Sixel);
 
   loop {
-    app.check_pending().await?;
+    app.check_pending().await.context("Failed to check pending async tasks")?;
     app.player.check_mpv_status();
 
     // Update frame source image if available and time position changed
@@ -1392,8 +1392,8 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
             // Image ID i=1 with placement p=1 atomically replaces the
             // previous image — no need to delete first.
             match display_mode {
-              DisplayMode::Kitty => kitty_render_image(image, area)?,
-              DisplayMode::Sixel => sixel_render_image(image, area)?,
+              DisplayMode::Kitty => kitty_render_image(image, area).context("Failed to render kitty thumbnail")?,
+              DisplayMode::Sixel => sixel_render_image(image, area).context("Failed to render sixel thumbnail")?,
               _ => {}
             }
             app.gfx.last_sent = Some(key);
@@ -1413,7 +1413,7 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
     if event::poll(Duration::from_millis(100)).context("Failed to poll for terminal events")? {
       match event::read().context("Failed to read terminal event")? {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
-          handle_key_event(&mut app, key).await?;
+          handle_key_event(&mut app, key).await.context("Failed to handle key event")?;
         }
         _ => {}
       }
