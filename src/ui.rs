@@ -107,27 +107,32 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
   }
 
   if let Some((ref video_id, ref image)) = app.player.cached_thumbnail {
-    let needs_resize = match &app.gfx.resized_thumb {
-      Some((id, w, h, _)) => id != video_id || *w != thumb_area.width || *h != thumb_area.height,
-      None => true,
-    };
-    if needs_resize {
-      let target_w = thumb_area.width as u32;
-      let target_h = match app.player.display_mode {
-        DisplayMode::Direct => (target_w as f32 * 9.0 / 16.0) as u32,
-        _ => (target_w as f32 * 9.0 / 32.0) as u32,
-      };
-      let resized = image.resize_to_fill(target_w, target_h.max(1), FilterType::Lanczos3);
-      app.gfx.resized_thumb = Some((video_id.clone(), thumb_area.width, thumb_area.height, resized));
-    }
-
-    if let Some((_, _, _, ref resized)) = app.gfx.resized_thumb {
-      let widget = ThumbnailWidget { image: resized, display_mode: app.player.display_mode };
-      frame.render_widget(widget, thumb_area);
-    }
-
     if matches!(app.player.display_mode, DisplayMode::Kitty | DisplayMode::Sixel) {
+      // Kitty/Sixel: rendering is handled outside ratatui (in run loop).
+      // Just record the area — skip the expensive resize and widget render
+      // that are only used by Direct/Ascii modes.
+      let _ = (video_id, image); // suppress unused warnings
       app.gfx.thumb_area = Some(thumb_area);
+    } else {
+      // Direct/Ascii: resize and render via ThumbnailWidget into the ratatui buffer.
+      let needs_resize = match &app.gfx.resized_thumb {
+        Some((id, w, h, _)) => id != video_id || *w != thumb_area.width || *h != thumb_area.height,
+        None => true,
+      };
+      if needs_resize {
+        let target_w = thumb_area.width as u32;
+        let target_h = match app.player.display_mode {
+          DisplayMode::Direct => (target_w as f32 * 9.0 / 16.0) as u32,
+          _ => (target_w as f32 * 9.0 / 32.0) as u32,
+        };
+        let resized = image.resize_to_fill(target_w, target_h.max(1), FilterType::Lanczos3);
+        app.gfx.resized_thumb = Some((video_id.clone(), thumb_area.width, thumb_area.height, resized));
+      }
+
+      if let Some((_, _, _, ref resized)) = app.gfx.resized_thumb {
+        let widget = ThumbnailWidget { image: resized, display_mode: app.player.display_mode };
+        frame.render_widget(widget, thumb_area);
+      }
     }
   }
 
@@ -139,7 +144,8 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
     .title(info_title)
     .border_type(ratatui::widgets::BorderType::Rounded)
     .border_style(Style::default().fg(theme.border))
-    .padding(Padding::horizontal(1));
+    .padding(Padding::horizontal(1))
+    .style(Style::default().bg(theme.panel_bg));
 
   if let Some(details) = &app.player.current_details {
     let inner_w = info_area.width.saturating_sub(4) as usize;
@@ -349,6 +355,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
       let mut k = vec![("Enter", "Search"), ("^t", "Theme"), ("^f", "Frame")];
       if is_playing {
         k.push(("^s", "Stop"));
+        k.push(("^o", "Open"));
       }
       if has_results {
         k.push(("↓", "Results"));
@@ -364,6 +371,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         let pause_label = if app.player.paused { "Resume" } else { "Pause" };
         k.push(("Space", pause_label));
         k.push(("^s", "Stop"));
+        k.push(("^o", "Open"));
       }
       k.push(("^t", "Theme"));
       k.push(("^f", "Frame"));

@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use display::{CliDisplayMode, DisplayMode};
-use graphics::{kitty_delete_all, kitty_render_image, sixel_render_image};
+use graphics::{kitty_delete_all, kitty_delete_placement, kitty_render_image, sixel_render_image};
 use player::{MusicPlayer, VideoDetails};
 use theme::THEMES;
 use youtube::{
@@ -622,6 +622,27 @@ async fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()> {
     return Ok(());
   }
 
+  if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+    if let Some(ref details) = app.player.current_details {
+      let url = details.url.clone();
+      // Use platform-appropriate command to open URL in default browser.
+      #[cfg(target_os = "macos")]
+      let cmd = "open";
+      #[cfg(not(target_os = "macos"))]
+      let cmd = "xdg-open";
+      if let Err(e) = std::process::Command::new(cmd)
+        .arg(&url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+      {
+        app.last_error = Some(format!("Failed to open browser: {}", e));
+      }
+    }
+    return Ok(());
+  }
+
   match app.mode {
     AppMode::Input => handle_input_key(app, key),
     AppMode::Results => handle_results_key(app, key).await?,
@@ -772,13 +793,20 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
     terminal.draw(|frame| ui::ui(frame, &mut app))?;
 
     if uses_graphics_protocol {
+      // Wrap graphics protocol output in synchronized update markers so the
+      // terminal treats the ratatui cell updates + image data as one atomic
+      // frame, preventing visible gaps between cell clear and image render.
+      use std::io::Write;
+      let mut stdout = std::io::stdout();
+      let _ = write!(stdout, "\x1B[?2026h"); // BeginSynchronizedUpdate
+      let _ = stdout.flush();
+
       if let Some(area) = app.gfx.thumb_area {
         if let Some((ref video_id, ref image)) = app.player.cached_thumbnail {
           let key = (video_id.clone(), area);
           if app.gfx.last_sent.as_ref() != Some(&key) {
-            if display_mode == DisplayMode::Kitty {
-              kitty_delete_all()?;
-            }
+            // Image ID i=1 with placement p=1 atomically replaces the
+            // previous image — no need to delete first.
             match display_mode {
               DisplayMode::Kitty => kitty_render_image(image, area)?,
               DisplayMode::Sixel => sixel_render_image(image, area)?,
@@ -789,10 +817,13 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
         }
       } else if app.gfx.last_sent.is_some() {
         if display_mode == DisplayMode::Kitty {
-          kitty_delete_all()?;
+          kitty_delete_placement()?;
         }
         app.gfx.last_sent = None;
       }
+
+      let _ = write!(stdout, "\x1B[?2026l"); // EndSynchronizedUpdate
+      let _ = stdout.flush();
     }
 
     if event::poll(Duration::from_millis(100))? {

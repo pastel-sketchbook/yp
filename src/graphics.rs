@@ -91,17 +91,30 @@ fn render_ascii(image: &DynamicImage, area: Rect, buf: &mut Buffer) {
 //
 // Sends an image to the terminal using the Kitty graphics protocol (OSC APC).
 //
-//   Transmit:  \x1B_G a=T,f=100,t=d,c=<cols>,r=<rows>,q=2,m=1;<base64 chunk>\x1B\\
+//   Transmit:  \x1B_G a=T,f=100,t=d,i=1,p=1,c=<cols>,r=<rows>,q=2,m=1;<base64 chunk>\x1B\\
 //   Continue:  \x1B_G m=1;<base64 chunk>\x1B\\
 //   Last:      \x1B_G m=0;<base64 chunk>\x1B\\
-//   Delete:    \x1B_G a=d,d=a,q=2\x1B\\
+//   Delete placement: \x1B_G a=d,d=i,i=1,q=2\x1B\\
+//   Delete all:       \x1B_G a=d,d=a,q=2\x1B\\
+//
+// Using `i=1` (image ID) and `p=1` (placement ID) allows atomic replacement:
+// re-sending with the same ID replaces the previous image without a visible gap.
 //
 // The image is encoded as PNG, base64'd, and sent in <=4096-byte chunks.
 // `c` and `r` tell the terminal how many columns/rows to scale the image over.
 
 const KITTY_CHUNK_SIZE: usize = 4096;
 
-/// Delete all Kitty images currently displayed.
+/// Delete the image placement with `i=1` (targeted cleanup without affecting other images).
+/// Use this when leaving the player view or clearing the thumbnail area.
+pub fn kitty_delete_placement() -> Result<()> {
+  let mut stdout = std::io::stdout();
+  write!(stdout, "\x1B_Ga=d,d=i,i=1,q=2\x1B\\")?;
+  stdout.flush().context("Failed to flush kitty delete placement")?;
+  Ok(())
+}
+
+/// Delete all Kitty images currently displayed (used on app exit).
 pub fn kitty_delete_all() -> Result<()> {
   let mut stdout = std::io::stdout();
   write!(stdout, "\x1B_Ga=d,d=a,q=2\x1B\\")?;
@@ -137,7 +150,7 @@ pub fn kitty_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
     let more = if i < last { 1 } else { 0 };
 
     if i == 0 {
-      write!(stdout, "\x1B_Ga=T,f=100,t=d,c={},r={},q=2,m={};{}\x1B\\", area.width, area.height, more, data)?;
+      write!(stdout, "\x1B_Ga=T,f=100,t=d,i=1,p=1,c={},r={},q=2,m={};{}\x1B\\", area.width, area.height, more, data)?;
     } else {
       write!(stdout, "\x1B_Gm={};{}\x1B\\", more, data)?;
     }
