@@ -418,22 +418,12 @@ impl App {
     // sox `rec` args:
     //   rate 16000       — 16kHz sample rate (what Whisper expects)
     //   channels 1       — mono
-    //   silence 1 2.0 3% — auto-stop after 2s of silence below 3%
     //
-    // No leading silence gate — recording starts immediately so we don't
-    // miss audio if the mic level is low or the user is already speaking.
+    // No silence effect — it trims audio below the threshold, producing
+    // empty files when mic levels are low. Instead we record continuously
+    // and rely on Ctrl+A (manual stop) or the max duration safety guard.
     let child = tokio::process::Command::new("rec")
-      .args([
-        wav_path.to_str().unwrap_or("/tmp/yp-voice.wav"),
-        "rate",
-        "16000",
-        "channels",
-        "1",
-        "silence",
-        "1",
-        "2.0",
-        "3%",
-      ])
+      .args([wav_path.to_str().unwrap_or("/tmp/yp-voice.wav"), "rate", "16000", "channels", "1"])
       .stdin(std::process::Stdio::null())
       .stdout(std::process::Stdio::null())
       .stderr(std::process::Stdio::null())
