@@ -416,11 +416,12 @@ impl App {
     let _ = std::fs::remove_file(&wav_path);
 
     // sox `rec` args:
-    //   -r 16000        — 16kHz sample rate (what Whisper expects)
-    //   -c 1            — mono
-    //   -b 16           — 16-bit depth
-    //   silence 1 0.1 3%  — start recording when sound exceeds 3% for 0.1s
-    //   1 2.0 3%        — stop after 2s of silence below 3%
+    //   rate 16000       — 16kHz sample rate (what Whisper expects)
+    //   channels 1       — mono
+    //   silence 1 2.0 3% — auto-stop after 2s of silence below 3%
+    //
+    // No leading silence gate — recording starts immediately so we don't
+    // miss audio if the mic level is low or the user is already speaking.
     let child = tokio::process::Command::new("rec")
       .args([
         wav_path.to_str().unwrap_or("/tmp/yp-voice.wav"),
@@ -429,9 +430,6 @@ impl App {
         "channels",
         "1",
         "silence",
-        "1",
-        "0.1",
-        "3%",
         "1",
         "2.0",
         "3%",
