@@ -4053,7 +4053,7 @@ dependencies = [
 
 [[package]]
 name = "yp"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "base64",

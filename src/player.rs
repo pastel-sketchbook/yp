@@ -1,10 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use image::DynamicImage;
 use reqwest::Client;
-use std::{
-  process::Stdio,
-  sync::{Arc, Mutex},
-};
+use std::process::Stdio;
 use tokio::{
   io::AsyncBufReadExt,
   io::BufReader as TokioBufReader,
@@ -33,7 +30,7 @@ pub struct MusicPlayer {
   pub cached_thumbnail: Option<(String, DynamicImage)>,
   mpv_monitor_handle: Option<JoinHandle<()>>,
   mpv_status_rx: Option<mpsc::Receiver<String>>,
-  last_mpv_status: Arc<Mutex<Option<String>>>,
+  last_mpv_status: Option<String>,
   ipc_socket_path: Option<String>,
   pub paused: bool,
 }
@@ -48,7 +45,7 @@ impl MusicPlayer {
       cached_thumbnail: None,
       mpv_monitor_handle: None,
       mpv_status_rx: None,
-      last_mpv_status: Arc::new(Mutex::new(None)),
+      last_mpv_status: None,
       ipc_socket_path: None,
       paused: false,
     }
@@ -61,16 +58,13 @@ impl MusicPlayer {
   pub fn check_mpv_status(&mut self) {
     if let Some(rx) = &mut self.mpv_status_rx {
       while let Ok(status) = rx.try_recv() {
-        // safety: mutex is only locked briefly and we never panic while holding it
-        let mut last_status = self.last_mpv_status.lock().expect("mpv status mutex poisoned");
-        *last_status = Some(status);
+        self.last_mpv_status = Some(status);
       }
     }
   }
 
   pub fn get_last_mpv_status(&self) -> Option<String> {
-    // safety: mutex is only locked briefly and we never panic while holding it
-    self.last_mpv_status.lock().expect("mpv status mutex poisoned").clone()
+    self.last_mpv_status.clone()
   }
 
   pub async fn play(&mut self, details: VideoDetails) -> Result<()> {
@@ -78,7 +72,8 @@ impl MusicPlayer {
     self.current_details = Some(details.clone());
     self.paused = false;
 
-    let socket_path = format!("/tmp/yp-mpv-{}.sock", std::process::id());
+    let socket_path = std::env::temp_dir().join(format!("yp-mpv-{}.sock", std::process::id()));
+    let socket_path_str = socket_path.to_str().context("Temp dir path is not valid UTF-8")?.to_string();
     // Remove stale socket if it exists from a previous crash.
     let _ = std::fs::remove_file(&socket_path);
 
@@ -86,7 +81,7 @@ impl MusicPlayer {
     cmd.args([
       "--no-video",
       "--term-status-msg=Time: ${time-pos/full} / ${duration/full} | Title: ${media-title} | ${pause} ${percent-pos}%",
-      &format!("--input-ipc-server={}", socket_path),
+      &format!("--input-ipc-server={}", socket_path_str),
       &details.url,
     ]);
     cmd.stdin(Stdio::null());
@@ -117,7 +112,7 @@ impl MusicPlayer {
 
     self.current_process = Some(child);
     self.mpv_monitor_handle = Some(monitor_handle);
-    self.ipc_socket_path = Some(socket_path);
+    self.ipc_socket_path = Some(socket_path_str);
     Ok(())
   }
 
@@ -138,8 +133,7 @@ impl MusicPlayer {
       let _ = handle.await;
     }
     self.mpv_status_rx = None;
-    // safety: mutex is only locked briefly and we never panic while holding it
-    *self.last_mpv_status.lock().expect("mpv status mutex poisoned") = None;
+    self.last_mpv_status = None;
 
     if let Some(mut child) = self.current_process.take() {
       child.kill().await.context("Failed to kill mpv process")?;

@@ -3,11 +3,37 @@ use image::DynamicImage;
 use reqwest::Client;
 use serde_json::Value;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 use tokio::process::{Child as TokioChild, Command};
 use tokio::sync::mpsc;
 
 use crate::player::VideoDetails;
+
+// --- Shared Helpers ---
+
+/// Parse an optional yt-dlp field value: trim, filter empty/"NA" sentinel.
+fn opt_field(s: Option<&str>) -> Option<String> {
+  s.map(str::trim).filter(|s| !s.is_empty() && *s != "NA").map(|s| s.to_string())
+}
+
+/// Spawn a yt-dlp command with the given arguments and wait for it to finish.
+/// Provides a consistent "yt-dlp not found" error message across all call sites.
+async fn run_yt_dlp(args: &[&str], context: &str) -> Result<Output> {
+  Command::new("yt-dlp")
+    .args(args)
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .output()
+    .await
+    .map_err(|e| {
+      if e.kind() == std::io::ErrorKind::NotFound {
+        anyhow!("yt-dlp not found. Install it with: brew install yt-dlp (macOS) or pip install yt-dlp")
+      } else {
+        anyhow!(e).context(format!("Failed to execute yt-dlp for {}", context))
+      }
+    })
+}
 
 // --- Frame Sources ---
 
@@ -229,14 +255,7 @@ fn parse_storyboard_meta(json: &Value) -> Result<StoryboardMeta> {
 /// the static thumbnail continues to work.
 pub async fn fetch_sprite_frames(client: &Client, video_id: &str) -> Result<FrameSource> {
   let url = format!("https://youtube.com/watch?v={}", video_id);
-  let output = Command::new("yt-dlp")
-    .args(["--dump-json", "--no-warnings", "--", &url])
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null())
-    .output()
-    .await
-    .context("Failed to run yt-dlp for storyboard info")?;
+  let output = run_yt_dlp(&["--dump-json", "--no-warnings", "--", &url], "storyboard info").await?;
 
   if !output.status.success() {
     return Err(anyhow!("yt-dlp --dump-json failed for storyboard"));
@@ -250,11 +269,10 @@ pub async fn fetch_sprite_frames(client: &Client, video_id: &str) -> Result<Fram
   let mut durations = Vec::with_capacity(meta.fragments.len());
 
   for frag in &meta.fragments {
-    let response = client
-      .get(&frag.url)
-      .send()
-      .await
-      .with_context(|| format!("Failed to fetch storyboard sheet: {}", &frag.url[..60.min(frag.url.len())]))?;
+    let response = client.get(&frag.url).send().await.with_context(|| {
+      let truncated: String = frag.url.chars().take(60).collect();
+      format!("Failed to fetch storyboard sheet: {}", truncated)
+    })?;
     let bytes = response.bytes().await.context("Failed to read storyboard sheet bytes")?;
     let image = image::load_from_memory(&bytes).context("Failed to decode storyboard sprite sheet")?;
     sheets.push(image);
@@ -280,14 +298,11 @@ pub async fn fetch_sprite_frames(client: &Client, video_id: &str) -> Result<Fram
 /// frames appear on disk as ffmpeg processes the stream.
 pub async fn fetch_video_frames(video_id: &str) -> Result<FrameSource> {
   let yt_url = format!("https://youtube.com/watch?v={}", video_id);
-  let output = Command::new("yt-dlp")
-    .args(["--get-url", "-f", "bestvideo[height<=480]/bestvideo", "--no-warnings", "--", &yt_url])
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null())
-    .output()
-    .await
-    .context("Failed to run yt-dlp --get-url for video frames")?;
+  let output = run_yt_dlp(
+    &["--get-url", "-f", "bestvideo[height<=480]/bestvideo", "--no-warnings", "--", &yt_url],
+    "video frames",
+  )
+  .await?;
 
   if !output.status.success() {
     return Err(anyhow!("yt-dlp --get-url failed for video frame extraction"));
@@ -298,7 +313,7 @@ pub async fn fetch_video_frames(video_id: &str) -> Result<FrameSource> {
     return Err(anyhow!("yt-dlp returned empty stream URL"));
   }
 
-  let frames_dir = PathBuf::from(format!("/tmp/yp-frames-{}-{}", std::process::id(), video_id));
+  let frames_dir = std::env::temp_dir().join(format!("yp-frames-{}-{}", std::process::id(), video_id));
   std::fs::create_dir_all(&frames_dir).context("Failed to create temp dir for video frames")?;
 
   let output_pattern = frames_dir.join("frame_%04d.jpg");
@@ -358,13 +373,13 @@ pub struct SearchEntry {
 
 /// Clean yt-dlp's Python-list repr of tags into a comma-separated string.
 /// e.g. `['rock', 'music', 'guitar']` → `rock, music, guitar`
-fn clean_tags(raw: &str) -> String {
+pub(crate) fn clean_tags(raw: &str) -> String {
   raw.trim_start_matches('[').trim_end_matches(']').replace('\'', "")
 }
 
 /// Parse a single tab-separated yt-dlp output line into a SearchEntry.
 /// Expected format: `title\tid[\tupload_date\ttags]`
-fn parse_search_line(line: &str) -> Option<SearchEntry> {
+pub(crate) fn parse_search_line(line: &str) -> Option<SearchEntry> {
   let parts: Vec<&str> = line.split('\t').collect();
   if parts.len() < 2 {
     return None;
@@ -374,11 +389,8 @@ fn parse_search_line(line: &str) -> Option<SearchEntry> {
   if video_id.is_empty() {
     return None;
   }
-  let opt = |idx: usize| -> Option<String> {
-    parts.get(idx).map(|s| s.trim()).filter(|s| !s.is_empty() && *s != "NA").map(|s| s.to_string())
-  };
-  let upload_date = opt(2);
-  let tags = opt(3).map(|s| clean_tags(&s)).filter(|s| !s.is_empty());
+  let upload_date = opt_field(parts.get(2).copied());
+  let tags = opt_field(parts.get(3).copied()).map(|s| clean_tags(&s)).filter(|s| !s.is_empty());
   let enriched = upload_date.is_some() || tags.is_some();
   Some(SearchEntry { title, video_id, upload_date, tags, enriched })
 }
@@ -452,13 +464,8 @@ pub async fn enrich_video_metadata(video_ids: Vec<String>, tx: mpsc::Sender<Vide
       let tx = tx.clone();
       async move {
         let url = format!("https://youtube.com/watch?v={}", video_id);
-        let result = Command::new("yt-dlp")
-          .args(["--skip-download", "--print", ENRICH_FORMAT, "--no-warnings", "--", &url])
-          .stdin(Stdio::null())
-          .stdout(Stdio::piped())
-          .stderr(Stdio::null())
-          .output()
-          .await;
+        let result =
+          run_yt_dlp(&["--skip-download", "--print", ENRICH_FORMAT, "--no-warnings", "--", &url], "enrichment").await;
 
         if let Ok(output) = result
           && output.status.success()
@@ -467,11 +474,8 @@ pub async fn enrich_video_metadata(video_ids: Vec<String>, tx: mpsc::Sender<Vide
           let line = stdout.trim();
           let parts: Vec<&str> = line.split('\t').collect();
           if !parts.is_empty() && !parts[0].is_empty() {
-            let opt = |idx: usize| -> Option<String> {
-              parts.get(idx).map(|s| s.trim()).filter(|s| !s.is_empty() && *s != "NA").map(|s| s.to_string())
-            };
-            let upload_date = opt(1);
-            let tags = opt(2).map(|s| clean_tags(&s)).filter(|s| !s.is_empty());
+            let upload_date = opt_field(parts.get(1).copied());
+            let tags = opt_field(parts.get(2).copied()).map(|s| clean_tags(&s)).filter(|s| !s.is_empty());
             let _ = tx.send(VideoMeta { video_id: parts[0].trim().to_string(), upload_date, tags }).await;
           }
         }
@@ -489,8 +493,8 @@ pub async fn list_channel_videos(channel_url: &str, start: usize, count: usize) 
   let end = start + count - 1;
   let playlist_range = format!("{}:{}", start, end);
 
-  let output = Command::new("yt-dlp")
-    .args([
+  let output = run_yt_dlp(
+    &[
       "--flat-playlist",
       "--print",
       "%(title)s\t%(id)s",
@@ -500,19 +504,10 @@ pub async fn list_channel_videos(channel_url: &str, start: usize, count: usize) 
       "--ignore-errors",
       "--",
       channel_url,
-    ])
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .output()
-    .await
-    .map_err(|e| {
-      if e.kind() == std::io::ErrorKind::NotFound {
-        anyhow!("yt-dlp not found. Install it with: brew install yt-dlp (macOS) or pip install yt-dlp")
-      } else {
-        anyhow!(e).context("Failed to execute yt-dlp channel listing")
-      }
-    })?;
+    ],
+    "channel listing",
+  )
+  .await?;
 
   if !output.status.success() {
     return Err(anyhow!("yt-dlp channel listing failed: {}", String::from_utf8_lossy(&output.stderr)));
@@ -524,8 +519,8 @@ pub async fn list_channel_videos(channel_url: &str, start: usize, count: usize) 
 }
 
 pub async fn search_youtube(query: &str) -> Result<Vec<SearchEntry>> {
-  let output = Command::new("yt-dlp")
-    .args([
+  let output = run_yt_dlp(
+    &[
       "--print",
       PRINT_FORMAT,
       "--default-search",
@@ -536,19 +531,10 @@ pub async fn search_youtube(query: &str) -> Result<Vec<SearchEntry>> {
       "--no-warnings",
       "--",
       query,
-    ])
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .output()
-    .await
-    .map_err(|e| {
-      if e.kind() == std::io::ErrorKind::NotFound {
-        anyhow!("yt-dlp not found. Install it with: brew install yt-dlp (macOS) or pip install yt-dlp")
-      } else {
-        anyhow!(e).context("Failed to execute yt-dlp search command")
-      }
-    })?;
+    ],
+    "search",
+  )
+  .await?;
 
   if !output.status.success() {
     return Err(anyhow!("yt-dlp search failed: {}", String::from_utf8_lossy(&output.stderr)));
@@ -560,8 +546,8 @@ pub async fn search_youtube(query: &str) -> Result<Vec<SearchEntry>> {
 
 pub async fn get_video_info(video_id: &str) -> Result<VideoDetails> {
   let url = format!("https://youtube.com/watch?v={}", video_id);
-  let output = Command::new("yt-dlp")
-    .args([
+  let output = run_yt_dlp(
+    &[
       "--print",
       "%(title)s",
       "--print",
@@ -575,32 +561,19 @@ pub async fn get_video_info(video_id: &str) -> Result<VideoDetails> {
       "--no-warnings",
       "--",
       &url,
-    ])
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .output()
-    .await
-    .map_err(|e| {
-      if e.kind() == std::io::ErrorKind::NotFound {
-        anyhow!("yt-dlp not found. Install it with: brew install yt-dlp (macOS) or pip install yt-dlp")
-      } else {
-        anyhow!(e).context("Failed to execute yt-dlp to get video info")
-      }
-    })?;
-
-  let opt = |s: Option<&str>| -> Option<String> {
-    s.map(str::trim).filter(|s| !s.is_empty() && *s != "NA").map(|s| s.to_string())
-  };
+    ],
+    "video info",
+  )
+  .await?;
 
   if output.status.success() {
     let info_str = String::from_utf8(output.stdout).context("Failed to parse yt-dlp info output as UTF-8")?;
     let mut lines = info_str.lines();
     let title = lines.next().map(|s| s.trim().to_string()).ok_or_else(|| anyhow!("Missing title in yt-dlp output"))?;
-    let uploader = opt(lines.next());
-    let duration = opt(lines.next());
-    let upload_date = opt(lines.next());
-    let tags = opt(lines.next())
+    let uploader = opt_field(lines.next());
+    let duration = opt_field(lines.next());
+    let upload_date = opt_field(lines.next());
+    let tags = opt_field(lines.next())
       .map(|s| clean_tags(&s))
       .filter(|s| !s.is_empty())
       .map(|s| s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
@@ -637,4 +610,139 @@ pub async fn fetch_thumbnail(client: &Client, video_id: &str) -> Result<DynamicI
     }
   }
   Err(anyhow!("Failed to fetch any thumbnail for video ID: {}", video_id))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  // --- clean_tags ---
+
+  #[test]
+  fn clean_tags_python_list() {
+    assert_eq!(clean_tags("['rock', 'music', 'guitar']"), "rock, music, guitar");
+  }
+
+  #[test]
+  fn clean_tags_empty_list() {
+    assert_eq!(clean_tags("[]"), "");
+  }
+
+  #[test]
+  fn clean_tags_single_item() {
+    assert_eq!(clean_tags("['jazz']"), "jazz");
+  }
+
+  #[test]
+  fn clean_tags_no_brackets() {
+    assert_eq!(clean_tags("rock, pop"), "rock, pop");
+  }
+
+  // --- parse_search_line ---
+
+  #[test]
+  fn parse_search_line_basic() {
+    let entry = parse_search_line("My Song\tabc123").unwrap();
+    assert_eq!(entry.title, "My Song");
+    assert_eq!(entry.video_id, "abc123");
+    assert_eq!(entry.upload_date, None);
+    assert_eq!(entry.tags, None);
+    assert!(!entry.enriched);
+  }
+
+  #[test]
+  fn parse_search_line_with_date_and_tags() {
+    let entry = parse_search_line("Title\tvid1\t2024-01-15\t['rock', 'pop']").unwrap();
+    assert_eq!(entry.title, "Title");
+    assert_eq!(entry.video_id, "vid1");
+    assert_eq!(entry.upload_date, Some("2024-01-15".to_string()));
+    assert_eq!(entry.tags, Some("rock, pop".to_string()));
+    assert!(entry.enriched);
+  }
+
+  #[test]
+  fn parse_search_line_with_na_fields() {
+    let entry = parse_search_line("Title\tvid2\tNA\tNA").unwrap();
+    assert_eq!(entry.upload_date, None);
+    assert_eq!(entry.tags, None);
+    assert!(!entry.enriched);
+  }
+
+  #[test]
+  fn parse_search_line_empty() {
+    assert!(parse_search_line("").is_none());
+  }
+
+  #[test]
+  fn parse_search_line_no_id() {
+    assert!(parse_search_line("Title\t").is_none());
+  }
+
+  #[test]
+  fn parse_search_line_single_field() {
+    assert!(parse_search_line("JustATitle").is_none());
+  }
+
+  // --- detect_channel_url ---
+
+  #[test]
+  fn detect_channel_bare_handle() {
+    assert_eq!(detect_channel_url("@TwoSetViolin"), Some("https://www.youtube.com/@TwoSetViolin/videos".to_string()));
+  }
+
+  #[test]
+  fn detect_channel_handle_with_spaces_is_none() {
+    assert_eq!(detect_channel_url("@Two Set"), None);
+  }
+
+  #[test]
+  fn detect_channel_url_full() {
+    assert_eq!(
+      detect_channel_url("https://www.youtube.com/@TwoSetViolin"),
+      Some("https://www.youtube.com/@TwoSetViolin/videos".to_string())
+    );
+  }
+
+  #[test]
+  fn detect_channel_url_already_has_videos() {
+    assert_eq!(
+      detect_channel_url("https://www.youtube.com/@TwoSetViolin/videos"),
+      Some("https://www.youtube.com/@TwoSetViolin/videos".to_string())
+    );
+  }
+
+  #[test]
+  fn detect_channel_url_channel_id() {
+    assert_eq!(
+      detect_channel_url("https://www.youtube.com/channel/UC123abc"),
+      Some("https://www.youtube.com/channel/UC123abc/videos".to_string())
+    );
+  }
+
+  #[test]
+  fn detect_channel_prefix_command() {
+    assert_eq!(
+      detect_channel_url("/channel TwoSetViolin"),
+      Some("https://www.youtube.com/@TwoSetViolin/videos".to_string())
+    );
+  }
+
+  #[test]
+  fn detect_channel_prefix_with_handle() {
+    assert_eq!(
+      detect_channel_url("/channel @TwoSetViolin"),
+      Some("https://www.youtube.com/@TwoSetViolin/videos".to_string())
+    );
+  }
+
+  #[test]
+  fn detect_channel_regular_search() {
+    assert_eq!(detect_channel_url("beethoven moonlight sonata"), None);
+  }
+
+  #[test]
+  fn detect_channel_bare_at_sign() {
+    // Single @ with nothing else
+    assert_eq!(detect_channel_url("@"), None);
+  }
 }

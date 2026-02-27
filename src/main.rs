@@ -132,6 +132,35 @@ pub enum AppMode {
   Results,
 }
 
+/// Terminal graphics protocol rendering state (Kitty/Sixel).
+#[derive(Default)]
+pub struct GraphicsCache {
+  pub thumb_area: Option<Rect>,
+  pub last_sent: Option<(String, Rect)>,
+  pub resized_thumb: Option<(String, u16, u16, DynamicImage)>,
+}
+
+/// Frame source state for storyboard/video frame display during playback.
+#[derive(Default)]
+struct FrameState {
+  source: Option<FrameSource>,
+  source_rx: Option<oneshot::Receiver<Result<FrameSource>>>,
+  idx: Option<usize>,
+  /// The original thumbnail image (before storyboard/video frames replace it).
+  /// Used to restore the thumbnail when cycling frame modes.
+  original_thumbnail: Option<(String, DynamicImage)>,
+}
+
+/// In-flight async task receivers and handles.
+#[derive(Default)]
+struct AsyncTasks {
+  search_rx: Option<oneshot::Receiver<Result<SearchResult>>>,
+  load_rx: Option<oneshot::Receiver<Result<LoadResult>>>,
+  more_rx: Option<oneshot::Receiver<Result<SearchResult>>>,
+  enrich_rx: Option<mpsc::Receiver<VideoMeta>>,
+  enrich_handle: Option<JoinHandle<()>>,
+}
+
 pub struct App {
   pub input: String,
   pub cursor_position: usize,
@@ -144,22 +173,11 @@ pub struct App {
   pub last_error: Option<String>,
   pub status_message: Option<String>,
   pub should_quit: bool,
-  search_rx: Option<oneshot::Receiver<Result<SearchResult>>>,
-  load_rx: Option<oneshot::Receiver<Result<LoadResult>>>,
-  more_rx: Option<oneshot::Receiver<Result<SearchResult>>>,
-  enrich_rx: Option<mpsc::Receiver<VideoMeta>>,
-  enrich_handle: Option<JoinHandle<()>>,
-  frame_source: Option<FrameSource>,
-  frame_source_rx: Option<oneshot::Receiver<Result<FrameSource>>>,
-  frame_idx: Option<usize>,
-  /// The original thumbnail image (before storyboard/video frames replace it).
-  /// Used to restore the thumbnail when cycling frame modes.
-  original_thumbnail: Option<(String, DynamicImage)>,
   pub channel_source: Option<ChannelSource>,
-  pub graphics_thumb_area: Option<Rect>,
-  pub graphics_last_sent: Option<(String, Rect)>,
-  pub cached_resized_thumb: Option<(String, u16, u16, DynamicImage)>,
   pub input_scroll: usize,
+  pub gfx: GraphicsCache,
+  frames: FrameState,
+  tasks: AsyncTasks,
 }
 
 impl App {
@@ -185,20 +203,11 @@ impl App {
       last_error: None,
       status_message: None,
       should_quit: false,
-      search_rx: None,
-      load_rx: None,
-      more_rx: None,
-      enrich_rx: None,
-      enrich_handle: None,
-      frame_source: None,
-      frame_source_rx: None,
-      frame_idx: None,
-      original_thumbnail: None,
       channel_source: None,
-      graphics_thumb_area: None,
-      graphics_last_sent: None,
-      cached_resized_thumb: None,
       input_scroll: 0,
+      gfx: GraphicsCache::default(),
+      frames: FrameState::default(),
+      tasks: AsyncTasks::default(),
     }
   }
 
@@ -222,15 +231,15 @@ impl App {
     self.frame_mode = FrameMode::ALL[(idx + 1) % FrameMode::ALL.len()];
 
     // Clear current frame source state
-    self.frame_source = None;
-    self.frame_source_rx = None;
-    self.frame_idx = None;
+    self.frames.source = None;
+    self.frames.source_rx = None;
+    self.frames.idx = None;
 
     // Restore original thumbnail if we have one
-    if let Some((ref vid, ref img)) = self.original_thumbnail {
+    if let Some((ref vid, ref img)) = self.frames.original_thumbnail {
       self.player.cached_thumbnail = Some((vid.clone(), img.clone()));
-      self.cached_resized_thumb = None;
-      self.graphics_last_sent = None;
+      self.gfx.resized_thumb = None;
+      self.gfx.last_sent = None;
     }
 
     // Trigger new frame source if currently playing
@@ -243,38 +252,50 @@ impl App {
 
   /// Spawn appropriate frame source fetch based on current `frame_mode`.
   /// Does nothing in Thumbnail mode.
-  fn trigger_frame_source(&mut self) {
+  /// If `explicit_video_id` is provided, uses that instead of looking up from cached state.
+  fn trigger_frame_source_for(&mut self, explicit_video_id: Option<&str>) {
     if self.frame_mode == FrameMode::Thumbnail {
       return;
     }
-    // Determine video_id from original_thumbnail or cached_thumbnail
-    let video_id = self.original_thumbnail.as_ref().or(self.player.cached_thumbnail.as_ref()).map(|(id, _)| id.clone());
-    let Some(video_id) = video_id else { return };
+    let video_id = if let Some(id) = explicit_video_id {
+      id.to_string()
+    } else {
+      // Determine video_id from original_thumbnail or cached_thumbnail
+      let found =
+        self.frames.original_thumbnail.as_ref().or(self.player.cached_thumbnail.as_ref()).map(|(id, _)| id.clone());
+      let Some(id) = found else { return };
+      id
+    };
 
     match self.frame_mode {
       FrameMode::Storyboard => {
         let client = self.player.http_client.clone();
-        let vid = video_id.clone();
+        let vid = video_id;
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
           let _ = tx.send(fetch_sprite_frames(&client, &vid).await);
         });
-        self.frame_source_rx = Some(rx);
+        self.frames.source_rx = Some(rx);
       }
       FrameMode::Video => {
-        let vid = video_id.clone();
+        let vid = video_id;
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
           let _ = tx.send(fetch_video_frames(&vid).await);
         });
-        self.frame_source_rx = Some(rx);
+        self.frames.source_rx = Some(rx);
       }
       FrameMode::Thumbnail => {}
     }
   }
 
+  /// Convenience: trigger frame source using cached video state.
+  fn trigger_frame_source(&mut self) {
+    self.trigger_frame_source_for(None);
+  }
+
   async fn check_pending(&mut self) -> Result<()> {
-    if let Some(mut rx) = self.search_rx.take() {
+    if let Some(mut rx) = self.tasks.search_rx.take() {
       match rx.try_recv() {
         Ok(result) => {
           self.status_message = None;
@@ -305,7 +326,7 @@ impl App {
           }
         }
         Err(oneshot::error::TryRecvError::Empty) => {
-          self.search_rx = Some(rx);
+          self.tasks.search_rx = Some(rx);
         }
         Err(oneshot::error::TryRecvError::Closed) => {
           self.status_message = None;
@@ -314,7 +335,7 @@ impl App {
       }
     }
 
-    if let Some(mut rx) = self.load_rx.take() {
+    if let Some(mut rx) = self.tasks.load_rx.take() {
       match rx.try_recv() {
         Ok(result) => {
           self.status_message = None;
@@ -324,7 +345,7 @@ impl App {
                 self.last_error = Some(format!("Playback error: {}", e));
                 let _ = self.player.stop().await;
               } else if let Some(thumb) = thumbnail {
-                self.original_thumbnail = Some((video_id.clone(), thumb.clone()));
+                self.frames.original_thumbnail = Some((video_id.clone(), thumb.clone()));
                 self.player.cached_thumbnail = Some((video_id, thumb));
               }
               self.mode = AppMode::Input;
@@ -335,7 +356,7 @@ impl App {
           }
         }
         Err(oneshot::error::TryRecvError::Empty) => {
-          self.load_rx = Some(rx);
+          self.tasks.load_rx = Some(rx);
         }
         Err(oneshot::error::TryRecvError::Closed) => {
           self.status_message = None;
@@ -345,7 +366,7 @@ impl App {
     }
 
     // Check for background "load more" channel results
-    if let Some(mut rx) = self.more_rx.take() {
+    if let Some(mut rx) = self.tasks.more_rx.take() {
       match rx.try_recv() {
         Ok(result) => {
           if let Some(ref mut source) = self.channel_source {
@@ -376,7 +397,7 @@ impl App {
           }
         }
         Err(oneshot::error::TryRecvError::Empty) => {
-          self.more_rx = Some(rx);
+          self.tasks.more_rx = Some(rx);
         }
         Err(oneshot::error::TryRecvError::Closed) => {
           if let Some(ref mut source) = self.channel_source {
@@ -387,23 +408,23 @@ impl App {
     }
 
     // Check for background frame source fetch
-    if let Some(mut rx) = self.frame_source_rx.take() {
+    if let Some(mut rx) = self.frames.source_rx.take() {
       match rx.try_recv() {
         Ok(Ok(fs)) => {
-          self.frame_source = Some(fs);
+          self.frames.source = Some(fs);
         }
         Ok(Err(_)) => {
           // Frame source fetch failed silently — static thumbnail continues to work
         }
         Err(oneshot::error::TryRecvError::Empty) => {
-          self.frame_source_rx = Some(rx);
+          self.frames.source_rx = Some(rx);
         }
         Err(oneshot::error::TryRecvError::Closed) => {}
       }
     }
 
     // Drain enrichment results and apply to matching entries
-    if let Some(ref mut rx) = self.enrich_rx {
+    if let Some(ref mut rx) = self.tasks.enrich_rx {
       while let Ok(meta) = rx.try_recv() {
         if let Some(entry) = self.search_results.iter_mut().find(|e| e.video_id == meta.video_id) {
           entry.upload_date = meta.upload_date;
@@ -422,8 +443,8 @@ impl App {
       self.last_error = Some("Enter a search term.".to_string());
       return;
     }
-    self.search_rx = None;
-    self.more_rx = None;
+    self.tasks.search_rx = None;
+    self.tasks.more_rx = None;
     self.cancel_enrich();
     self.last_error = None;
 
@@ -437,7 +458,7 @@ impl App {
       tokio::spawn(async move {
         let _ = tx.send(list_channel_videos(&channel_url, 1, CHANNEL_INITIAL_SIZE).await);
       });
-      self.search_rx = Some(rx);
+      self.tasks.search_rx = Some(rx);
     } else {
       // Regular search mode
       self.status_message = Some(format!("Searching '{}'…", query));
@@ -447,7 +468,7 @@ impl App {
       tokio::spawn(async move {
         let _ = tx.send(search_youtube(&query).await);
       });
-      self.search_rx = Some(rx);
+      self.tasks.search_rx = Some(rx);
     }
   }
 
@@ -465,15 +486,15 @@ impl App {
     tokio::spawn(async move {
       let _ = tx.send(list_channel_videos(&url, start, CHANNEL_PAGE_SIZE).await);
     });
-    self.more_rx = Some(rx);
+    self.tasks.more_rx = Some(rx);
   }
 
   /// Cancel any in-flight enrichment task.
   fn cancel_enrich(&mut self) {
-    if let Some(handle) = self.enrich_handle.take() {
+    if let Some(handle) = self.tasks.enrich_handle.take() {
       handle.abort();
     }
-    self.enrich_rx = None;
+    self.tasks.enrich_rx = None;
   }
 
   /// Spawn background enrichment for all unenriched entries in `search_results`.
@@ -490,8 +511,8 @@ impl App {
     let handle = tokio::spawn(async move {
       enrich_video_metadata(ids, tx).await;
     });
-    self.enrich_rx = Some(rx);
-    self.enrich_handle = Some(handle);
+    self.tasks.enrich_rx = Some(rx);
+    self.tasks.enrich_handle = Some(handle);
   }
 
   fn trigger_load(&mut self) {
@@ -509,11 +530,12 @@ impl App {
     self.last_error = None;
     self.status_message = Some("Loading…".to_string());
     // Clear previous frame source state
-    self.frame_source = None;
-    self.frame_source_rx = None;
-    self.frame_idx = None;
-    self.original_thumbnail = None;
+    self.frames.source = None;
+    self.frames.source_rx = None;
+    self.frames.idx = None;
+    self.frames.original_thumbnail = None;
 
+    let frame_vid = video_id.clone();
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
       let details = get_video_info(&video_id).await;
@@ -533,29 +555,10 @@ impl App {
         }
       }
     });
-    self.load_rx = Some(rx);
+    self.tasks.load_rx = Some(rx);
 
     // Spawn background frame source fetch based on current mode
-    match self.frame_mode {
-      FrameMode::Thumbnail => {}
-      FrameMode::Storyboard => {
-        let sb_client = self.player.http_client.clone();
-        let sb_video_id = entry.video_id.clone();
-        let (fs_tx, fs_rx) = oneshot::channel();
-        tokio::spawn(async move {
-          let _ = fs_tx.send(fetch_sprite_frames(&sb_client, &sb_video_id).await);
-        });
-        self.frame_source_rx = Some(fs_rx);
-      }
-      FrameMode::Video => {
-        let vid = entry.video_id.clone();
-        let (fs_tx, fs_rx) = oneshot::channel();
-        tokio::spawn(async move {
-          let _ = fs_tx.send(fetch_video_frames(&vid).await);
-        });
-        self.frame_source_rx = Some(fs_rx);
-      }
-    }
+    self.trigger_frame_source_for(Some(&frame_vid));
   }
 }
 
@@ -609,12 +612,12 @@ async fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()> {
   if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
     if app.player.is_playing() {
       app.player.stop().await.context("Failed to stop playback")?;
-      app.frame_source = None;
-      app.frame_source_rx = None;
-      app.frame_idx = None;
-      app.original_thumbnail = None;
-      app.graphics_last_sent = None;
-      app.cached_resized_thumb = None;
+      app.frames.source = None;
+      app.frames.source_rx = None;
+      app.frames.idx = None;
+      app.frames.original_thumbnail = None;
+      app.gfx.last_sent = None;
+      app.gfx.resized_thumb = None;
     }
     return Ok(());
   }
@@ -750,29 +753,29 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
     app.player.check_mpv_status();
 
     // Update frame source image if available and time position changed
-    if let Some(ref frame_source) = app.frame_source
+    if let Some(ref frame_source) = app.frames.source
       && let Some(status) = app.player.get_last_mpv_status()
       && let Some(time_secs) = parse_mpv_time_secs(&status)
     {
       let idx = frame_source.frame_index_at(time_secs);
-      if app.frame_idx != Some(idx)
+      if app.frames.idx != Some(idx)
         && let Some(frame) = frame_source.frame_at(time_secs)
       {
         let vid = frame_source.video_id().to_string();
         app.player.cached_thumbnail = Some((vid, frame));
-        app.cached_resized_thumb = None;
-        app.graphics_last_sent = None;
-        app.frame_idx = Some(idx);
+        app.gfx.resized_thumb = None;
+        app.gfx.last_sent = None;
+        app.frames.idx = Some(idx);
       }
     }
 
     terminal.draw(|frame| ui::ui(frame, &mut app))?;
 
     if uses_graphics_protocol {
-      if let Some(area) = app.graphics_thumb_area {
+      if let Some(area) = app.gfx.thumb_area {
         if let Some((ref video_id, ref image)) = app.player.cached_thumbnail {
           let key = (video_id.clone(), area);
-          if app.graphics_last_sent.as_ref() != Some(&key) {
+          if app.gfx.last_sent.as_ref() != Some(&key) {
             if display_mode == DisplayMode::Kitty {
               kitty_delete_all()?;
             }
@@ -781,14 +784,14 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
               DisplayMode::Sixel => sixel_render_image(image, area)?,
               _ => {}
             }
-            app.graphics_last_sent = Some(key);
+            app.gfx.last_sent = Some(key);
           }
         }
-      } else if app.graphics_last_sent.is_some() {
+      } else if app.gfx.last_sent.is_some() {
         if display_mode == DisplayMode::Kitty {
           kitty_delete_all()?;
         }
-        app.graphics_last_sent = None;
+        app.gfx.last_sent = None;
       }
     }
 
@@ -811,4 +814,89 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
   }
   app.player.stop().await?;
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  // --- parse_mpv_time_secs ---
+
+  #[test]
+  fn parse_mpv_time_mm_ss() {
+    let status = "Time: 01:30 / 04:00 | Title: Song | no 37%";
+    assert_eq!(parse_mpv_time_secs(status), Some(90.0));
+  }
+
+  #[test]
+  fn parse_mpv_time_h_mm_ss() {
+    let status = "Time: 1:02:03 / 2:00:00 | Title: Song | no 51%";
+    assert_eq!(parse_mpv_time_secs(status), Some(3723.0));
+  }
+
+  #[test]
+  fn parse_mpv_time_zero() {
+    let status = "Time: 00:00 / 03:45 | Title: Song | no 0%";
+    assert_eq!(parse_mpv_time_secs(status), Some(0.0));
+  }
+
+  #[test]
+  fn parse_mpv_time_no_prefix() {
+    assert_eq!(parse_mpv_time_secs("Something else"), None);
+  }
+
+  #[test]
+  fn parse_mpv_time_garbage() {
+    assert_eq!(parse_mpv_time_secs("Time: abc / def"), None);
+  }
+
+  // --- char_to_byte_index ---
+
+  #[test]
+  fn char_to_byte_ascii() {
+    assert_eq!(char_to_byte_index("hello", 0), 0);
+    assert_eq!(char_to_byte_index("hello", 3), 3);
+    assert_eq!(char_to_byte_index("hello", 5), 5); // past end
+  }
+
+  #[test]
+  fn char_to_byte_multibyte() {
+    let s = "aé日"; // a=1 byte, é=2 bytes, 日=3 bytes
+    assert_eq!(char_to_byte_index(s, 0), 0); // 'a'
+    assert_eq!(char_to_byte_index(s, 1), 1); // 'é' starts at byte 1
+    assert_eq!(char_to_byte_index(s, 2), 3); // '日' starts at byte 3
+    assert_eq!(char_to_byte_index(s, 3), 6); // past end
+  }
+
+  #[test]
+  fn char_to_byte_empty() {
+    assert_eq!(char_to_byte_index("", 0), 0);
+    assert_eq!(char_to_byte_index("", 5), 0);
+  }
+
+  // --- FrameMode::from_config ---
+
+  #[test]
+  fn frame_mode_from_config_thumbnail() {
+    assert_eq!(FrameMode::from_config("thumbnail"), FrameMode::Thumbnail);
+    assert_eq!(FrameMode::from_config("Thumbnail"), FrameMode::Thumbnail);
+  }
+
+  #[test]
+  fn frame_mode_from_config_storyboard() {
+    assert_eq!(FrameMode::from_config("storyboard"), FrameMode::Storyboard);
+    assert_eq!(FrameMode::from_config("STORYBOARD"), FrameMode::Storyboard);
+  }
+
+  #[test]
+  fn frame_mode_from_config_video() {
+    assert_eq!(FrameMode::from_config("video"), FrameMode::Video);
+    assert_eq!(FrameMode::from_config("Video"), FrameMode::Video);
+  }
+
+  #[test]
+  fn frame_mode_from_config_unknown_defaults_to_thumbnail() {
+    assert_eq!(FrameMode::from_config("invalid"), FrameMode::Thumbnail);
+    assert_eq!(FrameMode::from_config(""), FrameMode::Thumbnail);
+  }
 }
