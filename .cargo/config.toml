@@ -1,0 +1,4 @@
+# whisper-rs-sys uses CMakeLists.txt with cmake_minimum_required < 3.5,
+# which CMake 4.x rejects by default. This env var restores compatibility.
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

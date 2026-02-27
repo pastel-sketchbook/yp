@@ -14,10 +14,10 @@ use ratatui::{
   layout::Rect,
   widgets::ListState,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use display::{CliDisplayMode, DisplayMode};
 use graphics::{kitty_delete_all, kitty_delete_placement, kitty_render_image, sixel_render_image};
@@ -91,49 +91,37 @@ pub struct ChannelSource {
   pub loading_more: bool,
 }
 
-// --- Voice Input ---
+// --- Auto-transcription ---
 
-/// Maximum recording duration in seconds (safety guard).
-const VOICE_MAX_DURATION_SECS: u64 = 15;
-
-/// HuggingFace URL for the whisper.cpp small model (~460 MB).
-const WHISPER_MODEL_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin";
-
-/// Progress events from the model download task.
-pub enum DownloadEvent {
-  /// Intermediate progress: (bytes downloaded, total bytes).
-  Progress(u64, u64),
-  /// Download finished (Ok) or failed (Err).
-  Complete(Result<()>),
+/// Result of the transcription pipeline: either in progress or completed.
+pub enum TranscriptEvent {
+  /// Audio extraction finished, now starting transcription.
+  AudioExtracted,
+  /// Whisper model download progress (downloaded bytes, total bytes).
+  DownloadProgress(u64, u64),
+  /// Transcription completed with utterances.
+  Transcribed(Vec<whisper_cli::Utternace>),
+  /// Pipeline failed with an error message.
+  Failed(String),
 }
 
-/// Return the local path where the whisper model should live.
-fn whisper_model_path() -> std::path::PathBuf {
-  let data_dir = directories::BaseDirs::new()
-    .map(|d| d.data_dir().to_path_buf())
-    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-  data_dir.join("whisper-cpp/models/ggml-small.bin")
-}
-
-/// Voice input state machine.
+/// Auto-transcription state machine.
+///
+/// When a track starts playing, the pipeline automatically:
+/// 1. Extracts audio via yt-dlp to a temp WAV file
+/// 2. Transcribes via whisper-cli-rs library (synchronous FFI in spawn_blocking)
+/// 3. Stores utterances for time-synced display
 #[derive(Default)]
-pub enum VoiceState {
-  /// No voice activity.
+pub enum TranscriptState {
+  /// No transcription in progress.
   #[default]
   Idle,
-  /// sox `rec` is recording audio to a temp WAV file.
-  Recording { child: tokio::process::Child, wav_path: std::path::PathBuf, started: Instant },
-  /// Downloading the whisper model from HuggingFace.
-  Downloading {
-    rx: mpsc::UnboundedReceiver<DownloadEvent>,
-    wav_path: std::path::PathBuf,
-    /// Bytes downloaded so far — updated by polling `rx`.
-    downloaded: u64,
-    /// Total bytes (from Content-Length) — updated by polling `rx`.
-    total: u64,
-  },
-  /// whisper-cli is transcribing the recorded WAV file.
-  Transcribing { rx: oneshot::Receiver<Result<String>>, wav_path: std::path::PathBuf },
+  /// yt-dlp is extracting audio to a WAV file.
+  ExtractingAudio { handle: JoinHandle<()> },
+  /// whisper-cli-rs is transcribing the WAV file.
+  Transcribing { handle: JoinHandle<()> },
+  /// Transcription complete — utterances are stored in App.
+  Ready,
 }
 
 // --- Config ---
@@ -236,7 +224,15 @@ pub struct App {
   pub filtered_indices: Vec<usize>,
   frames: FrameState,
   tasks: AsyncTasks,
-  pub voice: VoiceState,
+  pub transcript_state: TranscriptState,
+  /// Receiver for transcript pipeline events (extraction done, transcription done, errors).
+  transcript_rx: Option<mpsc::UnboundedReceiver<TranscriptEvent>>,
+  /// Completed transcript utterances with timestamps for time-synced display.
+  pub utterances: Vec<whisper_cli::Utternace>,
+  /// Whether the transcript pane is visible (toggled with Ctrl+A).
+  pub transcript_visible: bool,
+  /// Whisper model download progress (downloaded, total) for progress bar display.
+  pub download_progress: Option<(u64, u64)>,
 }
 
 impl App {
@@ -272,7 +268,11 @@ impl App {
       filtered_indices: Vec::new(),
       frames: FrameState::default(),
       tasks: AsyncTasks::default(),
-      voice: VoiceState::default(),
+      transcript_state: TranscriptState::default(),
+      transcript_rx: None,
+      utterances: Vec::new(),
+      transcript_visible: true,
+      download_progress: None,
     }
   }
 
@@ -406,212 +406,172 @@ impl App {
     self.trigger_frame_source_for(None);
   }
 
-  // --- Voice Input ---
+  // --- Auto-transcription ---
 
-  /// Start recording audio via sox `rec` with auto-silence detection.
-  fn voice_start_recording(&mut self) {
-    let wav_path = std::env::temp_dir().join(format!("yp-voice-{}.wav", std::process::id()));
-    info!(path = %wav_path.display(), "voice: start recording");
-    // Remove stale file from previous recording
+  /// Start the auto-transcription pipeline for the given YouTube URL.
+  /// Stage 1: Extract audio via yt-dlp to a temp WAV file.
+  /// Stage 2: Download whisper model if needed (with progress reporting).
+  /// Stage 3: Transcribe via whisper-cli-rs library (with C logging suppressed).
+  fn trigger_transcription(&mut self, url: &str) {
+    // Cancel any in-progress transcription
+    self.cancel_transcription();
+    self.utterances.clear();
+    self.download_progress = None;
+
+    let (tx, rx) = mpsc::unbounded_channel();
+    self.transcript_rx = Some(rx);
+
+    let wav_path = std::env::temp_dir().join(format!("yp-transcript-{}.wav", std::process::id()));
+    // Clean up stale file from previous run
     let _ = std::fs::remove_file(&wav_path);
 
-    // sox `rec` args:
-    //   rate 16000       — 16kHz sample rate (what Whisper expects)
-    //   channels 1       — mono
-    //
-    // No silence effect — it trims audio below the threshold, producing
-    // empty files when mic levels are low. Instead we record continuously
-    // and rely on Ctrl+A (manual stop) or the max duration safety guard.
-    let child = tokio::process::Command::new("rec")
-      .args([wav_path.to_str().unwrap_or("/tmp/yp-voice.wav"), "rate", "16000", "channels", "1"])
-      .stdin(std::process::Stdio::null())
-      .stdout(std::process::Stdio::null())
-      .stderr(std::process::Stdio::null())
-      .spawn();
-
-    match child {
-      Ok(child) => {
-        debug!(pid = child.id(), "voice: sox spawned");
-        self.voice = VoiceState::Recording { child, wav_path, started: Instant::now() };
-        self.status_message = Some("Recording…".to_string());
-        self.last_error = None;
-        self.info_message = None;
-      }
-      Err(e) => {
-        error!(err = %e, "voice: failed to spawn sox");
-        if e.kind() == std::io::ErrorKind::NotFound {
-          self.last_error = Some("sox not found. Install with: brew install sox".to_string());
-        } else {
-          self.last_error = Some(format!("Failed to start recording: {}", e));
-        }
-      }
-    }
-  }
-
-  /// Stop recording and proceed to transcription (downloading model first if needed).
-  /// Sends SIGTERM so sox can finalize the WAV header; falls back to SIGKILL after timeout.
-  async fn voice_stop_recording(&mut self) {
-    let state = std::mem::replace(&mut self.voice, VoiceState::Idle);
-    if let VoiceState::Recording { mut child, wav_path, started } = state {
-      let elapsed = started.elapsed();
-      info!(elapsed_ms = elapsed.as_millis() as u64, path = %wav_path.display(), "voice: stop recording");
-      // Send SIGTERM to let sox finalize the WAV file header.
-      // SIGKILL would corrupt the header, causing whisper to read garbage.
-      if let Some(pid) = child.id() {
-        debug!(pid, "voice: sending SIGTERM to sox");
-        let _ = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status();
-      }
-      // Wait up to 2 seconds for graceful exit, then force kill.
-      match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
-        Ok(Ok(status)) => {
-          debug!(code = ?status.code(), "voice: sox exited gracefully");
-        }
-        Ok(Err(e)) => {
-          error!(err = %e, "voice: sox wait error");
-        }
-        Err(_) => {
-          error!("voice: sox did not exit in 2s, sending SIGKILL");
-          let _ = child.kill().await;
-          let _ = child.wait().await;
-        }
-      }
-      // Log WAV file size for debugging
-      if let Ok(meta) = std::fs::metadata(&wav_path) {
-        debug!(size_bytes = meta.len(), "voice: WAV file written");
-      }
-      self.voice_ensure_model_then_transcribe(wav_path);
-    }
-  }
-
-  /// Check if whisper model exists; if not, start downloading it; otherwise start transcription.
-  /// Skips transcription entirely if the WAV file is empty (header-only, no audio data).
-  fn voice_ensure_model_then_transcribe(&mut self, wav_path: std::path::PathBuf) {
-    // A WAV header with no audio data is ~44-80 bytes. Skip transcription for empty recordings.
-    const MIN_WAV_SIZE: u64 = 256;
-    let wav_size = std::fs::metadata(&wav_path).map(|m| m.len()).unwrap_or(0);
-    if wav_size < MIN_WAV_SIZE {
-      info!(size_bytes = wav_size, "voice: WAV too small, skipping transcription");
-      let _ = std::fs::remove_file(&wav_path);
-      self.status_message = None;
-      self.info_message = Some("No speech detected".to_string());
-      return;
-    }
-
-    let model_path = whisper_model_path();
-    if model_path.exists() {
-      debug!(model = %model_path.display(), "voice: model exists, starting transcription");
-      self.voice_start_transcription(wav_path);
-    } else {
-      info!(model = %model_path.display(), "voice: model not found, starting download");
-      self.voice_download_model(wav_path);
-    }
-  }
-
-  /// Start background download of the whisper model from HuggingFace.
-  fn voice_download_model(&mut self, wav_path: std::path::PathBuf) {
-    let (tx, rx) = mpsc::unbounded_channel();
-    let model_path = whisper_model_path();
-    info!(model = %model_path.display(), "voice: starting model download");
-
-    tokio::spawn(async move {
-      let result = download_whisper_model(&model_path, &tx).await;
-      if let Err(ref e) = result {
-        error!(err = %e, "voice: model download failed");
-      } else {
-        info!("voice: model download complete");
-      }
-      // Send completion event — if receiver is dropped (user cancelled), that's fine.
-      let _ = tx.send(DownloadEvent::Complete(result));
-    });
-
-    self.status_message = None; // progress bar is rendered by the UI directly
-    self.voice = VoiceState::Downloading { rx, wav_path, downloaded: 0, total: 0 };
-  }
-
-  /// Spawn whisper-cli to transcribe the WAV file.
-  fn voice_start_transcription(&mut self, wav_path: std::path::PathBuf) {
-    info!(path = %wav_path.display(), "voice: start transcription");
-    self.status_message = Some("Transcribing…".to_string());
-
-    let (tx, rx) = oneshot::channel();
+    let url = url.to_string();
     let wav = wav_path.clone();
-    let model = whisper_model_path();
-    tokio::spawn(async move {
-      let model_str = model.to_string_lossy().to_string();
-      debug!(model = %model_str, wav = %wav.display(), "voice: spawning whisper-cli");
-      let result = tokio::process::Command::new("whisper-cli")
-        .args(["-m", &model_str, "-f", wav.to_str().unwrap_or(""), "--no-timestamps", "-l", "auto"])
+
+    info!(url = %url, wav = %wav.display(), "transcript: starting audio extraction");
+
+    let handle = tokio::spawn(async move {
+      // Stage 1: Extract audio via yt-dlp
+      let result = tokio::process::Command::new("yt-dlp")
+        .args([
+          "-x",
+          "--audio-format",
+          "wav",
+          "--postprocessor-args",
+          "ffmpeg:-ar 16000 -ac 1",
+          "-o",
+          wav.to_str().unwrap_or("/tmp/yp-transcript.wav"),
+          &url,
+        ])
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
         .await;
 
-      let text = match result {
-        Ok(output) if output.status.success() => {
-          let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-          let stderr_raw = String::from_utf8_lossy(&output.stderr).trim().to_string();
-          debug!(stdout_len = raw.len(), stderr_len = stderr_raw.len(), "voice: whisper-cli succeeded");
-          debug!(raw_stdout = %raw, "voice: whisper raw output");
-          // whisper-cli may output bracketed markers like [BLANK_AUDIO] — filter them
-          let cleaned: String =
-            raw.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('[')).collect::<Vec<_>>().join(" ");
-          info!(cleaned_len = cleaned.len(), cleaned = %cleaned, "voice: transcription result");
-          Ok(cleaned)
-        }
-        Ok(output) => {
-          let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-          error!(code = ?output.status.code(), stderr = %stderr, "voice: whisper-cli failed");
-          if stderr.contains("failed to open") || stderr.contains("no such file") {
-            Err(anyhow::anyhow!("Whisper model not found at {}", model_str))
-          } else {
-            Err(anyhow::anyhow!("whisper-cli failed: {}", stderr))
+      match result {
+        Ok(status) if status.success() => {
+          info!(wav = %wav.display(), "transcript: audio extraction complete");
+          // Signal that we're moving to transcription stage
+          let _ = tx.send(TranscriptEvent::AudioExtracted);
+
+          // Stage 2: Download whisper model if needed
+          let model_path = whisper_cli::Size::Small.get_path();
+          if !model_path.exists() {
+            info!("transcript: whisper model not found, downloading");
+            if let Err(e) = download_whisper_model(&tx, &model_path).await {
+              let _ = tx.send(TranscriptEvent::Failed(format!("Model download failed: {:#}", e)));
+              return;
+            }
           }
+
+          // Stage 3: Transcribe via whisper-cli-rs (with C logging suppressed)
+          let wav_for_whisper = wav.clone();
+          let transcribe_result = tokio::task::spawn_blocking(move || {
+            // Suppress whisper.cpp C library logging (writes directly to stdout/stderr)
+            let _guard = SuppressStdio::new();
+
+            info!("transcript: loading whisper model (Small)");
+            let model = whisper_cli::Model::new(whisper_cli::Size::Small);
+
+            // Model is already downloaded; Whisper::new() will skip download.
+            // We use a nested tokio runtime since Whisper::new() is async but
+            // we're inside spawn_blocking (sync context).
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
+            let whisper = match rt {
+              Ok(rt) => rt.block_on(whisper_cli::Whisper::new(model, Some(whisper_cli::Language::Auto))),
+              Err(e) => {
+                return Err(anyhow::anyhow!("Failed to create tokio runtime for model init: {}", e));
+              }
+            };
+            let mut whisper = whisper;
+
+            info!(wav = %wav_for_whisper.display(), "transcript: starting whisper transcription");
+            let transcript =
+              whisper.transcribe(&wav_for_whisper, false, false, false, false).context("Whisper transcription failed");
+
+            // Clean up WAV file
+            let _ = std::fs::remove_file(&wav_for_whisper);
+
+            transcript
+          })
+          .await;
+
+          match transcribe_result {
+            Ok(Ok(transcript)) => {
+              info!(
+                segments = transcript.utterances.len(),
+                time_ms = transcript.processing_time.as_millis(),
+                "transcript: transcription complete"
+              );
+              let _ = tx.send(TranscriptEvent::Transcribed(transcript.utterances));
+            }
+            Ok(Err(e)) => {
+              error!(err = %e, "transcript: transcription failed");
+              let _ = tx.send(TranscriptEvent::Failed(format!("Transcription failed: {:#}", e)));
+            }
+            Err(e) => {
+              error!(err = %e, "transcript: spawn_blocking panicked");
+              let _ = tx.send(TranscriptEvent::Failed(format!("Transcription task panicked: {}", e)));
+            }
+          }
+        }
+        Ok(status) => {
+          error!(code = ?status.code(), "transcript: yt-dlp audio extraction failed");
+          let _ = std::fs::remove_file(&wav);
+          let _ = tx.send(TranscriptEvent::Failed("Audio extraction failed".to_string()));
         }
         Err(e) => {
-          error!(err = %e, "voice: failed to spawn whisper-cli");
-          if e.kind() == std::io::ErrorKind::NotFound {
-            Err(anyhow::anyhow!("whisper-cli not found. Install with: brew install whisper-cpp"))
+          error!(err = %e, "transcript: failed to spawn yt-dlp");
+          let msg = if e.kind() == std::io::ErrorKind::NotFound {
+            "yt-dlp not found. Install with: brew install yt-dlp".to_string()
           } else {
-            Err(anyhow::anyhow!("Failed to run whisper-cli: {}", e))
-          }
+            format!("Failed to start audio extraction: {}", e)
+          };
+          let _ = tx.send(TranscriptEvent::Failed(msg));
         }
-      };
-      let _ = tx.send(text);
+      }
     });
-    self.voice = VoiceState::Transcribing { rx, wav_path };
+
+    self.transcript_state = TranscriptState::ExtractingAudio { handle };
   }
 
-  /// Handle Ctrl+A toggle: start recording or stop recording.
-  async fn voice_toggle(&mut self) {
-    match self.voice {
-      VoiceState::Idle => {
-        debug!("voice: toggle -> start recording");
-        self.voice_start_recording();
+  /// Cancel any in-progress transcription pipeline.
+  fn cancel_transcription(&mut self) {
+    match std::mem::replace(&mut self.transcript_state, TranscriptState::Idle) {
+      TranscriptState::ExtractingAudio { handle } => {
+        info!("transcript: cancelling audio extraction");
+        handle.abort();
       }
-      VoiceState::Recording { .. } => {
-        debug!("voice: toggle -> stop recording");
-        self.voice_stop_recording().await;
+      TranscriptState::Transcribing { handle } => {
+        info!("transcript: cancelling transcription");
+        handle.abort();
       }
-      VoiceState::Downloading { .. } | VoiceState::Transcribing { .. } => {
-        debug!("voice: toggle ignored (busy)");
-      }
+      _ => {}
     }
+    self.transcript_rx = None;
+    self.download_progress = None;
   }
 
-  /// Insert transcribed text into the current input field (search or filter).
-  fn voice_insert_text(&mut self, text: &str) {
-    let (input, cursor) = match self.mode {
-      AppMode::Filter => (&mut self.filter, &mut self.filter_cursor),
-      _ => (&mut self.input, &mut self.cursor_position),
-    };
-    let byte_idx = char_to_byte_index(input, *cursor);
-    input.insert_str(byte_idx, text);
-    *cursor += text.chars().count();
-
-    // Recompute filter if we're in filter mode
-    if self.mode == AppMode::Filter {
-      self.recompute_filter();
+  /// Handle Ctrl+A: toggle transcript visibility / cancel in-progress transcription.
+  fn transcript_toggle(&mut self) {
+    match self.transcript_state {
+      TranscriptState::ExtractingAudio { .. } | TranscriptState::Transcribing { .. } => {
+        // Cancel in-progress transcription
+        debug!("transcript: toggle -> cancel");
+        self.cancel_transcription();
+        self.transcript_visible = false;
+      }
+      TranscriptState::Ready => {
+        // Toggle visibility
+        self.transcript_visible = !self.transcript_visible;
+        debug!(visible = self.transcript_visible, "transcript: toggle visibility");
+      }
+      TranscriptState::Idle => {
+        // Toggle visibility (show/hide even when empty)
+        self.transcript_visible = !self.transcript_visible;
+        debug!(visible = self.transcript_visible, "transcript: toggle visibility (idle)");
+      }
     }
   }
 
@@ -663,12 +623,17 @@ impl App {
           self.status_message = None;
           match result {
             Ok((video_id, details, thumbnail)) => {
+              let play_url = details.url.clone();
               if let Err(e) = self.player.play(details).await {
                 self.last_error = Some(format!("Playback error: {}", e));
                 let _ = self.player.stop().await;
-              } else if let Some(thumb) = thumbnail {
-                self.frames.original_thumbnail = Some((video_id.clone(), thumb.clone()));
-                self.player.cached_thumbnail = Some((video_id, thumb));
+              } else {
+                // Auto-trigger transcription for the new track
+                self.trigger_transcription(&play_url);
+                if let Some(thumb) = thumbnail {
+                  self.frames.original_thumbnail = Some((video_id.clone(), thumb.clone()));
+                  self.player.cached_thumbnail = Some((video_id, thumb));
+                }
               }
               self.mode = AppMode::Input;
             }
@@ -763,82 +728,40 @@ impl App {
       }
     }
 
-    // --- Voice input polling ---
+    // --- Auto-transcription polling ---
 
-    // Check recording max duration safety guard
-    if let VoiceState::Recording { ref started, .. } = self.voice
-      && started.elapsed() >= Duration::from_secs(VOICE_MAX_DURATION_SECS)
-    {
-      info!(max_secs = VOICE_MAX_DURATION_SECS, "voice: max duration reached, stopping");
-      self.voice_stop_recording().await;
-    }
-
-    // Check if sox recording process has exited (auto-silence triggered)
-    if let VoiceState::Recording { ref mut child, .. } = self.voice
-      && let Some(status) = child.try_wait().ok().flatten()
-    {
-      info!(code = ?status.code(), "voice: sox exited (auto-silence)");
-      // sox exited — take the state and check model before transcription
-      let state = std::mem::replace(&mut self.voice, VoiceState::Idle);
-      if let VoiceState::Recording { wav_path, .. } = state {
-        if let Ok(meta) = std::fs::metadata(&wav_path) {
-          debug!(size_bytes = meta.len(), "voice: WAV file from auto-silence");
-        }
-        self.voice_ensure_model_then_transcribe(wav_path);
-      }
-    }
-
-    // Poll model download progress
-    if let VoiceState::Downloading { ref mut rx, ref mut downloaded, ref mut total, .. } = self.voice {
-      // Drain all available progress messages, keeping the latest values
+    // Poll transcript pipeline events
+    if let Some(ref mut rx) = self.transcript_rx {
       while let Ok(event) = rx.try_recv() {
         match event {
-          DownloadEvent::Progress(d, t) => {
-            *downloaded = d;
-            *total = t;
-          }
-          DownloadEvent::Complete(result) => {
-            let state = std::mem::replace(&mut self.voice, VoiceState::Idle);
-            if let VoiceState::Downloading { wav_path, .. } = state {
-              match result {
-                Ok(()) => {
-                  self.voice_start_transcription(wav_path);
-                }
-                Err(e) => {
-                  self.last_error = Some(format!("Model download failed: {}", e));
-                  // Clean up the wav file
-                  let _ = std::fs::remove_file(&wav_path);
-                }
-              }
+          TranscriptEvent::AudioExtracted => {
+            // Transition from ExtractingAudio to Transcribing.
+            // The handle stays the same (single spawned task covers both stages).
+            let old = std::mem::replace(&mut self.transcript_state, TranscriptState::Idle);
+            if let TranscriptState::ExtractingAudio { handle } = old {
+              self.transcript_state = TranscriptState::Transcribing { handle };
             }
+          }
+          TranscriptEvent::DownloadProgress(downloaded, total) => {
+            self.download_progress = Some((downloaded, total));
+          }
+          TranscriptEvent::Transcribed(new_utterances) => {
+            info!(segments = new_utterances.len(), "transcript: received utterances");
+            self.utterances = new_utterances;
+            self.transcript_state = TranscriptState::Ready;
+            self.transcript_visible = true;
+            self.download_progress = None;
+            self.transcript_rx = None;
             break;
           }
-        }
-      }
-    }
-
-    // Check if whisper-cli transcription has completed
-    if let VoiceState::Transcribing { ref mut rx, .. } = self.voice
-      && let Ok(result) = rx.try_recv()
-    {
-      let state = std::mem::replace(&mut self.voice, VoiceState::Idle);
-      if let VoiceState::Transcribing { wav_path, .. } = state {
-        debug!(path = %wav_path.display(), "voice: cleaning up WAV file");
-        let _ = std::fs::remove_file(&wav_path);
-      }
-      self.status_message = None;
-      match result {
-        Ok(text) if text.is_empty() => {
-          info!("voice: no speech detected (empty transcription)");
-          self.info_message = Some("No speech detected".to_string());
-        }
-        Ok(text) => {
-          info!(len = text.len(), text = %text, "voice: inserting transcribed text");
-          self.voice_insert_text(&text);
-        }
-        Err(e) => {
-          error!(err = %e, "voice: transcription error");
-          self.last_error = Some(format!("{}", e));
+          TranscriptEvent::Failed(msg) => {
+            error!(err = %msg, "transcript: pipeline failed");
+            self.last_error = Some(msg);
+            self.transcript_state = TranscriptState::Idle;
+            self.download_progress = None;
+            self.transcript_rx = None;
+            break;
+          }
         }
       }
     }
@@ -984,6 +907,106 @@ impl App {
   }
 }
 
+// --- Whisper model download + C logging suppression ---
+
+/// Download the whisper model ourselves (instead of letting whisper-cli-rs do it via indicatif)
+/// so we can send progress events to the TUI for a nice progress bar.
+async fn download_whisper_model(
+  tx: &mpsc::UnboundedSender<TranscriptEvent>,
+  model_path: &std::path::Path,
+) -> Result<()> {
+  use futures::StreamExt;
+
+  let url = format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{}.bin", whisper_cli::Size::Small);
+
+  info!(url = %url, "transcript: downloading whisper model");
+
+  let response = reqwest::get(&url).await.context("Failed to download whisper model")?;
+
+  let total = response.content_length().unwrap_or(0);
+  let mut downloaded: u64 = 0;
+
+  // Ensure parent directory exists
+  if let Some(parent) = model_path.parent() {
+    std::fs::create_dir_all(parent).context("Failed to create model cache directory")?;
+  }
+
+  // Write to a temp file, then rename (atomic)
+  let tmp_path = model_path.with_extension("bin.part");
+  let mut file = tokio::fs::File::create(&tmp_path).await.context("Failed to create model file")?;
+
+  let mut stream = response.bytes_stream();
+  // Throttle progress events: send at most every 100ms
+  let mut last_progress = std::time::Instant::now();
+
+  while let Some(chunk) = stream.next().await {
+    let chunk = chunk.context("Error downloading model chunk")?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await.context("Error writing model file")?;
+
+    downloaded += chunk.len() as u64;
+    if last_progress.elapsed() >= Duration::from_millis(100) || downloaded >= total {
+      let _ = tx.send(TranscriptEvent::DownloadProgress(downloaded, total));
+      last_progress = std::time::Instant::now();
+    }
+  }
+
+  tokio::io::AsyncWriteExt::flush(&mut file).await.context("Error flushing model file")?;
+  drop(file);
+
+  // Rename temp file to final path
+  tokio::fs::rename(&tmp_path, model_path).await.context("Failed to finalize model file")?;
+
+  info!(path = %model_path.display(), "transcript: whisper model downloaded");
+  // Clear progress after download completes
+  let _ = tx.send(TranscriptEvent::DownloadProgress(total, total));
+  Ok(())
+}
+
+/// RAII guard that redirects stdout and stderr to /dev/null while alive.
+/// Restores original file descriptors on drop.
+/// Used to suppress whisper.cpp C library logging that writes directly to fd 1/2.
+struct SuppressStdio {
+  saved_stdout: libc::c_int,
+  saved_stderr: libc::c_int,
+}
+
+impl SuppressStdio {
+  fn new() -> Self {
+    // Safety: dup() and dup2() are standard POSIX calls. We save the original
+    // fd's and redirect to /dev/null. If any call fails, we log a warning
+    // but continue (the worst case is some C logging leaks through).
+    unsafe {
+      let saved_stdout = libc::dup(1);
+      let saved_stderr = libc::dup(2);
+      let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+      if devnull >= 0 {
+        libc::dup2(devnull, 1);
+        libc::dup2(devnull, 2);
+        libc::close(devnull);
+      } else {
+        warn!("transcript: failed to open /dev/null for stdio suppression");
+      }
+      Self { saved_stdout, saved_stderr }
+    }
+  }
+}
+
+impl Drop for SuppressStdio {
+  fn drop(&mut self) {
+    // Safety: restoring the saved file descriptors to their original values.
+    unsafe {
+      if self.saved_stdout >= 0 {
+        libc::dup2(self.saved_stdout, 1);
+        libc::close(self.saved_stdout);
+      }
+      if self.saved_stderr >= 0 {
+        libc::dup2(self.saved_stderr, 2);
+        libc::close(self.saved_stderr);
+      }
+    }
+  }
+}
+
 // --- Helpers ---
 
 /// Convert a char index to a byte offset within the string.
@@ -1034,6 +1057,8 @@ async fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()> {
   if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
     if app.player.is_playing() {
       app.player.stop().await.context("Failed to stop playback")?;
+      app.cancel_transcription();
+      app.utterances.clear();
       app.frames.source = None;
       app.frames.source_rx = None;
       app.frames.idx = None;
@@ -1074,7 +1099,7 @@ async fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()> {
   }
 
   if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
-    app.voice_toggle().await;
+    app.transcript_toggle();
     return Ok(());
   }
 
@@ -1259,49 +1284,6 @@ async fn handle_filter_key(app: &mut App, key: event::KeyEvent) -> Result<()> {
     }
     _ => {}
   }
-  Ok(())
-}
-
-// --- Whisper Model Download ---
-
-/// Download the whisper model file from HuggingFace, streaming to disk with progress updates.
-async fn download_whisper_model(model_path: &std::path::Path, tx: &mpsc::UnboundedSender<DownloadEvent>) -> Result<()> {
-  use futures::StreamExt;
-  use tokio::io::AsyncWriteExt;
-
-  // Create parent directory
-  if let Some(parent) = model_path.parent() {
-    tokio::fs::create_dir_all(parent).await.context("Failed to create whisper model directory")?;
-  }
-
-  let response = reqwest::get(WHISPER_MODEL_URL).await.context("Failed to connect to HuggingFace")?;
-  if !response.status().is_success() {
-    anyhow::bail!("Download failed: HTTP {}", response.status());
-  }
-
-  let total = response.content_length().unwrap_or(0);
-  let _ = tx.send(DownloadEvent::Progress(0, total));
-
-  // Write to a temp file first, rename on success to avoid partial files.
-  let tmp_path = model_path.with_extension("bin.part");
-  let mut file = tokio::fs::File::create(&tmp_path).await.context("Failed to create model file")?;
-
-  let mut stream = response.bytes_stream();
-  let mut downloaded: u64 = 0;
-
-  while let Some(chunk) = stream.next().await {
-    let chunk = chunk.context("Download interrupted")?;
-    file.write_all(&chunk).await.context("Failed to write model data")?;
-    downloaded += chunk.len() as u64;
-    let _ = tx.send(DownloadEvent::Progress(downloaded, total));
-  }
-
-  file.flush().await.context("Failed to flush model file")?;
-  drop(file);
-
-  // Atomic-ish rename from .part to final path
-  tokio::fs::rename(&tmp_path, model_path).await.context("Failed to rename downloaded model")?;
-
   Ok(())
 }
 

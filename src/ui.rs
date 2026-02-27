@@ -2,17 +2,26 @@ use image::imageops::FilterType;
 use ratatui::{
   Frame,
   layout::{Alignment, Constraint, Layout, Rect},
-  style::{Modifier, Style, Stylize},
+  style::{Color, Modifier, Style, Stylize},
   text::{Line, Span},
-  widgets::{Block, List, ListItem, Padding, Paragraph},
+  widgets::{Block, Gauge, List, ListItem, Padding, Paragraph, Wrap},
 };
 
 use crate::display::DisplayMode;
 use crate::graphics::ThumbnailWidget;
 use crate::theme::Theme;
-use crate::{App, AppMode, VoiceState};
+use crate::{App, AppMode, TranscriptState};
 
 // --- Helpers ---
+
+/// Dim an RGB color by the given factor (0.0 = black, 1.0 = unchanged).
+/// Non-RGB colors are returned as-is.
+fn dim_color(color: Color, factor: f32) -> Color {
+  match color {
+    Color::Rgb(r, g, b) => Color::Rgb((r as f32 * factor) as u8, (g as f32 * factor) as u8, (b as f32 * factor) as u8),
+    other => other,
+  }
+}
 
 /// Compute the display width of the first `n` chars (accounting for double-width CJK).
 pub fn display_width(s: &str, n: usize) -> usize {
@@ -157,11 +166,24 @@ fn render_welcome(frame: &mut Frame, theme: &Theme, area: Rect) {
 
 fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
   let theme = app.theme();
-  let [mut thumb_area, info_area] =
+  let [thumb_layout_area, info_area] =
     Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)]).areas(area);
 
-  // Pad and center vertically to maintain 16:9 if possible
-  thumb_area = Rect { y: thumb_area.y + 1, height: thumb_area.height.saturating_sub(2), ..thumb_area };
+  // Glow border around thumbnail
+  let glow_color = dim_color(theme.accent, 0.35);
+  let glow_block =
+    Block::bordered().border_type(ratatui::widgets::BorderType::Rounded).border_style(Style::default().fg(glow_color));
+  frame.render_widget(glow_block, thumb_layout_area);
+
+  // Thumbnail area: inside the glow border (1 cell inset on all sides)
+  let mut thumb_area = Rect {
+    x: thumb_layout_area.x.saturating_add(1),
+    y: thumb_layout_area.y.saturating_add(1),
+    width: thumb_layout_area.width.saturating_sub(2),
+    height: thumb_layout_area.height.saturating_sub(2),
+  };
+
+  // Center vertically to maintain 16:9 aspect ratio
   let ideal_h = (thumb_area.width as f32 * 9.0 / 32.0).round() as u16;
   if ideal_h < thumb_area.height {
     let diff = thumb_area.height - ideal_h;
@@ -199,6 +221,16 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
     }
   }
 
+  let show_transcript =
+    app.transcript_visible && (!app.utterances.is_empty() || !matches!(app.transcript_state, TranscriptState::Idle));
+
+  let (np_area, transcript_area) = if show_transcript {
+    let [top, bottom] = Layout::vertical([Constraint::Percentage(65), Constraint::Percentage(35)]).areas(info_area);
+    (top, Some(bottom))
+  } else {
+    (info_area, None)
+  };
+
   let info_title = Line::from(vec![
     Span::styled(" Now Playing ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
     Span::styled(format!("[{}] ", app.player.display_mode.label().to_lowercase()), Style::default().fg(theme.muted)),
@@ -211,7 +243,7 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
     .style(Style::default().bg(theme.panel_bg));
 
   if let Some(details) = &app.player.current_details {
-    let inner_w = info_area.width.saturating_sub(4) as usize;
+    let inner_w = np_area.width.saturating_sub(4) as usize;
 
     let mut lines = vec![
       Line::from(""),
@@ -265,10 +297,129 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let paragraph = Paragraph::new(lines).block(info_block);
-    frame.render_widget(paragraph, info_area);
+    frame.render_widget(paragraph, np_area);
   } else {
-    frame.render_widget(info_block, info_area);
+    frame.render_widget(info_block, np_area);
   }
+
+  // --- Transcript area (bottom 35% of info pane) ---
+  if let Some(t_area) = transcript_area {
+    render_transcript(frame, app, t_area);
+  }
+}
+
+fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
+  let theme = app.theme();
+
+  let title_text = match &app.transcript_state {
+    TranscriptState::ExtractingAudio { .. } => " Extracting… ",
+    TranscriptState::Transcribing { .. } => {
+      if app.download_progress.is_some() {
+        " Downloading… "
+      } else {
+        " Transcribing… "
+      }
+    }
+    TranscriptState::Ready => " Transcript ",
+    TranscriptState::Idle => " Transcript ",
+  };
+  let title = Line::from(Span::styled(title_text, Style::default().fg(theme.accent)));
+  let block = Block::bordered()
+    .title(title)
+    .border_type(ratatui::widgets::BorderType::Rounded)
+    .border_style(Style::default().fg(theme.border))
+    .padding(Padding::horizontal(1))
+    .style(Style::default().bg(theme.panel_bg));
+
+  // Show model download progress bar
+  if let Some((downloaded, total)) = app.download_progress
+    && total > 0
+  {
+    let ratio = (downloaded as f64 / total as f64).min(1.0);
+    let downloaded_mb = downloaded as f64 / (1024.0 * 1024.0);
+    let total_mb = total as f64 / (1024.0 * 1024.0);
+    let label = format!("{downloaded_mb:.0} / {total_mb:.0} MB");
+
+    let gauge = Gauge::default()
+      .block(block)
+      .gauge_style(Style::default().fg(theme.accent).bg(theme.border))
+      .ratio(ratio)
+      .label(Span::styled(label, Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)));
+    frame.render_widget(gauge, area);
+    return;
+  }
+
+  if app.utterances.is_empty() {
+    frame.render_widget(block, area);
+    return;
+  }
+
+  // Determine current playback time for highlighting
+  let current_time_cs: Option<i64> =
+    app.player.get_last_mpv_status().and_then(|s| crate::parse_mpv_time_secs(&s)).map(|secs| (secs * 100.0) as i64); // Convert seconds to centiseconds
+
+  // Find the active utterance index
+  let active_idx: Option<usize> =
+    current_time_cs.and_then(|t| app.utterances.iter().position(|u| t >= u.start && t < u.stop));
+
+  let mut lines: Vec<Line> = Vec::new();
+  // Track which line index in `lines` corresponds to the active utterance
+  let mut active_line_idx: Option<usize> = None;
+  for (i, utterance) in app.utterances.iter().enumerate() {
+    let text = utterance.text.trim();
+    if text.is_empty() {
+      continue;
+    }
+
+    let is_active = active_idx == Some(i);
+
+    let style = if is_active {
+      Style::default().fg(theme.highlight_fg).bg(theme.highlight_bg).add_modifier(Modifier::BOLD)
+    } else {
+      Style::default().fg(theme.muted)
+    };
+
+    if is_active {
+      active_line_idx = Some(lines.len());
+    }
+
+    lines.push(Line::from(Span::styled(text.to_string(), style)));
+
+    // Add blank line between utterances (except after last)
+    if i < app.utterances.len().saturating_sub(1) {
+      lines.push(Line::from(""));
+    }
+  }
+
+  // Auto-scroll: compute total visual lines after word-wrap,
+  // then scroll so the currently active line is visible.
+  let inner_height = area.height.saturating_sub(2) as usize;
+  let inner_width = area.width.saturating_sub(4).max(1) as usize;
+
+  // Find the visual line offset of the active utterance for smart scrolling
+  let mut total_visual_lines: usize = 0;
+  let mut active_visual_line: usize = 0;
+  for (line_i, line) in lines.iter().enumerate() {
+    let line_width: usize = line.spans.iter().map(|s| s.content.len()).sum();
+    let visual_rows = if line_width == 0 { 1 } else { line_width.saturating_sub(1) / inner_width + 1 };
+
+    if active_line_idx == Some(line_i) {
+      active_visual_line = total_visual_lines;
+    }
+    total_visual_lines += visual_rows;
+  }
+
+  // Scroll to keep active line visible, falling back to bottom-scroll
+  let scroll = if active_line_idx.is_some() {
+    // Center the active line in the visible area
+    active_visual_line.saturating_sub(inner_height / 2) as u16
+  } else {
+    // No active line — scroll to bottom
+    total_visual_lines.saturating_sub(inner_height) as u16
+  };
+
+  let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false }).scroll((scroll, 0));
+  frame.render_widget(paragraph, area);
 }
 
 fn render_results(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -398,16 +549,8 @@ fn render_results(frame: &mut Frame, app: &mut App, area: Rect) {
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
   let theme = app.theme();
 
-  // Special rendering for model download progress bar
-  if let VoiceState::Downloading { downloaded, total, .. } = &app.voice {
-    render_download_progress(frame, theme, area, *downloaded, *total);
-    return;
-  }
-
-  let is_voice_active = !matches!(app.voice, VoiceState::Idle);
-  let voice_icon = if is_voice_active { "🎤 " } else { "" };
   let (text, style) = if let Some(msg) = &app.status_message {
-    (format!(" {voice_icon}⏳ {}", msg), Style::default().fg(theme.status))
+    (format!(" ⏳ {}", msg), Style::default().fg(theme.status))
   } else if let Some(err) = &app.last_error {
     (format!(" ⚠  {}", err), Style::default().fg(theme.error))
   } else if let Some(msg) = &app.info_message {
@@ -420,28 +563,6 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     }
   };
   frame.render_widget(Paragraph::new(text).style(style), area);
-}
-
-fn render_download_progress(frame: &mut Frame, theme: &Theme, area: Rect, downloaded: u64, total: u64) {
-  let pct = if total > 0 { downloaded.saturating_mul(100) / total } else { 0 };
-  let downloaded_mb = downloaded / (1024 * 1024);
-  let total_mb = total.max(1) / (1024 * 1024);
-
-  let bar_width: usize = 24;
-  let filled = if total > 0 { (bar_width as u64 * downloaded / total) as usize } else { 0 };
-  let empty = bar_width.saturating_sub(filled);
-
-  let filled_str: String = "█".repeat(filled);
-  let empty_str: String = "░".repeat(empty);
-
-  let spans = vec![
-    Span::styled(" 🎤 Downloading model  ", Style::default().fg(theme.status)),
-    Span::styled(filled_str, Style::default().fg(theme.accent)),
-    Span::styled(empty_str, Style::default().fg(theme.muted)),
-    Span::styled(format!("  {}%  ({}/{} MB)", pct, downloaded_mb, total_mb), Style::default().fg(theme.status)),
-  ];
-
-  frame.render_widget(Line::from(spans), area);
 }
 
 fn render_input(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -500,20 +621,21 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
   let theme = app.theme();
   let has_results = !app.search_results.is_empty();
   let is_playing = app.player.is_playing();
-  let is_recording = matches!(app.voice, VoiceState::Recording { .. });
-  let voice_busy = matches!(app.voice, VoiceState::Downloading { .. } | VoiceState::Transcribing { .. });
-  let voice_hint = if is_recording {
-    ("^a", "Stop")
-  } else if voice_busy {
-    ("^a", "…")
+  let transcript_busy =
+    matches!(app.transcript_state, TranscriptState::ExtractingAudio { .. } | TranscriptState::Transcribing { .. });
+  let has_transcript = !app.utterances.is_empty() || transcript_busy;
+  let transcript_hint = if transcript_busy {
+    ("^a", "Cancel")
+  } else if has_transcript {
+    if app.transcript_visible { ("^a", "Hide") } else { ("^a", "Show") }
   } else {
-    ("^a", "Mic")
+    ("^a", "Transcript")
   };
   let keys: Vec<(&str, &str)> = match app.mode {
     AppMode::Input => {
       let mut k = vec![("Enter", "Search"), ("^t", "Theme"), ("^f", "Frame")];
-      k.push(voice_hint);
       if is_playing {
+        k.push(transcript_hint);
         k.push(("^s", "Stop"));
         k.push(("^o", "Open"));
       }
@@ -527,8 +649,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
     AppMode::Results => {
       let mut k = vec![("Enter", "Play"), ("j/k", "Navigate"), ("/", "Filter")];
-      k.push(voice_hint);
       if is_playing {
+        k.push(transcript_hint);
         let pause_label = if app.player.paused { "Resume" } else { "Pause" };
         k.push(("Space", pause_label));
         k.push(("^s", "Stop"));
@@ -541,8 +663,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
     AppMode::Filter => {
       let mut k = vec![("Enter", "Apply"), ("Esc", "Clear"), ("↑↓", "Navigate")];
-      k.push(voice_hint);
       if is_playing {
+        k.push(transcript_hint);
         let pause_label = if app.player.paused { "Resume" } else { "Pause" };
         k.push(("Space", pause_label));
         k.push(("^s", "Stop"));
