@@ -1,10 +1,10 @@
 use image::imageops::FilterType;
 use ratatui::{
+  Frame,
   layout::{Alignment, Constraint, Layout, Rect},
   style::{Modifier, Style, Stylize},
   text::{Line, Span},
   widgets::{Block, List, ListItem, Padding, Paragraph},
-  Frame,
 };
 
 use crate::display::DisplayMode;

@@ -19,6 +19,7 @@ pub struct VideoDetails {
   pub uploader: Option<String>,
   pub duration: Option<String>,
   pub upload_date: Option<String>,
+  pub view_count: Option<String>,
   pub tags: Vec<String>,
 }
 
