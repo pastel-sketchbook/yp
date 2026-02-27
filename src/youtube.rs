@@ -1,11 +1,342 @@
 use anyhow::{Context, Result, anyhow};
 use image::DynamicImage;
 use reqwest::Client;
+use serde_json::Value;
+use std::path::PathBuf;
 use std::process::Stdio;
-use tokio::process::Command;
+use tokio::process::{Child as TokioChild, Command};
 use tokio::sync::mpsc;
 
 use crate::player::VideoDetails;
+
+// --- Frame Sources ---
+
+/// Frame rate for ffmpeg video frame extraction (frames per second).
+const FRAME_EXTRACT_FPS: f64 = 0.5;
+
+/// Width of extracted video frames (height is auto-scaled to preserve aspect ratio).
+const FRAME_EXTRACT_WIDTH: u32 = 640;
+
+/// A decoded storyboard: sprite sheets + metadata for frame extraction.
+pub struct SpriteFrameSource {
+  /// The video ID this source belongs to.
+  pub video_id: String,
+  /// Decoded sprite sheet images (one per fragment).
+  sheets: Vec<DynamicImage>,
+  /// Width of a single frame within the sprite sheet.
+  frame_width: u32,
+  /// Height of a single frame within the sprite sheet.
+  frame_height: u32,
+  /// Number of rows in each sprite sheet grid.
+  rows: u32,
+  /// Number of columns in each sprite sheet grid.
+  cols: u32,
+  /// Storyboard frame rate (frames per second, typically ~0.5).
+  fps: f64,
+  /// Duration each fragment covers (in seconds).
+  fragment_durations: Vec<f64>,
+}
+
+impl SpriteFrameSource {
+  /// Number of frames in each sprite sheet.
+  fn frames_per_sheet(&self) -> u32 {
+    self.rows * self.cols
+  }
+
+  /// Duration of a single frame (in seconds).
+  fn frame_interval(&self) -> f64 {
+    if self.fps > 0.0 { 1.0 / self.fps } else { 2.0 }
+  }
+
+  /// Compute a global frame index for the given playback time.
+  pub fn frame_index_at(&self, time_secs: f64) -> usize {
+    if self.sheets.is_empty() || time_secs < 0.0 {
+      return 0;
+    }
+    let interval = self.frame_interval();
+    let fps = self.frames_per_sheet() as usize;
+    let mut elapsed = 0.0;
+    let mut global_offset = 0usize;
+
+    for (i, &dur) in self.fragment_durations.iter().enumerate() {
+      if time_secs < elapsed + dur || i == self.sheets.len() - 1 {
+        let time_in_frag = (time_secs - elapsed).max(0.0);
+        let local_idx = (time_in_frag / interval) as usize;
+        return global_offset + local_idx.min(fps - 1);
+      }
+      elapsed += dur;
+      global_offset += fps;
+    }
+    0
+  }
+
+  /// Extract the frame image at the given playback time.
+  pub fn frame_at(&self, time_secs: f64) -> Option<DynamicImage> {
+    if self.sheets.is_empty() || time_secs < 0.0 {
+      return None;
+    }
+    let interval = self.frame_interval();
+    let fps = self.frames_per_sheet();
+    let mut elapsed = 0.0;
+
+    for (i, sheet) in self.sheets.iter().enumerate() {
+      let frag_dur = self.fragment_durations.get(i).copied().unwrap_or(0.0);
+      if time_secs < elapsed + frag_dur || i == self.sheets.len() - 1 {
+        let time_in_frag = (time_secs - elapsed).max(0.0);
+        let local_idx = (time_in_frag / interval) as u32;
+        let local_idx = local_idx.min(fps - 1);
+        let col = local_idx % self.cols;
+        let row = local_idx / self.cols;
+        let x = col * self.frame_width;
+        let y = row * self.frame_height;
+        return Some(sheet.crop_imm(x, y, self.frame_width, self.frame_height));
+      }
+      elapsed += frag_dur;
+    }
+    None
+  }
+}
+
+/// Video frame source: ffmpeg extracts frames progressively to a temp directory.
+/// Frames become available on disk as ffmpeg processes the stream.
+pub struct VideoFrameSource {
+  /// The video ID this source belongs to.
+  pub video_id: String,
+  /// Directory containing extracted frame JPEGs (frame_0001.jpg, frame_0002.jpg, ...).
+  frames_dir: PathBuf,
+  /// Interval between frames in seconds (1.0 / FRAME_EXTRACT_FPS).
+  frame_interval: f64,
+  /// Handle to the running ffmpeg process (killed on drop).
+  ffmpeg_handle: Option<TokioChild>,
+}
+
+impl VideoFrameSource {
+  /// Compute the 1-indexed frame number for the given playback time.
+  pub fn frame_index_at(&self, time_secs: f64) -> usize {
+    if time_secs < 0.0 {
+      return 1;
+    }
+    (time_secs / self.frame_interval) as usize + 1
+  }
+
+  /// Load the frame image at the given playback time from disk.
+  /// Returns `None` if the frame hasn't been extracted yet.
+  pub fn frame_at(&self, time_secs: f64) -> Option<DynamicImage> {
+    let idx = self.frame_index_at(time_secs);
+    let path = self.frames_dir.join(format!("frame_{:04}.jpg", idx));
+    image::open(&path).ok()
+  }
+}
+
+impl Drop for VideoFrameSource {
+  fn drop(&mut self) {
+    if let Some(ref mut child) = self.ffmpeg_handle {
+      // start_kill is synchronous — safe to call in Drop
+      let _ = child.start_kill();
+    }
+    let _ = std::fs::remove_dir_all(&self.frames_dir);
+  }
+}
+
+/// Unified frame source enum — delegates to either sprite sheets or video frames.
+pub enum FrameSource {
+  Sprites(SpriteFrameSource),
+  Video(VideoFrameSource),
+}
+
+impl FrameSource {
+  pub fn video_id(&self) -> &str {
+    match self {
+      FrameSource::Sprites(s) => &s.video_id,
+      FrameSource::Video(v) => &v.video_id,
+    }
+  }
+
+  pub fn frame_index_at(&self, time_secs: f64) -> usize {
+    match self {
+      FrameSource::Sprites(s) => s.frame_index_at(time_secs),
+      FrameSource::Video(v) => v.frame_index_at(time_secs),
+    }
+  }
+
+  pub fn frame_at(&self, time_secs: f64) -> Option<DynamicImage> {
+    match self {
+      FrameSource::Sprites(s) => s.frame_at(time_secs),
+      FrameSource::Video(v) => v.frame_at(time_secs),
+    }
+  }
+}
+
+/// Intermediate: parsed storyboard metadata from yt-dlp JSON.
+struct StoryboardMeta {
+  frame_width: u32,
+  frame_height: u32,
+  rows: u32,
+  cols: u32,
+  fps: f64,
+  fragments: Vec<StoryboardFragmentMeta>,
+}
+
+struct StoryboardFragmentMeta {
+  url: String,
+  duration: f64,
+}
+
+/// Parse storyboard metadata from yt-dlp --dump-json output.
+/// Picks the highest-resolution storyboard format available.
+fn parse_storyboard_meta(json: &Value) -> Result<StoryboardMeta> {
+  let formats = json.get("formats").and_then(Value::as_array).context("No formats array in yt-dlp JSON")?;
+
+  let sb_format = formats
+    .iter()
+    .filter(|f| f.get("format_note").and_then(Value::as_str) == Some("storyboard"))
+    .max_by_key(|f| {
+      let w = f.get("width").and_then(Value::as_u64).unwrap_or(0);
+      let h = f.get("height").and_then(Value::as_u64).unwrap_or(0);
+      w * h
+    })
+    .context("No storyboard format found")?;
+
+  let frame_width = sb_format.get("width").and_then(Value::as_u64).context("Missing storyboard width")? as u32;
+  let frame_height = sb_format.get("height").and_then(Value::as_u64).context("Missing storyboard height")? as u32;
+  let rows = sb_format.get("rows").and_then(Value::as_u64).context("Missing storyboard rows")? as u32;
+  let cols = sb_format.get("columns").and_then(Value::as_u64).context("Missing storyboard columns")? as u32;
+  let fps = sb_format.get("fps").and_then(Value::as_f64).context("Missing storyboard fps")?;
+
+  let fragments = sb_format
+    .get("fragments")
+    .and_then(Value::as_array)
+    .context("Missing storyboard fragments")?
+    .iter()
+    .filter_map(|f| {
+      let url = f.get("url").and_then(Value::as_str)?.to_string();
+      let duration = f.get("duration").and_then(Value::as_f64)?;
+      Some(StoryboardFragmentMeta { url, duration })
+    })
+    .collect::<Vec<_>>();
+
+  if fragments.is_empty() {
+    return Err(anyhow!("Storyboard has no fragments"));
+  }
+
+  Ok(StoryboardMeta { frame_width, frame_height, rows, cols, fps, fragments })
+}
+
+/// Fetch storyboard sprite sheets for a video.
+///
+/// Runs `yt-dlp --dump-json` to get storyboard metadata, then downloads
+/// all sprite sheet images. This is a progressive enhancement — if it fails,
+/// the static thumbnail continues to work.
+pub async fn fetch_sprite_frames(client: &Client, video_id: &str) -> Result<FrameSource> {
+  let url = format!("https://youtube.com/watch?v={}", video_id);
+  let output = Command::new("yt-dlp")
+    .args(["--dump-json", "--no-warnings", "--", &url])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .output()
+    .await
+    .context("Failed to run yt-dlp for storyboard info")?;
+
+  if !output.status.success() {
+    return Err(anyhow!("yt-dlp --dump-json failed for storyboard"));
+  }
+
+  let json: Value = serde_json::from_slice(&output.stdout).context("Failed to parse yt-dlp JSON for storyboard")?;
+  let meta = parse_storyboard_meta(&json)?;
+
+  // Download fragments sequentially to preserve order (they're small images)
+  let mut sheets = Vec::with_capacity(meta.fragments.len());
+  let mut durations = Vec::with_capacity(meta.fragments.len());
+
+  for frag in &meta.fragments {
+    let response = client
+      .get(&frag.url)
+      .send()
+      .await
+      .with_context(|| format!("Failed to fetch storyboard sheet: {}", &frag.url[..60.min(frag.url.len())]))?;
+    let bytes = response.bytes().await.context("Failed to read storyboard sheet bytes")?;
+    let image = image::load_from_memory(&bytes).context("Failed to decode storyboard sprite sheet")?;
+    sheets.push(image);
+    durations.push(frag.duration);
+  }
+
+  Ok(FrameSource::Sprites(SpriteFrameSource {
+    video_id: video_id.to_string(),
+    sheets,
+    frame_width: meta.frame_width,
+    frame_height: meta.frame_height,
+    rows: meta.rows,
+    cols: meta.cols,
+    fps: meta.fps,
+    fragment_durations: durations,
+  }))
+}
+
+/// Fetch video frames via ffmpeg extraction.
+///
+/// Runs `yt-dlp --get-url` to get the video stream URL, then spawns `ffmpeg`
+/// to progressively extract frames to a temp directory. Returns immediately —
+/// frames appear on disk as ffmpeg processes the stream.
+pub async fn fetch_video_frames(video_id: &str) -> Result<FrameSource> {
+  let yt_url = format!("https://youtube.com/watch?v={}", video_id);
+  let output = Command::new("yt-dlp")
+    .args(["--get-url", "-f", "bestvideo[height<=480]/bestvideo", "--no-warnings", "--", &yt_url])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .output()
+    .await
+    .context("Failed to run yt-dlp --get-url for video frames")?;
+
+  if !output.status.success() {
+    return Err(anyhow!("yt-dlp --get-url failed for video frame extraction"));
+  }
+
+  let stream_url = String::from_utf8(output.stdout).context("yt-dlp --get-url output not UTF-8")?.trim().to_string();
+  if stream_url.is_empty() {
+    return Err(anyhow!("yt-dlp returned empty stream URL"));
+  }
+
+  let frames_dir = PathBuf::from(format!("/tmp/yp-frames-{}-{}", std::process::id(), video_id));
+  std::fs::create_dir_all(&frames_dir).context("Failed to create temp dir for video frames")?;
+
+  let output_pattern = frames_dir.join("frame_%04d.jpg");
+  let vf_arg = format!("fps={},scale={}:-2", FRAME_EXTRACT_FPS, FRAME_EXTRACT_WIDTH);
+
+  let child = Command::new("ffmpeg")
+    .args([
+      "-nostdin",
+      "-i",
+      &stream_url,
+      "-vf",
+      &vf_arg,
+      "-q:v",
+      "2",
+      "-y",
+      output_pattern.to_str().context("Invalid temp dir path")?,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .map_err(|e| {
+      if e.kind() == std::io::ErrorKind::NotFound {
+        anyhow!("ffmpeg not found. Install it with: brew install ffmpeg (macOS)")
+      } else {
+        anyhow!(e).context("Failed to spawn ffmpeg for video frame extraction")
+      }
+    })?;
+
+  let frame_interval = 1.0 / FRAME_EXTRACT_FPS;
+
+  Ok(FrameSource::Video(VideoFrameSource {
+    video_id: video_id.to_string(),
+    frames_dir,
+    frame_interval,
+    ffmpeg_handle: Some(child),
+  }))
+}
 
 /// Number of videos to fetch on the initial channel load.
 pub const CHANNEL_INITIAL_SIZE: usize = 30;

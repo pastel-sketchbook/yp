@@ -4053,7 +4053,7 @@ dependencies = [
 
 [[package]]
 name = "yp"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -4065,6 +4065,7 @@ dependencies = [
  "ratatui",
  "reqwest",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "unicode-width",

@@ -346,7 +346,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
   let is_playing = app.player.is_playing();
   let keys: Vec<(&str, &str)> = match app.mode {
     AppMode::Input => {
-      let mut k = vec![("Enter", "Search"), ("^t", "Theme")];
+      let mut k = vec![("Enter", "Search"), ("^t", "Theme"), ("^f", "Frame")];
       if is_playing {
         k.push(("^s", "Stop"));
       }
@@ -366,6 +366,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         k.push(("^s", "Stop"));
       }
       k.push(("^t", "Theme"));
+      k.push(("^f", "Frame"));
       k.push(("Esc", "Back"));
       k
     }
@@ -388,9 +389,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 
   frame.render_widget(Line::from(spans), area);
 
-  let theme_label = format!("{} ", theme.name);
-  let right = Line::from(Span::styled(&theme_label, Style::default().fg(theme.muted)));
+  let right_label = format!("{} | {} ", app.frame_mode.label(), theme.name);
+  let right = Line::from(Span::styled(&right_label, Style::default().fg(theme.muted)));
   let right_area =
-    Rect { x: area.x + area.width.saturating_sub(theme_label.len() as u16), width: theme_label.len() as u16, ..area };
+    Rect { x: area.x + area.width.saturating_sub(right_label.len() as u16), width: right_label.len() as u16, ..area };
   frame.render_widget(right, right_area);
 }

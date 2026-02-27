@@ -23,8 +23,9 @@ use graphics::{kitty_delete_all, kitty_render_image, sixel_render_image};
 use player::{MusicPlayer, VideoDetails};
 use theme::THEMES;
 use youtube::{
-  CHANNEL_INITIAL_SIZE, CHANNEL_PAGE_SIZE, SearchEntry, VideoMeta, detect_channel_url, enrich_video_metadata,
-  fetch_thumbnail, get_video_info, list_channel_videos, search_youtube,
+  CHANNEL_INITIAL_SIZE, CHANNEL_PAGE_SIZE, FrameSource, SearchEntry, VideoMeta, detect_channel_url,
+  enrich_video_metadata, fetch_sprite_frames, fetch_thumbnail, fetch_video_frames, get_video_info, list_channel_videos,
+  search_youtube,
 };
 
 use directories::ProjectDirs;
@@ -45,6 +46,37 @@ struct Args {
 type SearchResult = Vec<SearchEntry>;
 type LoadResult = (String, VideoDetails, Option<DynamicImage>);
 
+/// Video frame display mode during playback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameMode {
+  /// Static thumbnail only (no extra work).
+  Thumbnail,
+  /// YouTube storyboard sprite sheets (low-res 320x180, fast, no ffmpeg).
+  Storyboard,
+  /// ffmpeg frame extraction (640x360, progressive, requires ffmpeg).
+  Video,
+}
+
+impl FrameMode {
+  pub const ALL: [FrameMode; 3] = [FrameMode::Thumbnail, FrameMode::Storyboard, FrameMode::Video];
+
+  pub fn label(self) -> &'static str {
+    match self {
+      FrameMode::Thumbnail => "thumbnail",
+      FrameMode::Storyboard => "storyboard",
+      FrameMode::Video => "video",
+    }
+  }
+
+  pub fn from_config(s: &str) -> Self {
+    match s.to_lowercase().as_str() {
+      "storyboard" => FrameMode::Storyboard,
+      "video" => FrameMode::Video,
+      _ => FrameMode::Thumbnail,
+    }
+  }
+}
+
 /// Tracks the state of a channel listing for on-demand pagination.
 #[derive(Debug, Clone)]
 pub struct ChannelSource {
@@ -63,6 +95,7 @@ pub struct ChannelSource {
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct Config {
   pub theme_name: Option<String>,
+  pub frame_mode: Option<String>,
 }
 
 impl Config {
@@ -104,6 +137,7 @@ pub struct App {
   pub cursor_position: usize,
   pub mode: AppMode,
   pub theme_index: usize,
+  pub frame_mode: FrameMode,
   pub search_results: Vec<SearchEntry>,
   pub list_state: ListState,
   pub player: MusicPlayer,
@@ -115,6 +149,12 @@ pub struct App {
   more_rx: Option<oneshot::Receiver<Result<SearchResult>>>,
   enrich_rx: Option<mpsc::Receiver<VideoMeta>>,
   enrich_handle: Option<JoinHandle<()>>,
+  frame_source: Option<FrameSource>,
+  frame_source_rx: Option<oneshot::Receiver<Result<FrameSource>>>,
+  frame_idx: Option<usize>,
+  /// The original thumbnail image (before storyboard/video frames replace it).
+  /// Used to restore the thumbnail when cycling frame modes.
+  original_thumbnail: Option<(String, DynamicImage)>,
   pub channel_source: Option<ChannelSource>,
   pub graphics_thumb_area: Option<Rect>,
   pub graphics_last_sent: Option<(String, Rect)>,
@@ -127,6 +167,8 @@ impl App {
     let config = Config::load();
     let theme_index =
       if let Some(ref name) = config.theme_name { THEMES.iter().position(|t| t.name == name).unwrap_or(0) } else { 0 };
+    let frame_mode =
+      if let Some(ref mode) = config.frame_mode { FrameMode::from_config(mode) } else { FrameMode::Thumbnail };
 
     let default_input = "@ChrisH-v4e".to_string();
     let default_cursor = default_input.chars().count();
@@ -136,6 +178,7 @@ impl App {
       cursor_position: default_cursor,
       mode: AppMode::Input,
       theme_index,
+      frame_mode,
       search_results: Vec::new(),
       list_state: ListState::default(),
       player: MusicPlayer::new(display_mode),
@@ -147,6 +190,10 @@ impl App {
       more_rx: None,
       enrich_rx: None,
       enrich_handle: None,
+      frame_source: None,
+      frame_source_rx: None,
+      frame_idx: None,
+      original_thumbnail: None,
       channel_source: None,
       graphics_thumb_area: None,
       graphics_last_sent: None,
@@ -159,10 +206,71 @@ impl App {
     &THEMES[self.theme_index]
   }
 
+  fn save_config(&self) {
+    let config =
+      Config { theme_name: Some(self.theme().name.to_string()), frame_mode: Some(self.frame_mode.label().to_string()) };
+    config.save();
+  }
+
   fn next_theme(&mut self) {
     self.theme_index = (self.theme_index + 1) % THEMES.len();
-    let config = Config { theme_name: Some(self.theme().name.to_string()) };
-    config.save();
+    self.save_config();
+  }
+
+  fn next_frame_mode(&mut self) {
+    let idx = FrameMode::ALL.iter().position(|m| *m == self.frame_mode).unwrap_or(0);
+    self.frame_mode = FrameMode::ALL[(idx + 1) % FrameMode::ALL.len()];
+
+    // Clear current frame source state
+    self.frame_source = None;
+    self.frame_source_rx = None;
+    self.frame_idx = None;
+
+    // Restore original thumbnail if we have one
+    if let Some((ref vid, ref img)) = self.original_thumbnail {
+      self.player.cached_thumbnail = Some((vid.clone(), img.clone()));
+      self.cached_resized_thumb = None;
+      self.graphics_last_sent = None;
+    }
+
+    // Trigger new frame source if currently playing
+    if self.player.is_playing() {
+      self.trigger_frame_source();
+    }
+
+    self.save_config();
+  }
+
+  /// Spawn appropriate frame source fetch based on current `frame_mode`.
+  /// Does nothing in Thumbnail mode.
+  fn trigger_frame_source(&mut self) {
+    if self.frame_mode == FrameMode::Thumbnail {
+      return;
+    }
+    // Determine video_id from original_thumbnail or cached_thumbnail
+    let video_id = self.original_thumbnail.as_ref().or(self.player.cached_thumbnail.as_ref()).map(|(id, _)| id.clone());
+    let Some(video_id) = video_id else { return };
+
+    match self.frame_mode {
+      FrameMode::Storyboard => {
+        let client = self.player.http_client.clone();
+        let vid = video_id.clone();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+          let _ = tx.send(fetch_sprite_frames(&client, &vid).await);
+        });
+        self.frame_source_rx = Some(rx);
+      }
+      FrameMode::Video => {
+        let vid = video_id.clone();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+          let _ = tx.send(fetch_video_frames(&vid).await);
+        });
+        self.frame_source_rx = Some(rx);
+      }
+      FrameMode::Thumbnail => {}
+    }
   }
 
   async fn check_pending(&mut self) -> Result<()> {
@@ -216,6 +324,7 @@ impl App {
                 self.last_error = Some(format!("Playback error: {}", e));
                 let _ = self.player.stop().await;
               } else if let Some(thumb) = thumbnail {
+                self.original_thumbnail = Some((video_id.clone(), thumb.clone()));
                 self.player.cached_thumbnail = Some((video_id, thumb));
               }
               self.mode = AppMode::Input;
@@ -274,6 +383,22 @@ impl App {
             source.loading_more = false;
           }
         }
+      }
+    }
+
+    // Check for background frame source fetch
+    if let Some(mut rx) = self.frame_source_rx.take() {
+      match rx.try_recv() {
+        Ok(Ok(fs)) => {
+          self.frame_source = Some(fs);
+        }
+        Ok(Err(_)) => {
+          // Frame source fetch failed silently — static thumbnail continues to work
+        }
+        Err(oneshot::error::TryRecvError::Empty) => {
+          self.frame_source_rx = Some(rx);
+        }
+        Err(oneshot::error::TryRecvError::Closed) => {}
       }
     }
 
@@ -383,6 +508,11 @@ impl App {
     let client = self.player.http_client.clone();
     self.last_error = None;
     self.status_message = Some("Loading…".to_string());
+    // Clear previous frame source state
+    self.frame_source = None;
+    self.frame_source_rx = None;
+    self.frame_idx = None;
+    self.original_thumbnail = None;
 
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
@@ -404,6 +534,28 @@ impl App {
       }
     });
     self.load_rx = Some(rx);
+
+    // Spawn background frame source fetch based on current mode
+    match self.frame_mode {
+      FrameMode::Thumbnail => {}
+      FrameMode::Storyboard => {
+        let sb_client = self.player.http_client.clone();
+        let sb_video_id = entry.video_id.clone();
+        let (fs_tx, fs_rx) = oneshot::channel();
+        tokio::spawn(async move {
+          let _ = fs_tx.send(fetch_sprite_frames(&sb_client, &sb_video_id).await);
+        });
+        self.frame_source_rx = Some(fs_rx);
+      }
+      FrameMode::Video => {
+        let vid = entry.video_id.clone();
+        let (fs_tx, fs_rx) = oneshot::channel();
+        tokio::spawn(async move {
+          let _ = fs_tx.send(fetch_video_frames(&vid).await);
+        });
+        self.frame_source_rx = Some(fs_rx);
+      }
+    }
   }
 }
 
@@ -412,6 +564,28 @@ impl App {
 /// Convert a char index to a byte offset within the string.
 fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
   s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
+}
+
+/// Parse the time position (in seconds) from an mpv status string.
+///
+/// Expects format: `Time: MM:SS / ... ` or `Time: H:MM:SS / ...`
+fn parse_mpv_time_secs(status: &str) -> Option<f64> {
+  let time_part = status.strip_prefix("Time: ")?.split(" / ").next()?.trim();
+  let parts: Vec<&str> = time_part.split(':').collect();
+  match parts.len() {
+    2 => {
+      let m: f64 = parts[0].parse().ok()?;
+      let s: f64 = parts[1].parse().ok()?;
+      Some(m * 60.0 + s)
+    }
+    3 => {
+      let h: f64 = parts[0].parse().ok()?;
+      let m: f64 = parts[1].parse().ok()?;
+      let s: f64 = parts[2].parse().ok()?;
+      Some(h * 3600.0 + m * 60.0 + s)
+    }
+    _ => None,
+  }
 }
 
 // --- Event Handling ---
@@ -427,9 +601,18 @@ async fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()> {
     return Ok(());
   }
 
+  if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
+    app.next_frame_mode();
+    return Ok(());
+  }
+
   if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
     if app.player.is_playing() {
       app.player.stop().await.context("Failed to stop playback")?;
+      app.frame_source = None;
+      app.frame_source_rx = None;
+      app.frame_idx = None;
+      app.original_thumbnail = None;
       app.graphics_last_sent = None;
       app.cached_resized_thumb = None;
     }
@@ -565,6 +748,23 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
   loop {
     app.check_pending().await?;
     app.player.check_mpv_status();
+
+    // Update frame source image if available and time position changed
+    if let Some(ref frame_source) = app.frame_source
+      && let Some(status) = app.player.get_last_mpv_status()
+      && let Some(time_secs) = parse_mpv_time_secs(&status)
+    {
+      let idx = frame_source.frame_index_at(time_secs);
+      if app.frame_idx != Some(idx)
+        && let Some(frame) = frame_source.frame_at(time_secs)
+      {
+        let vid = frame_source.video_id().to_string();
+        app.player.cached_thumbnail = Some((vid, frame));
+        app.cached_resized_thumb = None;
+        app.graphics_last_sent = None;
+        app.frame_idx = Some(idx);
+      }
+    }
 
     terminal.draw(|frame| ui::ui(frame, &mut app))?;
 
