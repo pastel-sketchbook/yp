@@ -10,11 +10,7 @@ brew install yt-dlp mpv
 
 ### Voice-to-Text (optional)
 
-Voice search requires `sox` for recording and `whisper-cpp` for transcription.
-
-```bash
-brew install sox whisper-cpp
-```
+Auto-transcription uses [whisper-cli-rs](https://github.com/m1guelpf/whisper-cli-rs) by [Miguel Piedrafita](https://github.com/m1guelpf) for speech-to-text via the whisper.cpp engine.
 
 The whisper model (`ggml-small.bin`, ~460 MB) is downloaded automatically on first use.
 

@@ -4323,6 +4323,7 @@ dependencies = [
 [[package]]
 name = "whisper_cli"
 version = "0.1.0"
+source = "git+https://github.com/m1guelpf/whisper-cli-rs#99d743cda602217edef517ec58991b3ed7d05be6"
 dependencies = [
  "anyhow",
  "audrey",

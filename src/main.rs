@@ -502,7 +502,7 @@ impl App {
 
             info!(wav = %wav_for_whisper.display(), "transcript: starting whisper transcription");
             let transcript =
-              whisper.transcribe(&wav_for_whisper, false, false, false, false).context("Whisper transcription failed");
+              whisper.transcribe(&wav_for_whisper, false, false).context("Whisper transcription failed");
 
             // Clean up WAV file
             let _ = std::fs::remove_file(&wav_for_whisper);
