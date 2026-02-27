@@ -152,9 +152,12 @@ fn render_welcome(frame: &mut Frame, theme: &Theme, area: Rect) {
     Line::from(""),
     Line::from(Span::styled("▶  Welcome to yp", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))),
     Line::from(""),
-    Line::from(Span::styled("Search YouTube. Play audio/video. In the terminal.", Style::default().fg(theme.fg))),
+    Line::from(Span::styled(
+      "YouTube player with thumbnails, transcription, and channel browsing.",
+      Style::default().fg(theme.fg),
+    )),
     Line::from(""),
-    Line::from(Span::styled("Type a query below and press Enter.", Style::default().fg(theme.muted))),
+    Line::from(Span::styled("Type a search query or @channel below.", Style::default().fg(theme.muted))),
   ];
   let paragraph = Paragraph::new(text).alignment(Alignment::Center).block(
     Block::bordered()
@@ -312,18 +315,18 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
   let theme = app.theme();
 
   let title_text = match &app.transcript_state {
-    TranscriptState::ExtractingAudio { .. } => " Extracting… ",
+    TranscriptState::ExtractingAudio { .. } => " Extracting... ",
     TranscriptState::Transcribing { .. } => {
       if app.download_progress.is_some() {
-        " Downloading… "
+        " Downloading... "
       } else {
-        " Transcribing… "
+        " Transcribing... "
       }
     }
     TranscriptState::Ready => " Transcript ",
     TranscriptState::Idle => " Transcript ",
   };
-  let title = Line::from(Span::styled(title_text, Style::default().fg(theme.accent)));
+  let title = Line::from(Span::styled(title_text, Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
   let block = Block::bordered()
     .title(title)
     .border_type(ratatui::widgets::BorderType::Rounded)
