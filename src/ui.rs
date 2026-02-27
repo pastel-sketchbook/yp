@@ -10,7 +10,7 @@ use ratatui::{
 use crate::display::DisplayMode;
 use crate::graphics::ThumbnailWidget;
 use crate::theme::Theme;
-use crate::{App, AppMode};
+use crate::{App, AppMode, VoiceState};
 
 // --- Helpers ---
 
@@ -397,8 +397,17 @@ fn render_results(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
   let theme = app.theme();
+
+  // Special rendering for model download progress bar
+  if let VoiceState::Downloading { downloaded, total, .. } = &app.voice {
+    render_download_progress(frame, theme, area, *downloaded, *total);
+    return;
+  }
+
+  let is_voice_active = !matches!(app.voice, VoiceState::Idle);
+  let voice_icon = if is_voice_active { "🎤 " } else { "" };
   let (text, style) = if let Some(msg) = &app.status_message {
-    (format!(" ⏳ {}", msg), Style::default().fg(theme.status))
+    (format!(" {voice_icon}⏳ {}", msg), Style::default().fg(theme.status))
   } else if let Some(err) = &app.last_error {
     (format!(" ⚠  {}", err), Style::default().fg(theme.error))
   } else {
@@ -409,6 +418,28 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     }
   };
   frame.render_widget(Paragraph::new(text).style(style), area);
+}
+
+fn render_download_progress(frame: &mut Frame, theme: &Theme, area: Rect, downloaded: u64, total: u64) {
+  let pct = if total > 0 { downloaded.saturating_mul(100) / total } else { 0 };
+  let downloaded_mb = downloaded / (1024 * 1024);
+  let total_mb = total.max(1) / (1024 * 1024);
+
+  let bar_width: usize = 24;
+  let filled = if total > 0 { (bar_width as u64 * downloaded / total) as usize } else { 0 };
+  let empty = bar_width.saturating_sub(filled);
+
+  let filled_str: String = "█".repeat(filled);
+  let empty_str: String = "░".repeat(empty);
+
+  let spans = vec![
+    Span::styled(" 🎤 Downloading model  ", Style::default().fg(theme.status)),
+    Span::styled(filled_str, Style::default().fg(theme.accent)),
+    Span::styled(empty_str, Style::default().fg(theme.muted)),
+    Span::styled(format!("  {}%  ({}/{} MB)", pct, downloaded_mb, total_mb), Style::default().fg(theme.status)),
+  ];
+
+  frame.render_widget(Line::from(spans), area);
 }
 
 fn render_input(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -467,9 +498,19 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
   let theme = app.theme();
   let has_results = !app.search_results.is_empty();
   let is_playing = app.player.is_playing();
+  let is_recording = matches!(app.voice, VoiceState::Recording { .. });
+  let voice_busy = matches!(app.voice, VoiceState::Downloading { .. } | VoiceState::Transcribing { .. });
+  let voice_hint = if is_recording {
+    ("^a", "Stop")
+  } else if voice_busy {
+    ("^a", "…")
+  } else {
+    ("^a", "Mic")
+  };
   let keys: Vec<(&str, &str)> = match app.mode {
     AppMode::Input => {
       let mut k = vec![("Enter", "Search"), ("^t", "Theme"), ("^f", "Frame")];
+      k.push(voice_hint);
       if is_playing {
         k.push(("^s", "Stop"));
         k.push(("^o", "Open"));
@@ -484,6 +525,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
     AppMode::Results => {
       let mut k = vec![("Enter", "Play"), ("j/k", "Navigate"), ("/", "Filter")];
+      k.push(voice_hint);
       if is_playing {
         let pause_label = if app.player.paused { "Resume" } else { "Pause" };
         k.push(("Space", pause_label));
@@ -497,6 +539,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
     AppMode::Filter => {
       let mut k = vec![("Enter", "Apply"), ("Esc", "Clear"), ("↑↓", "Navigate")];
+      k.push(voice_hint);
       if is_playing {
         let pause_label = if app.player.paused { "Resume" } else { "Pause" };
         k.push(("Space", pause_label));
