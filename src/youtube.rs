@@ -605,10 +605,16 @@ pub async fn get_video_info(video_id: &str) -> Result<VideoDetails> {
     let duration = opt_field(lines.next());
     let upload_date = opt_field(lines.next());
     let view_count = opt_field(lines.next()).map(|s| format_view_count(&s));
-    let tags = opt_field(lines.next())
+    let tags: Vec<String> = opt_field(lines.next())
       .map(|s| clean_tags(&s))
       .filter(|s| !s.is_empty())
-      .map(|s| s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
+      .map(|s| {
+        s.split(',')
+          .map(|t| t.trim().to_string())
+          .filter(|t| !t.is_empty())
+          .take(crate::constants::constants().max_display_tags)
+          .collect()
+      })
       .unwrap_or_default();
     Ok(VideoDetails { url, title, uploader, duration, upload_date, view_count, tags })
   } else {

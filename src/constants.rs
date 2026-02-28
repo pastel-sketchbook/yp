@@ -20,6 +20,9 @@ pub struct Constants {
   pub pip_height: u32,
   pub pip_margin: u32,
 
+  // UI
+  pub max_display_tags: usize,
+
   // Channel browsing
   pub channel_initial_size: usize,
   pub channel_page_size: usize,

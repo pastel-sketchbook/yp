@@ -8,6 +8,7 @@ use ratatui::{
 };
 
 use crate::app::{App, AppMode};
+use crate::constants::constants;
 use crate::display::DisplayMode;
 use crate::graphics::ThumbnailWidget;
 use crate::theme::Theme;
@@ -379,7 +380,7 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
     if !details.tags.is_empty() {
       lines.push(Line::from(""));
       lines.push(Line::from(Span::styled("Tags", Style::default().fg(theme.muted))));
-      for tag in &details.tags {
+      for tag in details.tags.iter().take(constants().max_display_tags) {
         lines.push(Line::from(Span::styled(
           format!("  {}", truncate_str(tag, inner_w.saturating_sub(2))),
           Style::default().fg(theme.tag),
@@ -581,7 +582,26 @@ fn render_results(frame: &mut Frame, app: &mut App, area: Rect) {
 
       // Build right-side metadata: "tags  date" or just "date" or just "tags"
       let date_str = entry.upload_date.as_deref().unwrap_or("");
-      let tags_str = entry.tags.as_deref().unwrap_or("");
+      let tags_limited: String;
+      let tags_str = match entry.tags.as_deref() {
+        Some(raw) if !raw.is_empty() => {
+          let half_w = inner_w / 2;
+          let parts: Vec<&str> = raw.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
+          // Take up to max_display_tags, then shrink further if the joined string exceeds half the line width.
+          let max = constants().max_display_tags.min(parts.len());
+          let mut count = max;
+          loop {
+            let candidate = parts[..count].join(", ");
+            if candidate.len() <= half_w || count <= 1 {
+              tags_limited = candidate;
+              break;
+            }
+            count = count.saturating_sub(2).max(1);
+          }
+          tags_limited.as_str()
+        }
+        _ => "",
+      };
       let right = match (!tags_str.is_empty(), !date_str.is_empty()) {
         (true, true) => format!("{}  {}", tags_str, date_str),
         (true, false) => tags_str.to_string(),

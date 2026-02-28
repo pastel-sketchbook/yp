@@ -13,6 +13,10 @@
   pip_height: 350,
   pip_margin: 30,
 
+  // --- UI ---
+  // Maximum number of tags shown in the Now Playing pane.
+  max_display_tags: 7,
+
   // --- Channel browsing ---
   // Number of videos fetched on the initial channel load.
   channel_initial_size: 30,
