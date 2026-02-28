@@ -39,8 +39,10 @@ impl DisplayMode {
 pub fn detect_display_mode() -> DisplayMode {
   let term = std::env::var("TERM").unwrap_or_default();
   let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default().to_lowercase();
+  let ghost_terminal = std::env::var("GHOST_TERMINAL").unwrap_or_default();
 
-  if term == "xterm-kitty" || matches!(term_program.as_str(), "kitty" | "wezterm" | "ghostty") {
+  if term == "xterm-kitty" || matches!(term_program.as_str(), "kitty" | "wezterm" | "ghostty") || ghost_terminal == "1"
+  {
     return DisplayMode::Kitty;
   }
 

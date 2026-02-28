@@ -48,6 +48,7 @@ fn detect_terminal() -> TerminalApp {
     Ok("Apple_Terminal") => TerminalApp::AppleTerminal,
     Ok("iTerm.app") => TerminalApp::ITerm2,
     Ok(s) if s == c.ghostty_term_program => TerminalApp::Ghostty,
+    _ if std::env::var("GHOST_TERMINAL").as_deref() == Ok("1") => TerminalApp::Ghostty,
     _ => TerminalApp::Other,
   }
 }
