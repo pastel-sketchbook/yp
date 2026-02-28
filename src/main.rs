@@ -3,6 +3,7 @@ mod graphics;
 mod player;
 mod theme;
 mod ui;
+mod window;
 mod youtube;
 
 use anyhow::{Context, Result};
@@ -241,6 +242,10 @@ pub struct App {
   whisper_cache: Arc<StdMutex<Option<whisper_cli::Whisper>>>,
   /// App start instant, used to drive UI animations (e.g. transcript progress indicator).
   pub started_at: Instant,
+  /// PiP (picture-in-picture) mode — terminal window shrinks to show only Now Playing.
+  pub pip_mode: bool,
+  /// Saved window geometry before entering PiP, for restoration on toggle-off or exit.
+  pip_original_geometry: Option<window::WindowGeometry>,
 }
 
 impl App {
@@ -283,6 +288,8 @@ impl App {
       download_progress: None,
       whisper_cache: Arc::new(StdMutex::new(None)),
       started_at: Instant::now(),
+      pip_mode: false,
+      pip_original_geometry: None,
     }
   }
 
@@ -653,6 +660,64 @@ impl App {
         self.transcript_visible = !self.transcript_visible;
         debug!(visible = self.transcript_visible, "transcript: toggle visibility (idle)");
       }
+    }
+  }
+
+  /// Toggle PiP (picture-in-picture) mode: shrink terminal to a small window showing
+  /// only Now Playing, or restore to the original size.
+  async fn toggle_pip(&mut self) {
+    if self.pip_mode {
+      // Restore original window geometry
+      if let Some(ref geom) = self.pip_original_geometry {
+        info!("pip: restoring original window geometry");
+        if let Err(e) = window::set_window_geometry(geom).await {
+          warn!(err = %e, "pip: failed to restore window geometry");
+          self.last_error = Some(format!("PiP restore failed: {}", e));
+        }
+      }
+      self.pip_mode = false;
+      self.pip_original_geometry = None;
+    } else {
+      // Save current geometry and shrink to PiP
+      match window::get_window_geometry().await {
+        Ok(original) => {
+          self.pip_original_geometry = Some(original);
+          match window::pip_geometry().await {
+            Ok(pip_geom) => {
+              if let Err(e) = window::set_window_geometry(&pip_geom).await {
+                warn!(err = %e, "pip: failed to set PiP geometry");
+                self.last_error = Some(format!("PiP failed: {}", e));
+                self.pip_original_geometry = None;
+              } else {
+                self.pip_mode = true;
+                info!("pip: entered PiP mode");
+              }
+            }
+            Err(e) => {
+              warn!(err = %e, "pip: failed to compute PiP geometry");
+              self.last_error = Some(format!("PiP failed: {}", e));
+              self.pip_original_geometry = None;
+            }
+          }
+        }
+        Err(e) => {
+          warn!(err = %e, "pip: failed to get current window geometry");
+          self.last_error = Some(format!("PiP failed: {}", e));
+        }
+      }
+    }
+  }
+
+  /// Restore window geometry if PiP is active. Called on exit to ensure the
+  /// terminal returns to its original size.
+  async fn restore_pip(&mut self) {
+    if self.pip_mode {
+      if let Some(ref geom) = self.pip_original_geometry {
+        info!("pip: restoring window on exit");
+        let _ = window::set_window_geometry(geom).await;
+      }
+      self.pip_mode = false;
+      self.pip_original_geometry = None;
     }
   }
 
@@ -1283,6 +1348,12 @@ async fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()> {
     return Ok(());
   }
 
+  // Ctrl+M — toggle PiP (picture-in-picture) mode
+  if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('m') {
+    app.toggle_pip().await;
+    return Ok(());
+  }
+
   match app.mode {
     AppMode::Input => handle_input_key(app, key),
     AppMode::Results => handle_results_key(app, key).await.context("Failed to handle results key event")?,
@@ -1598,6 +1669,7 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
   if display_mode == DisplayMode::Kitty {
     kitty_delete_all().context("Failed to clean up Kitty graphics on exit")?;
   }
+  app.restore_pip().await;
   app.player.stop().await.context("Failed to stop player on exit")?;
   Ok(())
 }

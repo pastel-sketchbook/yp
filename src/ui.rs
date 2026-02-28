@@ -110,6 +110,12 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
 
   frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), frame.area());
 
+  // PiP mode: compact layout showing only Now Playing + status
+  if app.pip_mode {
+    render_pip(frame, app);
+    return;
+  }
+
   let [header_area, main_area, status_area, input_area, footer_area] = Layout::vertical([
     Constraint::Length(1),
     Constraint::Min(3),
@@ -135,6 +141,72 @@ fn render_header(frame: &mut Frame, theme: &Theme, area: Rect) {
   let right = Line::from(Span::styled(&version, Style::default().fg(theme.muted)));
   let right_area = Rect { x: area.x.saturating_add(area.width.saturating_sub(version_w)), width: version_w, ..area };
   frame.render_widget(right, right_area);
+}
+
+/// PiP mode layout: compact Now Playing pane + status bar only.
+/// Designed for a small (~550x350px) terminal window.
+fn render_pip(frame: &mut Frame, app: &mut App) {
+  let theme = app.theme();
+
+  let [status_area, main_area, hint_area] = Layout::vertical([
+    Constraint::Length(1), // mpv status bar
+    Constraint::Min(3),    // now playing info
+    Constraint::Length(1), // PiP hint
+  ])
+  .areas(frame.area());
+
+  // Status bar
+  render_status(frame, app, status_area);
+
+  // Now Playing pane — fills most of the PiP window
+  let info_title = Line::from(vec![
+    Span::styled(" Now Playing ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+    Span::styled("[pip] ", Style::default().fg(theme.muted)),
+  ]);
+  let info_block = Block::bordered()
+    .title(info_title)
+    .border_type(ratatui::widgets::BorderType::Rounded)
+    .border_style(Style::default().fg(theme.border))
+    .padding(Padding::horizontal(1))
+    .style(Style::default().bg(theme.panel_bg));
+
+  if let Some(details) = &app.player.current_details {
+    let inner_w = main_area.width.saturating_sub(4) as usize;
+
+    let mut lines = vec![
+      Line::from(""),
+      Line::from(Span::styled(
+        truncate_str(&details.title, inner_w),
+        Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+      )),
+      Line::from(""),
+    ];
+    if let Some(uploader) = &details.uploader {
+      let label = "Uploader  ";
+      let value_w = inner_w.saturating_sub(label.len());
+      lines.push(Line::from(vec![
+        Span::styled(label, Style::default().fg(theme.muted)),
+        Span::styled(truncate_str(uploader, value_w), Style::default().fg(theme.fg)),
+      ]));
+    }
+    if let Some(duration) = &details.duration {
+      lines.push(Line::from(vec![
+        Span::styled("Duration  ", Style::default().fg(theme.muted)),
+        Span::styled(duration.as_str(), Style::default().fg(theme.fg)),
+      ]));
+    }
+
+    let paragraph = Paragraph::new(lines).block(info_block);
+    frame.render_widget(paragraph, main_area);
+  } else {
+    let lines = vec![Line::from(""), Line::from(Span::styled("Nothing playing", Style::default().fg(theme.muted)))];
+    let paragraph = Paragraph::new(lines).block(info_block).alignment(Alignment::Center);
+    frame.render_widget(paragraph, main_area);
+  }
+
+  // Bottom hint
+  let hint = Line::from(Span::styled(" [Ctrl+M] exit PiP", Style::default().fg(theme.muted)));
+  frame.render_widget(hint, hint_area);
 }
 
 fn render_main(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -675,6 +747,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
       let mut k = vec![("Enter", "Search"), ("^t", "Theme"), ("^f", "Frame")];
       if is_playing {
         k.push(transcript_hint);
+        k.push(("^m", "PiP"));
         k.push(("^s", "Stop"));
         k.push(("^o", "Open"));
       }
@@ -692,6 +765,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         k.push(transcript_hint);
         let pause_label = if app.player.paused { "Resume" } else { "Pause" };
         k.push(("Space", pause_label));
+        k.push(("^m", "PiP"));
         k.push(("^s", "Stop"));
         k.push(("^o", "Open"));
       }
@@ -706,6 +780,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         k.push(transcript_hint);
         let pause_label = if app.player.paused { "Resume" } else { "Pause" };
         k.push(("Space", pause_label));
+        k.push(("^m", "PiP"));
         k.push(("^s", "Stop"));
         k.push(("^o", "Open"));
       }
