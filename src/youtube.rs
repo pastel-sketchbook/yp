@@ -88,7 +88,7 @@ impl SpriteFrameSource {
       if time_secs < elapsed + dur || i == self.sheets.len() - 1 {
         let time_in_frag = (time_secs - elapsed).max(0.0);
         let local_idx = (time_in_frag / interval) as usize;
-        return global_offset + local_idx.min(fps - 1);
+        return global_offset + local_idx.min(fps.saturating_sub(1));
       }
       elapsed += dur;
       global_offset += fps;
@@ -110,7 +110,7 @@ impl SpriteFrameSource {
       if time_secs < elapsed + frag_dur || i == self.sheets.len() - 1 {
         let time_in_frag = (time_secs - elapsed).max(0.0);
         let local_idx = (time_in_frag / interval) as u32;
-        let local_idx = local_idx.min(fps - 1);
+        let local_idx = local_idx.min(fps.saturating_sub(1));
         let col = local_idx % self.cols;
         let row = local_idx / self.cols;
         let x = col * self.frame_width;
@@ -275,7 +275,9 @@ fn parse_storyboard_meta(json: &Value) -> Result<StoryboardMeta> {
 /// the static thumbnail continues to work.
 pub async fn fetch_sprite_frames(client: &Client, video_id: &str) -> Result<FrameSource> {
   let url = format!("https://youtube.com/watch?v={}", video_id);
-  let output = run_yt_dlp(&["--dump-json", "--no-warnings", "--", &url], "storyboard info").await?;
+  let output = run_yt_dlp(&["--dump-json", "--no-warnings", "--", &url], "storyboard info")
+    .await
+    .context("Failed to run yt-dlp for storyboard info")?;
 
   if !output.status.success() {
     return Err(anyhow!("yt-dlp --dump-json failed for storyboard"));
@@ -322,7 +324,8 @@ pub async fn fetch_video_frames(video_id: &str) -> Result<FrameSource> {
     &["--get-url", "-f", "bestvideo[height<=480]/bestvideo", "--no-warnings", "--", &yt_url],
     "video frames",
   )
-  .await?;
+  .await
+  .context("Failed to run yt-dlp for video frame URL")?;
 
   if !output.status.success() {
     return Err(anyhow!("yt-dlp --get-url failed for video frame extraction"));
@@ -547,7 +550,8 @@ pub async fn list_channel_videos(channel_url: &str, start: usize, count: usize) 
     ],
     "channel listing",
   )
-  .await?;
+  .await
+  .context("Failed to run yt-dlp for channel listing")?;
 
   if !output.status.success() {
     return Err(anyhow!("yt-dlp channel listing failed: {}", String::from_utf8_lossy(&output.stderr)));
@@ -574,7 +578,8 @@ pub async fn search_youtube(query: &str) -> Result<Vec<SearchEntry>> {
     ],
     "search",
   )
-  .await?;
+  .await
+  .context("Failed to run yt-dlp for search")?;
 
   if !output.status.success() {
     return Err(anyhow!("yt-dlp search failed: {}", String::from_utf8_lossy(&output.stderr)));
@@ -606,7 +611,8 @@ pub async fn get_video_info(video_id: &str) -> Result<VideoDetails> {
     ],
     "video info",
   )
-  .await?;
+  .await
+  .context("Failed to run yt-dlp for video info")?;
 
   if output.status.success() {
     let info_str = String::from_utf8(output.stdout).context("Failed to parse yt-dlp info output as UTF-8")?;

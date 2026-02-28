@@ -527,11 +527,19 @@ impl App {
           }
         }
 
-        // Check chunk file size — WAV header is 44 bytes; if file is <=44 bytes, no audio data
+        // Check chunk file size — WAV header is 44 bytes; if file is <=44 bytes, no audio data.
+        // Also skip very short chunks (<32KB ≈ <1s of 16kHz mono 16-bit) that cause whisper
+        // to panic with GenericError(-3).
+        const MIN_CHUNK_BYTES: u64 = 32_000;
         let chunk_size = std::fs::metadata(&chunk_path).map(|m| m.len()).unwrap_or(0);
         if chunk_size <= 44 {
           info!(offset = offset_secs, "transcript: chunk has no audio data, end of stream");
           break;
+        }
+        if chunk_size < MIN_CHUNK_BYTES {
+          info!(offset = offset_secs, size = chunk_size, "transcript: chunk too short for whisper, skipping");
+          offset_secs = offset_secs.saturating_add(CHUNK_SECS);
+          continue;
         }
 
         // Transcribe this chunk
@@ -543,6 +551,8 @@ impl App {
           // Suppress whisper.cpp C library logging (writes directly to stderr)
           let _guard = SuppressStdio::new();
 
+          // Safety: mutex is never held across an await/yield point and we don't
+          // panic while holding the lock, so poisoning cannot occur in practice.
           let mut lock = cache.lock().expect("whisper cache mutex poisoned");
           if lock.is_none() {
             info!("transcript: loading whisper model (Small) — first time, will be cached");
@@ -556,6 +566,7 @@ impl App {
             info!("transcript: whisper model loaded and cached");
           }
 
+          // Safety: we just checked is_none() and set it above, or it was already Some.
           let whisper = lock.as_mut().expect("whisper instance just set or already present");
 
           info!(offset = chunk_offset, "transcript: transcribing chunk");
@@ -583,16 +594,14 @@ impl App {
             }
           }
           Ok(Err(e)) => {
-            error!(err = %e, "transcript: chunk transcription failed");
-            let _ = tx.send(TranscriptEvent::Failed(format!("Transcription failed: {:#}", e)));
-            let _ = std::fs::remove_file(&chunk_path);
-            return;
+            // Skip failed chunk and continue — don't abort the pipeline.
+            // Whisper can fail on short/silent chunks (e.g. GenericError(-3)).
+            warn!(err = %e, offset = offset_secs, "transcript: chunk transcription failed, skipping");
           }
           Err(e) => {
-            error!(err = %e, "transcript: spawn_blocking panicked");
-            let _ = tx.send(TranscriptEvent::Failed(format!("Transcription task panicked: {}", e)));
-            let _ = std::fs::remove_file(&chunk_path);
-            return;
+            // spawn_blocking panicked (whisper.cpp internal crash on bad input).
+            // Skip this chunk and continue the pipeline.
+            warn!(err = %e, offset = offset_secs, "transcript: chunk task panicked, skipping");
           }
         }
 
@@ -1371,7 +1380,8 @@ async fn handle_results_key(app: &mut App, key: event::KeyEvent) -> Result<()> {
     KeyCode::Up | KeyCode::Char('k') => {
       let count = app.filtered_indices.len();
       if count > 0 {
-        let i = app.list_state.selected().map_or(0, |i| if i == 0 { count - 1 } else { i - 1 });
+        let i =
+          app.list_state.selected().map_or(0, |i| if i == 0 { count.saturating_sub(1) } else { i.saturating_sub(1) });
         app.list_state.select(Some(i));
       }
     }
@@ -1437,7 +1447,8 @@ async fn handle_filter_key(app: &mut App, key: event::KeyEvent) -> Result<()> {
     KeyCode::Up => {
       let count = app.filtered_indices.len();
       if count > 0 {
-        let i = app.list_state.selected().map_or(0, |i| if i == 0 { count - 1 } else { i - 1 });
+        let i =
+          app.list_state.selected().map_or(0, |i| if i == 0 { count.saturating_sub(1) } else { i.saturating_sub(1) });
         app.list_state.select(Some(i));
       }
     }

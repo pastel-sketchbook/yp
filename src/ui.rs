@@ -189,7 +189,7 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
   // Center vertically to maintain 16:9 aspect ratio
   let ideal_h = (thumb_area.width as f32 * 9.0 / 32.0).round() as u16;
   if ideal_h < thumb_area.height {
-    let diff = thumb_area.height - ideal_h;
+    let diff = thumb_area.height.saturating_sub(ideal_h);
     thumb_area.y = thumb_area.y.saturating_add(diff / 2);
     thumb_area.height = ideal_h;
   }
@@ -629,7 +629,7 @@ fn render_input(frame: &mut Frame, app: &mut App, area: Rect) {
   if cursor_col < *scroll {
     *scroll = cursor_col;
   } else if cursor_col >= *scroll + inner_w {
-    *scroll = cursor_col.saturating_sub(inner_w) + 1;
+    *scroll = cursor_col.saturating_sub(inner_w).saturating_add(1);
   }
 
   let scroll_val = *scroll;
