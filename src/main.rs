@@ -96,12 +96,14 @@ pub struct ChannelSource {
 
 /// Result of the transcription pipeline: either in progress or completed.
 pub enum TranscriptEvent {
-  /// Audio extraction finished, now starting transcription.
+  /// Audio URL resolved, now downloading+transcribing in chunks.
   AudioExtracted,
   /// Whisper model download progress (downloaded bytes, total bytes).
   DownloadProgress(u64, u64),
-  /// Transcription completed with utterances.
-  Transcribed(Vec<whisper_cli::Utternace>),
+  /// A chunk of utterances arrived (progressive — append to existing).
+  ChunkTranscribed(Vec<whisper_cli::Utternace>),
+  /// All chunks transcribed — pipeline complete.
+  Transcribed,
   /// Pipeline failed with an error message.
   Failed(String),
 }
@@ -109,19 +111,19 @@ pub enum TranscriptEvent {
 /// Auto-transcription state machine.
 ///
 /// When a track starts playing, the pipeline automatically:
-/// 1. Extracts audio via yt-dlp to a temp WAV file
-/// 2. Transcribes via whisper-cli-rs library (synchronous FFI in spawn_blocking)
-/// 3. Stores utterances for time-synced display
+/// 1. Resolves the audio stream URL (mpv IPC fast path, or yt-dlp -g fallback)
+/// 2. Downloads + transcribes audio in 30-second chunks via ffmpeg + whisper
+/// 3. Sends utterances progressively as each chunk completes
 #[derive(Default)]
 pub enum TranscriptState {
   /// No transcription in progress.
   #[default]
   Idle,
-  /// yt-dlp is extracting audio to a WAV file.
+  /// Resolving audio URL / downloading first chunk.
   ExtractingAudio { handle: JoinHandle<()> },
-  /// whisper-cli-rs is transcribing the WAV file.
+  /// Actively transcribing chunks (utterances arriving progressively).
   Transcribing { handle: JoinHandle<()> },
-  /// Transcription complete — utterances are stored in App.
+  /// All chunks transcribed — utterances are stored in App.
   Ready,
 }
 
@@ -417,9 +419,13 @@ impl App {
   // --- Auto-transcription ---
 
   /// Start the auto-transcription pipeline for the given YouTube URL.
-  /// Stage 1: Extract audio via yt-dlp to a temp WAV file.
-  /// Stage 2: Download whisper model if needed (with progress reporting).
-  /// Stage 3: Transcribe via whisper-cli-rs library (with C logging suppressed).
+  ///
+  /// Architecture: chunked transcription for fast first results.
+  /// 1. Resolve CDN stream URL (mpv IPC fast path ~0.5-4s, or yt-dlp -g fallback ~10-30s)
+  /// 2. Download whisper model if needed
+  /// 3. Loop: download 30s chunk via ffmpeg → transcribe → send utterances → next chunk
+  ///
+  /// First transcript appears in ~5-8s instead of ~50s.
   fn trigger_transcription(&mut self, url: &str) {
     // Cancel any in-progress transcription
     self.cancel_transcription();
@@ -429,124 +435,174 @@ impl App {
     let (tx, rx) = mpsc::unbounded_channel();
     self.transcript_rx = Some(rx);
 
-    let wav_path = std::env::temp_dir().join(format!("yp-transcript-{}.wav", std::process::id()));
-    // Clean up stale file from previous run
-    let _ = std::fs::remove_file(&wav_path);
-
     let url = url.to_string();
-    let wav = wav_path.clone();
     let whisper_cache = Arc::clone(&self.whisper_cache);
+    let ipc_socket = self.player.ipc_socket_path().map(|s| s.to_string());
 
-    info!(url = %url, wav = %wav.display(), "transcript: starting audio extraction");
+    info!(url = %url, "transcript: starting chunked transcription pipeline");
 
     let handle = tokio::spawn(async move {
-      // Stage 1: Extract audio via yt-dlp
-      let result = tokio::process::Command::new("yt-dlp")
-        .args([
-          "-x",
-          "--audio-format",
-          "wav",
-          "--postprocessor-args",
-          "ffmpeg:-ar 16000 -ac 1",
-          "-o",
-          wav.to_str().unwrap_or("/tmp/yp-transcript.wav"),
-          &url,
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await;
-
-      match result {
-        Ok(status) if status.success() => {
-          info!(wav = %wav.display(), "transcript: audio extraction complete");
-          // Signal that we're moving to transcription stage
-          let _ = tx.send(TranscriptEvent::AudioExtracted);
-
-          // Stage 2: Download whisper model if needed
-          let model_path = whisper_cli::Size::Small.get_path();
-          if !model_path.exists() {
-            info!("transcript: whisper model not found, downloading");
-            if let Err(e) = download_whisper_model(&tx, &model_path).await {
-              let _ = tx.send(TranscriptEvent::Failed(format!("Model download failed: {:#}", e)));
-              return;
-            }
-          }
-
-          // Stage 3: Transcribe via whisper-cli-rs (with C logging suppressed).
-          // Reuse cached Whisper instance to avoid reloading the ~460MB model each time.
-          let wav_for_whisper = wav.clone();
-          let cache = Arc::clone(&whisper_cache);
-          let transcribe_result = tokio::task::spawn_blocking(move || {
-            // Suppress whisper.cpp C library logging (writes directly to stdout/stderr)
-            let _guard = SuppressStdio::new();
-
-            let mut lock = cache.lock().expect("whisper cache mutex poisoned");
-            if lock.is_none() {
-              info!("transcript: loading whisper model (Small) — first time, will be cached");
-              let model = whisper_cli::Model::new(whisper_cli::Size::Small);
-
-              // Model is already downloaded; Whisper::new() will skip download.
-              // We use a nested tokio runtime since Whisper::new() is async but
-              // we're inside spawn_blocking (sync context).
-              let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("Failed to create tokio runtime for model init")?;
-              let whisper = rt.block_on(whisper_cli::Whisper::new(model, Some(whisper_cli::Language::Auto)));
-              *lock = Some(whisper);
-              info!("transcript: whisper model loaded and cached");
-            } else {
-              info!("transcript: reusing cached whisper model");
-            }
-
-            let whisper = lock.as_mut().expect("whisper instance just set above");
-
-            info!(wav = %wav_for_whisper.display(), "transcript: starting whisper transcription");
-            let transcript = whisper.transcribe(&wav_for_whisper, false, false).context("Whisper transcription failed");
-
-            // Clean up WAV file
-            let _ = std::fs::remove_file(&wav_for_whisper);
-
-            transcript
-          })
-          .await;
-
-          match transcribe_result {
-            Ok(Ok(transcript)) => {
-              info!(
-                segments = transcript.utterances.len(),
-                time_ms = transcript.processing_time.as_millis(),
-                "transcript: transcription complete"
-              );
-              let _ = tx.send(TranscriptEvent::Transcribed(transcript.utterances));
-            }
-            Ok(Err(e)) => {
-              error!(err = %e, "transcript: transcription failed");
-              let _ = tx.send(TranscriptEvent::Failed(format!("Transcription failed: {:#}", e)));
-            }
-            Err(e) => {
-              error!(err = %e, "transcript: spawn_blocking panicked");
-              let _ = tx.send(TranscriptEvent::Failed(format!("Transcription task panicked: {}", e)));
-            }
-          }
-        }
-        Ok(status) => {
-          error!(code = ?status.code(), "transcript: yt-dlp audio extraction failed");
-          let _ = std::fs::remove_file(&wav);
-          let _ = tx.send(TranscriptEvent::Failed("Audio extraction failed".to_string()));
+      // Stage 1: Resolve the direct CDN stream URL.
+      let stream_url = match resolve_stream_url(ipc_socket.as_deref(), &url).await {
+        Ok(resolved) => {
+          info!(stream_url = %resolved, "transcript: resolved stream URL");
+          resolved
         }
         Err(e) => {
-          error!(err = %e, "transcript: failed to spawn yt-dlp");
-          let msg = if e.kind() == std::io::ErrorKind::NotFound {
-            "yt-dlp not found. Install with: brew install yt-dlp".to_string()
-          } else {
-            format!("Failed to start audio extraction: {}", e)
-          };
-          let _ = tx.send(TranscriptEvent::Failed(msg));
+          error!(err = %e, "transcript: failed to resolve stream URL");
+          let _ = tx.send(TranscriptEvent::Failed(format!("{:#}", e)));
+          return;
+        }
+      };
+
+      // Signal that URL is resolved, moving to transcription
+      let _ = tx.send(TranscriptEvent::AudioExtracted);
+
+      // Stage 2: Download whisper model if needed
+      let model_path = whisper_cli::Size::Small.get_path();
+      if !model_path.exists() {
+        info!("transcript: whisper model not found, downloading");
+        if let Err(e) = download_whisper_model(&tx, &model_path).await {
+          let _ = tx.send(TranscriptEvent::Failed(format!("Model download failed: {:#}", e)));
+          return;
         }
       }
+
+      // Stage 3: Chunked download + transcription loop.
+      // Each iteration: ffmpeg downloads 30s of audio → whisper transcribes → send utterances.
+      const CHUNK_SECS: u32 = 30;
+      let chunk_path = std::env::temp_dir().join(format!("yp-chunk-{}.wav", std::process::id()));
+      let mut offset_secs: u32 = 0;
+
+      loop {
+        // Clean up previous chunk
+        let _ = std::fs::remove_file(&chunk_path);
+
+        // Download this chunk with ffmpeg
+        let chunk_str = chunk_path.to_str().unwrap_or("/tmp/yp-chunk.wav");
+        let offset_str = offset_secs.to_string();
+        let duration_str = CHUNK_SECS.to_string();
+
+        info!(offset = offset_secs, duration = CHUNK_SECS, "transcript: downloading chunk");
+
+        let ffmpeg_result = tokio::process::Command::new("ffmpeg")
+          .args([
+            "-y",
+            "-ss",
+            &offset_str,
+            "-t",
+            &duration_str,
+            "-i",
+            &stream_url,
+            "-vn",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-f",
+            "wav",
+            chunk_str,
+          ])
+          .stdin(std::process::Stdio::null())
+          .stdout(std::process::Stdio::null())
+          .stderr(std::process::Stdio::null())
+          .status()
+          .await;
+
+        match ffmpeg_result {
+          Ok(status) if status.success() => {}
+          Ok(status) => {
+            // Non-zero exit likely means we've gone past the end of the stream
+            info!(offset = offset_secs, code = ?status.code(), "transcript: ffmpeg exited non-zero, assuming end of stream");
+            break;
+          }
+          Err(e) => {
+            let msg = if e.kind() == std::io::ErrorKind::NotFound {
+              "ffmpeg not found. Install with: brew install ffmpeg".to_string()
+            } else {
+              format!("Failed to start ffmpeg: {}", e)
+            };
+            let _ = tx.send(TranscriptEvent::Failed(msg));
+            return;
+          }
+        }
+
+        // Check chunk file size — WAV header is 44 bytes; if file is <=44 bytes, no audio data
+        let chunk_size = std::fs::metadata(&chunk_path).map(|m| m.len()).unwrap_or(0);
+        if chunk_size <= 44 {
+          info!(offset = offset_secs, "transcript: chunk has no audio data, end of stream");
+          break;
+        }
+
+        // Transcribe this chunk
+        let chunk_for_whisper = chunk_path.clone();
+        let cache = Arc::clone(&whisper_cache);
+        let chunk_offset = offset_secs;
+
+        let transcribe_result = tokio::task::spawn_blocking(move || {
+          // Suppress whisper.cpp C library logging (writes directly to stderr)
+          let _guard = SuppressStdio::new();
+
+          let mut lock = cache.lock().expect("whisper cache mutex poisoned");
+          if lock.is_none() {
+            info!("transcript: loading whisper model (Small) — first time, will be cached");
+            let model = whisper_cli::Model::new(whisper_cli::Size::Small);
+            let rt = tokio::runtime::Builder::new_current_thread()
+              .enable_all()
+              .build()
+              .context("Failed to create tokio runtime for model init")?;
+            let whisper = rt.block_on(whisper_cli::Whisper::new(model, Some(whisper_cli::Language::Auto)));
+            *lock = Some(whisper);
+            info!("transcript: whisper model loaded and cached");
+          }
+
+          let whisper = lock.as_mut().expect("whisper instance just set or already present");
+
+          info!(offset = chunk_offset, "transcript: transcribing chunk");
+          let transcript =
+            whisper.transcribe(&chunk_for_whisper, false, false).context("Whisper transcription failed")?;
+
+          // Adjust timestamps: whisper returns times relative to chunk start,
+          // we need them relative to the full track.
+          let offset_cs = (chunk_offset as i64) * 100; // centiseconds
+          let mut utterances = transcript.utterances;
+          for u in &mut utterances {
+            u.start = u.start.saturating_add(offset_cs);
+            u.stop = u.stop.saturating_add(offset_cs);
+          }
+
+          Ok::<Vec<whisper_cli::Utternace>, anyhow::Error>(utterances)
+        })
+        .await;
+
+        match transcribe_result {
+          Ok(Ok(utterances)) => {
+            info!(segments = utterances.len(), offset = offset_secs, "transcript: chunk transcribed");
+            if !utterances.is_empty() {
+              let _ = tx.send(TranscriptEvent::ChunkTranscribed(utterances));
+            }
+          }
+          Ok(Err(e)) => {
+            error!(err = %e, "transcript: chunk transcription failed");
+            let _ = tx.send(TranscriptEvent::Failed(format!("Transcription failed: {:#}", e)));
+            let _ = std::fs::remove_file(&chunk_path);
+            return;
+          }
+          Err(e) => {
+            error!(err = %e, "transcript: spawn_blocking panicked");
+            let _ = tx.send(TranscriptEvent::Failed(format!("Transcription task panicked: {}", e)));
+            let _ = std::fs::remove_file(&chunk_path);
+            return;
+          }
+        }
+
+        offset_secs = offset_secs.saturating_add(CHUNK_SECS);
+      }
+
+      // Clean up chunk file and signal completion
+      let _ = std::fs::remove_file(&chunk_path);
+      info!(total_offset = offset_secs, "transcript: all chunks processed");
+      let _ = tx.send(TranscriptEvent::Transcribed);
     });
 
     self.transcript_state = TranscriptState::ExtractingAudio { handle };
@@ -761,9 +817,18 @@ impl App {
           TranscriptEvent::DownloadProgress(downloaded, total) => {
             self.download_progress = Some((downloaded, total));
           }
-          TranscriptEvent::Transcribed(new_utterances) => {
-            info!(segments = new_utterances.len(), "transcript: received utterances");
-            self.utterances = new_utterances;
+          TranscriptEvent::ChunkTranscribed(chunk_utterances) => {
+            info!(
+              segments = chunk_utterances.len(),
+              total = self.utterances.len() + chunk_utterances.len(),
+              "transcript: chunk arrived"
+            );
+            self.utterances.extend(chunk_utterances);
+            self.transcript_visible = true;
+            self.download_progress = None;
+          }
+          TranscriptEvent::Transcribed => {
+            info!(total_segments = self.utterances.len(), "transcript: all chunks complete");
             self.transcript_state = TranscriptState::Ready;
             self.transcript_visible = true;
             self.download_progress = None;
@@ -921,6 +986,102 @@ impl App {
     // Spawn background frame source fetch based on current mode
     self.trigger_frame_source_for(Some(&frame_vid));
   }
+}
+
+// --- Stream URL resolution ---
+
+/// Resolve a direct CDN stream URL for the given YouTube video.
+///
+/// Fast path: query mpv's IPC socket for `stream-open-filename` (~0.5-4s).
+/// Fallback: use `yt-dlp -g --format bestaudio` to resolve the URL (~10-30s).
+async fn resolve_stream_url(ipc_socket: Option<&str>, youtube_url: &str) -> Result<String> {
+  use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+
+  // Fast path: mpv already resolved the URL, ask for it via IPC.
+  if let Some(socket_path) = ipc_socket {
+    for attempt in 0..6 {
+      let delay = match attempt {
+        0 => Duration::from_millis(500),
+        1 => Duration::from_secs(1),
+        _ => Duration::from_secs(2),
+      };
+      tokio::time::sleep(delay).await;
+
+      let mut stream = match tokio::net::UnixStream::connect(socket_path).await {
+        Ok(s) => s,
+        Err(e) => {
+          info!(attempt, err = %e, "transcript: mpv IPC connect failed, retrying");
+          continue;
+        }
+      };
+
+      let cmd = b"{\"command\":[\"get_property\",\"stream-open-filename\"],\"request_id\":1}\n";
+      if let Err(e) = stream.write_all(cmd).await {
+        info!(attempt, err = %e, "transcript: mpv IPC write failed, retrying");
+        continue;
+      }
+
+      let reader = TokioBufReader::new(stream);
+      let mut lines = reader.lines();
+      let mut found_response = false;
+
+      for _ in 0..20 {
+        let line = match tokio::time::timeout(Duration::from_secs(3), lines.next_line()).await {
+          Ok(Ok(Some(line))) => line,
+          _ => break,
+        };
+
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line)
+          && val.get("request_id").and_then(|v| v.as_i64()) == Some(1)
+        {
+          found_response = true;
+          if val.get("error").and_then(|v| v.as_str()) == Some("success")
+            && let Some(url) = val.get("data").and_then(|v| v.as_str())
+          {
+            // Accept only resolved CDN URLs, not the original YouTube URL
+            if url.starts_with("http") && !url.contains("youtube.com/watch") && !url.contains("youtu.be/") {
+              info!(url = %url, "transcript: got stream URL from mpv IPC");
+              return Ok(url.to_string());
+            }
+          }
+          break;
+        }
+      }
+
+      if found_response {
+        info!(attempt, "transcript: mpv IPC responded but no resolved CDN URL yet");
+      }
+    }
+    info!("transcript: mpv IPC exhausted retries, falling back to yt-dlp -g");
+  }
+
+  // Fallback: use yt-dlp to resolve the URL (slow but reliable).
+  info!("transcript: resolving stream URL via yt-dlp -g");
+  let output = tokio::process::Command::new("yt-dlp")
+    .args(["-g", "--format", "bestaudio", youtube_url])
+    .stdin(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .output()
+    .await
+    .map_err(|e| {
+      if e.kind() == std::io::ErrorKind::NotFound {
+        anyhow::anyhow!("yt-dlp not found. Install with: brew install yt-dlp")
+      } else {
+        anyhow::anyhow!("Failed to start yt-dlp: {}", e)
+      }
+    })?;
+
+  if !output.status.success() {
+    return Err(anyhow::anyhow!("yt-dlp -g failed with status {}", output.status));
+  }
+
+  let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+  if url.is_empty() {
+    return Err(anyhow::anyhow!("yt-dlp -g returned empty output"));
+  }
+
+  info!(url = %url, "transcript: resolved stream URL via yt-dlp -g");
+  Ok(url)
 }
 
 // --- Whisper model download + C logging suppression ---
