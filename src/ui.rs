@@ -144,14 +144,14 @@ fn render_header(frame: &mut Frame, theme: &Theme, area: Rect) {
   frame.render_widget(right, right_area);
 }
 
-/// PiP mode layout: compact Now Playing pane + status bar only.
-/// Designed for a small (~550x350px) terminal window.
+/// PiP mode layout: thumbnail filling the window + status bar.
+/// Designed for a small (~550x350px) terminal window showing album art.
 fn render_pip(frame: &mut Frame, app: &mut App) {
   let theme = app.theme();
 
   let [status_area, main_area, hint_area] = Layout::vertical([
     Constraint::Length(1), // mpv status bar
-    Constraint::Min(3),    // now playing info
+    Constraint::Min(3),    // thumbnail
     Constraint::Length(1), // PiP hint
   ])
   .areas(frame.area());
@@ -159,49 +159,64 @@ fn render_pip(frame: &mut Frame, app: &mut App) {
   // Status bar
   render_status(frame, app, status_area);
 
-  // Now Playing pane — fills most of the PiP window
-  let info_title = Line::from(vec![
-    Span::styled(" Now Playing ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-    Span::styled("[pip] ", Style::default().fg(theme.muted)),
-  ]);
-  let info_block = Block::bordered()
-    .title(info_title)
-    .border_type(ratatui::widgets::BorderType::Rounded)
-    .border_style(Style::default().fg(theme.border))
-    .padding(Padding::horizontal(1))
-    .style(Style::default().bg(theme.panel_bg));
+  // Thumbnail area — fills most of the PiP window
+  if app.player.cached_thumbnail.is_some() {
+    // Glow border
+    let glow_color = dim_color(theme.accent, 0.35);
+    let glow_block = Block::bordered()
+      .border_type(ratatui::widgets::BorderType::Rounded)
+      .border_style(Style::default().fg(glow_color));
+    frame.render_widget(glow_block, main_area);
 
-  if let Some(details) = &app.player.current_details {
-    let inner_w = main_area.width.saturating_sub(4) as usize;
+    // Inner thumbnail area (1 cell inset for border)
+    let mut thumb_area = Rect {
+      x: main_area.x.saturating_add(1),
+      y: main_area.y.saturating_add(1),
+      width: main_area.width.saturating_sub(2),
+      height: main_area.height.saturating_sub(2),
+    };
 
-    let mut lines = vec![
-      Line::from(""),
-      Line::from(Span::styled(
-        truncate_str(&details.title, inner_w),
-        Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
-      )),
-      Line::from(""),
-    ];
-    if let Some(uploader) = &details.uploader {
-      let label = "Uploader  ";
-      let value_w = inner_w.saturating_sub(label.len());
-      lines.push(Line::from(vec![
-        Span::styled(label, Style::default().fg(theme.muted)),
-        Span::styled(truncate_str(uploader, value_w), Style::default().fg(theme.fg)),
-      ]));
-    }
-    if let Some(duration) = &details.duration {
-      lines.push(Line::from(vec![
-        Span::styled("Duration  ", Style::default().fg(theme.muted)),
-        Span::styled(duration.as_str(), Style::default().fg(theme.fg)),
-      ]));
+    // Center vertically to maintain 16:9 aspect ratio (half-block = 2 pixels per row)
+    let ideal_h = (thumb_area.width as f32 * 9.0 / 32.0).round() as u16;
+    if ideal_h < thumb_area.height {
+      let diff = thumb_area.height.saturating_sub(ideal_h);
+      thumb_area.y = thumb_area.y.saturating_add(diff / 2);
+      thumb_area.height = ideal_h;
     }
 
-    let paragraph = Paragraph::new(lines).block(info_block);
-    frame.render_widget(paragraph, main_area);
+    if let Some((ref video_id, ref image)) = app.player.cached_thumbnail {
+      if matches!(app.player.display_mode, DisplayMode::Kitty | DisplayMode::Sixel) {
+        // Kitty/Sixel: rendering handled outside ratatui in the run loop.
+        app.gfx.thumb_area = Some(thumb_area);
+      } else {
+        // Direct/Ascii: resize and render via ThumbnailWidget.
+        let needs_resize = match &app.gfx.resized_thumb {
+          Some((id, w, h, _)) => id != video_id || *w != thumb_area.width || *h != thumb_area.height,
+          None => true,
+        };
+        if needs_resize {
+          let target_w = thumb_area.width as u32;
+          let target_h = match app.player.display_mode {
+            DisplayMode::Direct => (target_w as f32 * 9.0 / 16.0) as u32,
+            _ => (target_w as f32 * 9.0 / 32.0) as u32,
+          };
+          let resized = image.resize_to_fill(target_w, target_h.max(1), FilterType::Lanczos3);
+          app.gfx.resized_thumb = Some((video_id.clone(), thumb_area.width, thumb_area.height, resized));
+        }
+        if let Some((_, _, _, ref resized)) = app.gfx.resized_thumb {
+          let widget = ThumbnailWidget { image: resized, display_mode: app.player.display_mode };
+          frame.render_widget(widget, thumb_area);
+        }
+      }
+    }
   } else {
+    // No thumbnail — show a placeholder
     let lines = vec![Line::from(""), Line::from(Span::styled("Nothing playing", Style::default().fg(theme.muted)))];
-    let paragraph = Paragraph::new(lines).block(info_block).alignment(Alignment::Center);
+    let block = Block::bordered()
+      .border_type(ratatui::widgets::BorderType::Rounded)
+      .border_style(Style::default().fg(theme.border))
+      .style(Style::default().bg(theme.panel_bg));
+    let paragraph = Paragraph::new(lines).block(block).alignment(Alignment::Center);
     frame.render_widget(paragraph, main_area);
   }
 

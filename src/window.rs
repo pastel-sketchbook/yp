@@ -173,11 +173,42 @@ pub fn is_likely_fullscreen(geom: &WindowGeometry, screen: &ScreenSize) -> bool 
   w_ratio > 0.95 && h_ratio > 0.90
 }
 
+/// Query the AXFullScreen attribute of the frontmost Ghostty window.
+///
+/// Returns `true` if the window is in macOS native fullscreen. Returns `false`
+/// for non-Ghostty terminals or if the query fails (conservative default).
+pub async fn is_native_fullscreen() -> bool {
+  if detect_terminal() != TerminalApp::Ghostty {
+    return false;
+  }
+
+  let script = format!(
+    r#"tell application "System Events"
+      tell process "{name}"
+        get value of attribute "AXFullScreen" of front window
+      end tell
+    end tell"#,
+    name = constants().ghostty_process_name
+  );
+
+  match run_osascript(&script).await {
+    Ok(val) => {
+      let is_fs = val.trim().eq_ignore_ascii_case("true");
+      info!(ax_fullscreen = is_fs, "pip: queried AXFullScreen attribute");
+      is_fs
+    }
+    Err(e) => {
+      warn!(err = %e, "pip: failed to query AXFullScreen, assuming not fullscreen");
+      false
+    }
+  }
+}
+
 /// Exit macOS native fullscreen for the frontmost Ghostty window.
 ///
-/// Uses System Events to check if the window has the "AXFullScreen" attribute
-/// and toggles it off. No-op for non-Ghostty terminals (they don't typically
-/// run fullscreen, or handle it differently).
+/// Uses System Events AppleScript to set the "AXFullScreen" attribute to false.
+/// No-op for non-Ghostty terminals (they don't typically run fullscreen, or
+/// handle it differently).
 pub async fn exit_fullscreen() -> Result<()> {
   let terminal = detect_terminal();
   if terminal != TerminalApp::Ghostty {
@@ -185,25 +216,23 @@ pub async fn exit_fullscreen() -> Result<()> {
   }
 
   info!("pip: exiting Ghostty fullscreen via System Events");
-  // Use AXFullScreen attribute via System Events to exit fullscreen.
-  // This is more reliable than click-simulating the green button.
   let script = format!(
-    r#"ObjC.import('ApplicationServices');
-var app = Application('System Events').processes.byName('{name}');
-var win = app.windows[0];
-var fs = win.attributes.byName('AXFullScreen');
-if (fs.value()) {{ fs.value = false; }}"#,
+    r#"tell application "System Events"
+      tell process "{name}"
+        set value of attribute "AXFullScreen" of front window to false
+      end tell
+    end tell"#,
     name = constants().ghostty_process_name
   );
-  run_osascript_jxa(&script).await.context("Failed to exit fullscreen via System Events")?;
+  run_osascript(&script).await.context("Failed to exit fullscreen via System Events")?;
 
   Ok(())
 }
 
 /// Enter macOS native fullscreen for the frontmost Ghostty window.
 ///
-/// Uses System Events to set the "AXFullScreen" attribute. No-op for
-/// non-Ghostty terminals.
+/// Uses System Events AppleScript to set the "AXFullScreen" attribute to true.
+/// No-op for non-Ghostty terminals.
 pub async fn enter_fullscreen() -> Result<()> {
   let terminal = detect_terminal();
   if terminal != TerminalApp::Ghostty {
@@ -212,14 +241,14 @@ pub async fn enter_fullscreen() -> Result<()> {
 
   info!("pip: entering Ghostty fullscreen via System Events");
   let script = format!(
-    r#"ObjC.import('ApplicationServices');
-var app = Application('System Events').processes.byName('{name}');
-var win = app.windows[0];
-var fs = win.attributes.byName('AXFullScreen');
-if (!fs.value()) {{ fs.value = true; }}"#,
+    r#"tell application "System Events"
+      tell process "{name}"
+        set value of attribute "AXFullScreen" of front window to true
+      end tell
+    end tell"#,
     name = constants().ghostty_process_name
   );
-  run_osascript_jxa(&script).await.context("Failed to enter fullscreen via System Events")?;
+  run_osascript(&script).await.context("Failed to enter fullscreen via System Events")?;
 
   Ok(())
 }

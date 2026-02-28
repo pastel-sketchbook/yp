@@ -463,9 +463,14 @@ impl App {
       // Save current geometry and shrink to PiP
       match window::get_window_geometry().await {
         Ok(original) => {
-          // Detect fullscreen by comparing window size to screen size
-          let screen = window::get_screen_size().await.ok();
-          let was_fullscreen = screen.is_some_and(|s| window::is_likely_fullscreen(&original, &s));
+          // Use the actual AXFullScreen attribute for Ghostty (definitive),
+          // fall back to geometry heuristic for other terminals.
+          let was_fullscreen = if window::is_native_fullscreen().await {
+            true
+          } else {
+            let screen = window::get_screen_size().await.ok();
+            screen.is_some_and(|s| window::is_likely_fullscreen(&original, &s))
+          };
 
           if was_fullscreen {
             info!("pip: exiting fullscreen before PiP");
@@ -475,11 +480,21 @@ impl App {
               return;
             }
             // Wait for macOS fullscreen exit animation
-            tokio::time::sleep(Duration::from_millis(750)).await;
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+
+            // Verify fullscreen actually exited
+            if window::is_native_fullscreen().await {
+              warn!("pip: fullscreen exit did not take effect, aborting PiP");
+              self.set_error("PiP failed: could not exit fullscreen".to_string());
+              return;
+            }
 
             // Re-query geometry after exiting fullscreen (size will have changed)
             match window::get_window_geometry().await {
-              Ok(post_fs) => self.pip_original_geometry = Some(post_fs),
+              Ok(post_fs) => {
+                info!(geom = ?post_fs, "pip: post-fullscreen geometry");
+                self.pip_original_geometry = Some(post_fs);
+              }
               Err(_) => self.pip_original_geometry = Some(original),
             }
           } else {
@@ -489,6 +504,7 @@ impl App {
 
           match window::pip_geometry().await {
             Ok(pip_geom) => {
+              info!(pip_geom = ?pip_geom, "pip: setting PiP geometry");
               if let Err(e) = window::set_window_geometry(&pip_geom).await {
                 warn!(err = %e, "pip: failed to set PiP geometry");
                 self.set_error(format!("PiP failed: {}", e));
