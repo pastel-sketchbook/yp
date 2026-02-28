@@ -6,8 +6,9 @@
 //! Terminal.app, iTerm2, and Ghostty.
 //!
 //! For Ghostty, we use `System Events` to get/set the window position and size. This
-//! works via the macOS Accessibility API and doesn't require any special terminal config.
-//! The first time it runs, macOS may prompt the user to grant Accessibility permissions.
+//! requires macOS Automation permission: the first time it runs, macOS may prompt the
+//! user to grant permission. If denied, the error is detected and an actionable message
+//! is shown guiding the user to System Settings → Privacy & Security → Automation.
 
 use anyhow::{Context, Result, anyhow};
 use tracing::{info, warn};
@@ -64,6 +65,29 @@ pub fn pip_supported() -> bool {
 // osascript helpers
 // ---------------------------------------------------------------------------
 
+/// Check if an osascript error is the macOS Automation permission denial (-1743).
+///
+/// Error -1743 means the calling app is not authorized to send Apple events to the
+/// target app (System Events). The user must grant permission in System Settings →
+/// Privacy & Security → Automation.
+fn is_automation_permission_error(stderr: &str) -> bool {
+  stderr.contains("-1743") || stderr.contains("not allowed assistive access")
+}
+
+/// Wraps an osascript error with an actionable permission message when the failure
+/// is due to missing macOS Automation permission.
+fn annotate_permission_error(stderr: &str) -> anyhow::Error {
+  if is_automation_permission_error(stderr) {
+    warn!(
+      "macOS Automation permission denied. Grant in: \
+       System Settings → Privacy & Security → Automation → enable \"System Events\" for your terminal"
+    );
+    anyhow!("Permission denied — enable Automation for System Events in System Settings → Privacy & Security")
+  } else {
+    anyhow!("osascript failed: {}", stderr.trim())
+  }
+}
+
 /// Run an osascript command and return trimmed stdout.
 async fn run_osascript(script: &str) -> Result<String> {
   let output = tokio::process::Command::new("osascript")
@@ -77,7 +101,7 @@ async fn run_osascript(script: &str) -> Result<String> {
 
   if !output.status.success() {
     let stderr = String::from_utf8_lossy(&output.stderr);
-    return Err(anyhow!("osascript failed: {}", stderr.trim()));
+    return Err(annotate_permission_error(&stderr));
   }
 
   Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -96,7 +120,7 @@ async fn run_osascript_jxa(script: &str) -> Result<String> {
 
   if !output.status.success() {
     let stderr = String::from_utf8_lossy(&output.stderr);
-    return Err(anyhow!("osascript JXA failed: {}", stderr.trim()));
+    return Err(annotate_permission_error(&stderr));
   }
 
   Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -461,5 +485,33 @@ mod tests {
     let geom = WindowGeometry { x: 0, y: 38, width: 2560, height: 1402 };
     let screen = ScreenSize { width: 2560, height: 1440 };
     assert!(is_likely_fullscreen(&geom, &screen));
+  }
+
+  #[test]
+  fn permission_error_detected_1743() {
+    let stderr = "execution error: Not authorized to send Apple events to System Events. (-1743)";
+    assert!(is_automation_permission_error(stderr));
+  }
+
+  #[test]
+  fn permission_error_detected_assistive_access() {
+    let stderr = "System Events got an error: osascript is not allowed assistive access.";
+    assert!(is_automation_permission_error(stderr));
+  }
+
+  #[test]
+  fn permission_error_not_detected_other() {
+    let stderr = "execution error: Can't get window 1 of process \"Ghostty\". (-1728)";
+    assert!(!is_automation_permission_error(stderr));
+  }
+
+  #[test]
+  fn annotate_permission_error_is_concise() {
+    let stderr = "execution error: Not authorized to send Apple events to System Events. (-1743)";
+    let err = annotate_permission_error(stderr);
+    let msg = err.to_string();
+    // Should be a single line (no newlines) suitable for status bar display
+    assert!(!msg.contains('\n'), "Error message should be single-line for TUI: {}", msg);
+    assert!(msg.contains("Permission denied"), "Should mention permission: {}", msg);
   }
 }
