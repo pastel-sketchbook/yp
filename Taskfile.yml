@@ -18,6 +18,10 @@ tasks:
     desc: Count lines of code
     cmds:
       - tokei
+  loc:files:
+    desc: Lines of code per source file
+    cmds:
+      - tokei src/ --files
 
   version:patch:
     desc: Bump patch version (0.0.x)

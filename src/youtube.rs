@@ -7,6 +7,7 @@ use std::process::{Output, Stdio};
 use tokio::process::{Child as TokioChild, Command};
 use tokio::sync::mpsc;
 
+use crate::constants::constants;
 use crate::player::VideoDetails;
 
 // --- Shared Helpers ---
@@ -36,12 +37,6 @@ async fn run_yt_dlp(args: &[&str], context: &str) -> Result<Output> {
 }
 
 // --- Frame Sources ---
-
-/// Frame rate for ffmpeg video frame extraction (frames per second).
-const FRAME_EXTRACT_FPS: f64 = 0.5;
-
-/// Width of extracted video frames (height is auto-scaled to preserve aspect ratio).
-const FRAME_EXTRACT_WIDTH: u32 = 640;
 
 /// A decoded storyboard: sprite sheets + metadata for frame extraction.
 pub struct SpriteFrameSource {
@@ -340,7 +335,8 @@ pub async fn fetch_video_frames(video_id: &str) -> Result<FrameSource> {
   std::fs::create_dir_all(&frames_dir).context("Failed to create temp dir for video frames")?;
 
   let output_pattern = frames_dir.join("frame_%04d.jpg");
-  let vf_arg = format!("fps={},scale={}:-2", FRAME_EXTRACT_FPS, FRAME_EXTRACT_WIDTH);
+  let c = constants();
+  let vf_arg = format!("fps={},scale={}:-2", c.frame_extract_fps, c.frame_extract_width);
 
   let child = Command::new("ffmpeg")
     .args([
@@ -366,7 +362,7 @@ pub async fn fetch_video_frames(video_id: &str) -> Result<FrameSource> {
       }
     })?;
 
-  let frame_interval = 1.0 / FRAME_EXTRACT_FPS;
+  let frame_interval = 1.0 / c.frame_extract_fps;
 
   Ok(FrameSource::Video(VideoFrameSource {
     video_id: video_id.to_string(),
@@ -375,12 +371,6 @@ pub async fn fetch_video_frames(video_id: &str) -> Result<FrameSource> {
     ffmpeg_handle: Some(child),
   }))
 }
-
-/// Number of videos to fetch on the initial channel load.
-pub const CHANNEL_INITIAL_SIZE: usize = 30;
-
-/// Page size for subsequent channel "load more" fetches.
-pub const CHANNEL_PAGE_SIZE: usize = 20;
 
 /// A single entry from a search or channel listing.
 #[derive(Debug, Clone)]
@@ -476,15 +466,6 @@ pub fn detect_channel_url(input: &str) -> Option<String> {
   None
 }
 
-/// The yt-dlp print template used for all listing commands.
-const PRINT_FORMAT: &str = "%(title)s\t%(id)s\t%(upload_date>%Y-%m-%d)s\t%(tags)s";
-
-/// The yt-dlp print template used for per-video metadata enrichment.
-const ENRICH_FORMAT: &str = "%(id)s\t%(upload_date>%Y-%m-%d)s\t%(tags)s";
-
-/// Maximum number of concurrent yt-dlp enrichment processes.
-const ENRICH_CONCURRENCY: usize = 5;
-
 /// Enriched metadata for a single video (returned from background enrichment).
 #[derive(Debug, Clone)]
 pub struct VideoMeta {
@@ -494,18 +475,20 @@ pub struct VideoMeta {
 }
 
 /// Enrich a list of video IDs with full metadata (upload_date, tags).
-/// Spawns up to `ENRICH_CONCURRENCY` concurrent yt-dlp processes.
+/// Spawns up to `enrich_concurrency` concurrent yt-dlp processes.
 /// Each result is sent progressively through `tx` as it becomes available.
 pub async fn enrich_video_metadata(video_ids: Vec<String>, tx: mpsc::Sender<VideoMeta>) {
   use futures::stream::{self, StreamExt};
 
+  let c = constants();
   stream::iter(video_ids)
     .map(|video_id| {
       let tx = tx.clone();
+      let enrich_format = &c.enrich_format;
       async move {
         let url = format!("https://youtube.com/watch?v={}", video_id);
         let result =
-          run_yt_dlp(&["--skip-download", "--print", ENRICH_FORMAT, "--no-warnings", "--", &url], "enrichment").await;
+          run_yt_dlp(&["--skip-download", "--print", enrich_format, "--no-warnings", "--", &url], "enrichment").await;
 
         if let Ok(output) = result
           && output.status.success()
@@ -521,7 +504,7 @@ pub async fn enrich_video_metadata(video_ids: Vec<String>, tx: mpsc::Sender<Vide
         }
       }
     })
-    .buffer_unordered(ENRICH_CONCURRENCY)
+    .buffer_unordered(c.enrich_concurrency)
     .collect::<()>()
     .await;
 }
@@ -566,7 +549,7 @@ pub async fn search_youtube(query: &str) -> Result<Vec<SearchEntry>> {
   let output = run_yt_dlp(
     &[
       "--print",
-      PRINT_FORMAT,
+      &constants().print_format,
       "--default-search",
       "ytsearch20:",
       "--no-playlist",

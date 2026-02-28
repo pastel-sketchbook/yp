@@ -1,0 +1,39 @@
+(
+  // Default channel handle shown in the input field on startup.
+  pastel_sketchbook_channel: "@ChrisH-v4e",
+
+  // --- Ghostty terminal ---
+  // TERM_PROGRAM env var value (lowercase).
+  ghostty_term_program: "ghostty",
+  // Process name in macOS System Events / Accessibility API (matches CFBundleName).
+  ghostty_process_name: "Ghostty",
+
+  // --- PiP window ---
+  pip_width: 550,
+  pip_height: 350,
+  pip_margin: 30,
+
+  // --- Channel browsing ---
+  // Number of videos fetched on the initial channel load.
+  channel_initial_size: 30,
+  // Page size for subsequent "load more" fetches.
+  channel_page_size: 20,
+
+  // --- Transcription ---
+  // Duration of each audio chunk downloaded for whisper (seconds).
+  chunk_secs: 30,
+  // Minimum WAV file size to consider a chunk valid (~1s of 16kHz mono 16-bit).
+  min_chunk_bytes: 32000,
+
+  // --- YouTube / yt-dlp ---
+  // Frame rate for ffmpeg video frame extraction (frames per second).
+  frame_extract_fps: 0.5,
+  // Width of extracted video frames (height auto-scales to preserve aspect ratio).
+  frame_extract_width: 640,
+  // Maximum concurrent yt-dlp enrichment processes.
+  enrich_concurrency: 5,
+  // yt-dlp print template for listing commands.
+  print_format: "%(title)s\t%(id)s\t%(upload_date>%Y-%m-%d)s\t%(tags)s",
+  // yt-dlp print template for per-video metadata enrichment.
+  enrich_format: "%(id)s\t%(upload_date>%Y-%m-%d)s\t%(tags)s",
+)

@@ -30,9 +30,26 @@ The `TERM_PROGRAM` environment variable identifies the running terminal:
 |------------------|-------------|-------------------|--------------------|
 | `Apple_Terminal`  | Terminal.app | App scripting     | None               |
 | `iTerm.app`       | iTerm2      | App scripting     | None               |
-| Other/unset       | Any         | System Events     | Accessibility      |
+| `ghostty`         | Ghostty     | System Events     | Accessibility      |
+| Other/unset       | —           | Not supported     | —                  |
 
-Terminal.app and iTerm2 use the `bounds` property (`{left, top, right, bottom}`), while System Events uses separate `position` and `size` properties. The window module normalizes both formats to `{x, y, width, height}`.
+PiP is only supported on these three terminals. Other terminals silently hide the Ctrl+M keybinding and footer hint.
+
+Terminal.app and iTerm2 use the `bounds` property (`{left, top, right, bottom}`), while Ghostty uses System Events with separate `position` and `size` properties. The window module normalizes both formats to `{x, y, width, height}`.
+
+### Ghostty Fullscreen Handling
+
+Ghostty users commonly run fullscreen. Since macOS native fullscreen windows can't be freely resized/repositioned, PiP must exit fullscreen first. This uses the `AXFullScreen` accessibility attribute via JXA:
+
+```javascript
+ObjC.import('ApplicationServices');
+var win = Application('System Events').processes.byName('ghostty').windows[0];
+win.attributes.byName('AXFullScreen').value = false;
+```
+
+After exiting fullscreen, the code waits 750ms for the macOS animation to complete, then re-queries window geometry before resizing to PiP. On restore, fullscreen is re-entered if it was active before PiP.
+
+**Why not xterm escape sequences?** Ghostty does not implement CSI `t` (xterm window manipulation) sequences. We initially attempted this approach but discovered it's not supported in Ghostty's VT implementation.
 
 ### Screen Size Query
 

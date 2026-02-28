@@ -143,6 +143,7 @@ impl MusicPlayer {
   /// mpv resolves the YouTube URL to a direct CDN stream URL on startup.
   /// We can reuse that URL to download audio with ffmpeg, skipping the
   /// slow yt-dlp URL resolution step entirely.
+  #[allow(dead_code)]
   pub async fn get_stream_url(&self) -> Result<Option<String>> {
     let Some(ref socket_path) = self.ipc_socket_path else {
       return Ok(None);

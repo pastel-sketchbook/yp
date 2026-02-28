@@ -7,10 +7,11 @@ use ratatui::{
   widgets::{Block, Gauge, List, ListItem, Padding, Paragraph, Wrap},
 };
 
+use crate::app::{App, AppMode};
 use crate::display::DisplayMode;
 use crate::graphics::ThumbnailWidget;
 use crate::theme::Theme;
-use crate::{App, AppMode, TranscriptState};
+use crate::transcript::TranscriptState;
 
 // --- Helpers ---
 
@@ -668,7 +669,11 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
   } else {
     let mpv_status = app.player.get_last_mpv_status();
     match mpv_status {
-      Some(status) => (format!(" ♪ {}", status), Style::default().fg(theme.status)),
+      Some(status) => {
+        // mpv's ${pause} emits "yes"/"no" — replace with icons.
+        let status = status.replace("| yes ", "| ⏸ ").replace("| no ", "| ▶ ");
+        (format!(" ♪ {}", status), Style::default().fg(theme.status))
+      }
       None if app.player.is_playing() => (" ♪ Buffering...".to_string(), Style::default().fg(theme.muted)),
       None => (" Ready".to_string(), Style::default().fg(theme.muted)),
     }
@@ -747,7 +752,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
       let mut k = vec![("Enter", "Search"), ("^t", "Theme"), ("^f", "Frame")];
       if is_playing {
         k.push(transcript_hint);
-        k.push(("^m", "PiP"));
+        if crate::window::pip_supported() {
+          k.push(("^m", "PiP"));
+        }
         k.push(("^s", "Stop"));
         k.push(("^o", "Open"));
       }
@@ -765,7 +772,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         k.push(transcript_hint);
         let pause_label = if app.player.paused { "Resume" } else { "Pause" };
         k.push(("Space", pause_label));
-        k.push(("^m", "PiP"));
+        if crate::window::pip_supported() {
+          k.push(("^m", "PiP"));
+        }
         k.push(("^s", "Stop"));
         k.push(("^o", "Open"));
       }
@@ -780,7 +789,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         k.push(transcript_hint);
         let pause_label = if app.player.paused { "Resume" } else { "Pause" };
         k.push(("Space", pause_label));
-        k.push(("^m", "PiP"));
+        if crate::window::pip_supported() {
+          k.push(("^m", "PiP"));
+        }
         k.push(("^s", "Stop"));
         k.push(("^o", "Open"));
       }
