@@ -67,11 +67,11 @@ enum Command {
     /// Fetch all videos from the channel (overrides --limit)
     #[arg(short, long)]
     all: bool,
-    /// Skip metadata enrichment (faster, but no dates/tags/duration/views)
+    /// Enrich videos with tags via per-video yt-dlp calls (slower)
     #[arg(short, long)]
-    fast: bool,
-    /// Number of concurrent enrichment processes (default: 5)
-    #[arg(short, long, default_value_t = 5)]
+    enrich: bool,
+    /// Number of concurrent enrichment processes (default: 8)
+    #[arg(short, long, default_value_t = 8)]
     jobs: usize,
   },
 
@@ -175,10 +175,10 @@ async fn main() -> Result<()> {
         Ok(())
       }
       Command::Search { query, limit } => cli::cmd_search(&query, limit).await,
-      Command::Channel { channel, limit, all, fast, jobs } => {
+      Command::Channel { channel, limit, all, enrich, jobs } => {
         let channel = channel.unwrap_or_else(|| constants::constants().pastel_sketchbook_channel.clone());
         let count = if all { None } else { Some(limit) };
-        cli::cmd_channel(&channel, count, !fast, jobs).await
+        cli::cmd_channel(&channel, count, enrich, jobs).await
       }
       Command::Info { video } => cli::cmd_info(&video).await,
       Command::Transcript { video, raw } => {

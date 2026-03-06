@@ -75,6 +75,66 @@ pub async fn cmd_search(query: &str, limit: usize) -> Result<()> {
 // Subcommand: channel
 // ---------------------------------------------------------------------------
 
+/// Build a JSON object for a channel entry, optionally merging enriched metadata.
+/// SearchEntry fields (from flat-playlist) are used as defaults; VideoMeta overrides when present.
+fn channel_entry_json(entry: &youtube::SearchEntry, meta: Option<&youtube::VideoMeta>) -> serde_json::Value {
+  let mut obj = serde_json::json!({
+    "video_id": entry.video_id,
+    "title": entry.title,
+    "url": format!("https://youtube.com/watch?v={}", entry.video_id),
+  });
+  // Populate from SearchEntry (flat-playlist data)
+  if let Some(date) = &entry.upload_date {
+    obj["upload_date"] = serde_json::Value::String(date.clone());
+  }
+  if let Some(tags) = &entry.tags {
+    obj["tags"] = serde_json::Value::String(tags.clone());
+  }
+  if let Some(dur) = &entry.duration {
+    obj["duration"] = serde_json::Value::String(dur.clone());
+  }
+  if let Some(vc) = &entry.view_count {
+    obj["view_count"] = serde_json::Value::String(vc.clone());
+  }
+  if let Some(up) = &entry.uploader {
+    obj["uploader"] = serde_json::Value::String(up.clone());
+  }
+  // Override with enriched metadata when available
+  if let Some(meta) = meta {
+    if let Some(date) = &meta.upload_date {
+      obj["upload_date"] = serde_json::Value::String(date.clone());
+    }
+    if let Some(tags) = &meta.tags {
+      obj["tags"] = serde_json::Value::String(tags.clone());
+    }
+    if let Some(dur) = &meta.duration {
+      obj["duration"] = serde_json::Value::String(dur.clone());
+    }
+    if let Some(vc) = &meta.view_count {
+      obj["view_count"] = serde_json::Value::String(vc.clone());
+    }
+    if let Some(up) = &meta.uploader {
+      obj["uploader"] = serde_json::Value::String(up.clone());
+    }
+  }
+  obj
+}
+
+/// Write a single JSONL line to stdout and flush immediately.
+///
+/// Explicit flushing is required because Rust uses full buffering when stdout
+/// is piped. Without it, downstream processes (e.g. `fzf`) won't see data
+/// until the 8 KB buffer fills or the process exits.
+fn write_jsonl(obj: &serde_json::Value) -> Result<()> {
+  use std::io::Write;
+  let stdout = std::io::stdout();
+  let mut lock = stdout.lock();
+  serde_json::to_writer(&mut lock, obj).context("Failed to write JSONL")?;
+  writeln!(lock).context("Failed to write newline")?;
+  lock.flush().context("Failed to flush stdout")?;
+  Ok(())
+}
+
 /// List videos from a YouTube channel, output as JSONL.
 ///
 /// `count`: `Some(n)` for n videos, `None` for all.
@@ -90,55 +150,37 @@ pub async fn cmd_channel(channel: &str, count: Option<usize>, enrich: bool, jobs
 
   if enrich && !entries.is_empty() {
     eprintln!("Enriching {} videos with metadata ({} concurrent)...", entries.len(), jobs);
+
+    // Build a lookup so we can merge entry titles with enrichment results.
+    let entry_map: std::collections::HashMap<String, &youtube::SearchEntry> =
+      entries.iter().map(|e| (e.video_id.clone(), e)).collect();
+    let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     let video_ids: Vec<String> = entries.iter().map(|e| e.video_id.clone()).collect();
     let (tx, mut rx) = mpsc::channel(video_ids.len().max(1));
 
     // Spawn enrichment in background
     let enrich_handle = tokio::spawn(youtube::enrich_video_metadata(video_ids, tx, jobs));
 
-    // Collect enriched metadata
-    let mut enriched: std::collections::HashMap<String, youtube::VideoMeta> = std::collections::HashMap::new();
+    // Stream each enriched entry to stdout as it arrives.
     while let Some(meta) = rx.recv().await {
-      enriched.insert(meta.video_id.clone(), meta);
+      if let Some(entry) = entry_map.get(&meta.video_id) {
+        write_jsonl(&channel_entry_json(entry, Some(&meta)))?;
+        emitted.insert(meta.video_id.clone());
+      }
     }
     enrich_handle.await.context("Enrichment task failed")?;
 
-    // Output entries with enriched data merged
+    // Output any entries that failed enrichment (so no data is silently lost).
     for entry in &entries {
-      let mut obj = serde_json::json!({
-        "video_id": entry.video_id,
-        "title": entry.title,
-        "url": format!("https://youtube.com/watch?v={}", entry.video_id),
-      });
-      if let Some(meta) = enriched.get(&entry.video_id) {
-        if let Some(date) = &meta.upload_date {
-          obj["upload_date"] = serde_json::Value::String(date.clone());
-        }
-        if let Some(tags) = &meta.tags {
-          obj["tags"] = serde_json::Value::String(tags.clone());
-        }
-        if let Some(dur) = &meta.duration {
-          obj["duration"] = serde_json::Value::String(dur.clone());
-        }
-        if let Some(vc) = &meta.view_count {
-          obj["view_count"] = serde_json::Value::String(vc.clone());
-        }
-        if let Some(up) = &meta.uploader {
-          obj["uploader"] = serde_json::Value::String(up.clone());
-        }
+      if !emitted.contains(&entry.video_id) {
+        write_jsonl(&channel_entry_json(entry, None))?;
       }
-      println!("{}", serde_json::to_string(&obj).context("Failed to serialize enriched entry")?);
     }
   } else {
     // Output as JSONL without enrichment (fast mode)
     for entry in &entries {
-      let obj = serde_json::json!({
-        "video_id": entry.video_id,
-        "title": entry.title,
-        "url": format!("https://youtube.com/watch?v={}", entry.video_id),
-      });
-      let json = serde_json::to_string(&obj).context("Failed to serialize entry")?;
-      println!("{}", json);
+      write_jsonl(&channel_entry_json(entry, None))?;
     }
   }
 

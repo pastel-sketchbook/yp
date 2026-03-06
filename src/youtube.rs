@@ -379,8 +379,11 @@ pub struct SearchEntry {
   pub video_id: String,
   pub upload_date: Option<String>,
   pub tags: Option<String>,
-  /// Whether this entry has been enriched with full metadata (date, tags).
-  /// Entries from `--flat-playlist` start as `false`.
+  pub duration: Option<String>,
+  pub view_count: Option<String>,
+  pub uploader: Option<String>,
+  /// Whether this entry has been enriched with full metadata (tags).
+  /// Entries from `--flat-playlist` start as `false` but carry date/duration/views.
   pub enriched: bool,
 }
 
@@ -408,7 +411,7 @@ pub(crate) fn format_view_count(raw: &str) -> String {
 }
 
 /// Parse a single tab-separated yt-dlp output line into a SearchEntry.
-/// Expected format: `title\tid[\tupload_date\ttags]`
+/// Expected format: `title\tid[\tupload_date\ttags\tduration\tview_count\tuploader]`
 pub(crate) fn parse_search_line(line: &str) -> Option<SearchEntry> {
   let parts: Vec<&str> = line.split('\t').collect();
   if parts.len() < 2 {
@@ -421,8 +424,11 @@ pub(crate) fn parse_search_line(line: &str) -> Option<SearchEntry> {
   }
   let upload_date = opt_field(parts.get(2).copied());
   let tags = opt_field(parts.get(3).copied()).map(|s| clean_tags(&s)).filter(|s| !s.is_empty());
-  let enriched = upload_date.is_some() || tags.is_some();
-  Some(SearchEntry { title, video_id, upload_date, tags, enriched })
+  let duration = opt_field(parts.get(4).copied());
+  let view_count = opt_field(parts.get(5).copied()).map(|s| format_view_count(&s));
+  let uploader = opt_field(parts.get(6).copied());
+  let enriched = tags.is_some();
+  Some(SearchEntry { title, video_id, upload_date, tags, duration, view_count, uploader, enriched })
 }
 
 /// Parse yt-dlp stdout lines into SearchEntry vec.
@@ -525,10 +531,12 @@ pub async fn enrich_video_metadata(video_ids: Vec<String>, tx: mpsc::Sender<Vide
 }
 
 /// Fetch a batch of videos from a channel URL using --flat-playlist for speed.
-/// Results will have titles and IDs but no date/tags (those come from enrichment).
+/// With the rich print_format, entries include date/duration/views/uploader from
+/// the playlist page itself — only tags require per-video enrichment.
 /// `start` is 1-indexed, `count` is how many to fetch (`None` = all videos).
 pub async fn list_channel_videos(channel_url: &str, start: usize, count: Option<usize>) -> Result<Vec<SearchEntry>> {
-  let mut args = vec!["--flat-playlist", "--print", "%(title)s\t%(id)s"];
+  let c = constants();
+  let mut args = vec!["--flat-playlist", "--print", &c.print_format];
 
   let playlist_range;
   if let Some(n) = count {
@@ -550,7 +558,8 @@ pub async fn list_channel_videos(channel_url: &str, start: usize, count: Option<
   }
 
   let stdout_str = String::from_utf8(output.stdout).context("yt-dlp output non-UTF8")?;
-  // flat-playlist only gives title + id, so entries will have enriched=false
+  // flat-playlist provides date/duration/views/uploader but not tags.
+  // Entries with tags=None have enriched=false.
   Ok(parse_search_output(&stdout_str))
 }
 
@@ -687,6 +696,9 @@ mod tests {
     assert_eq!(entry.video_id, "abc123");
     assert_eq!(entry.upload_date, None);
     assert_eq!(entry.tags, None);
+    assert_eq!(entry.duration, None);
+    assert_eq!(entry.view_count, None);
+    assert_eq!(entry.uploader, None);
     assert!(!entry.enriched);
   }
 
@@ -706,6 +718,28 @@ mod tests {
     assert_eq!(entry.upload_date, None);
     assert_eq!(entry.tags, None);
     assert!(!entry.enriched);
+  }
+
+  #[test]
+  fn parse_search_line_full_fields() {
+    let entry = parse_search_line("Song\tvid3\t2024-06-01\tNA\t5:30\t1234567\tMyChannel").unwrap();
+    assert_eq!(entry.upload_date, Some("2024-06-01".to_string()));
+    assert_eq!(entry.tags, None);
+    assert_eq!(entry.duration, Some("5:30".to_string()));
+    assert_eq!(entry.view_count, Some("1,234,567".to_string()));
+    assert_eq!(entry.uploader, Some("MyChannel".to_string()));
+    // enriched=false because tags are not present (flat-playlist mode)
+    assert!(!entry.enriched);
+  }
+
+  #[test]
+  fn parse_search_line_all_seven_fields() {
+    let entry = parse_search_line("Song\tvid4\t2024-01-01\t['jazz']\t3:45\t999\tArtist").unwrap();
+    assert_eq!(entry.tags, Some("jazz".to_string()));
+    assert_eq!(entry.duration, Some("3:45".to_string()));
+    assert_eq!(entry.view_count, Some("999".to_string()));
+    assert_eq!(entry.uploader, Some("Artist".to_string()));
+    assert!(entry.enriched);
   }
 
   #[test]

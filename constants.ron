@@ -35,9 +35,11 @@
   // Width of extracted video frames (height auto-scales to preserve aspect ratio).
   frame_extract_width: 640,
   // Maximum concurrent yt-dlp enrichment processes.
-  enrich_concurrency: 5,
-  // yt-dlp print template for listing commands.
-  print_format: "%(title)s\t%(id)s\t%(upload_date>%Y-%m-%d)s\t%(tags)s",
+  enrich_concurrency: 8,
+  // yt-dlp print template for listing commands (7 tab-separated fields).
+  // Fields: title, id, upload_date, tags, duration, view_count, uploader.
+  // In --flat-playlist mode, tags will be "NA" (only available via per-video enrichment).
+  print_format: "%(title)s\t%(id)s\t%(upload_date>%Y-%m-%d)s\t%(tags)s\t%(duration_string)s\t%(view_count)s\t%(uploader)s",
   // yt-dlp print template for per-video metadata enrichment.
   enrich_format: "%(id)s\t%(upload_date>%Y-%m-%d)s\t%(tags)s\t%(duration_string)s\t%(view_count)s\t%(uploader)s",
 )

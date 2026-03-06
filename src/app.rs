@@ -691,8 +691,11 @@ impl App {
       let mut updated = false;
       while let Ok(meta) = rx.try_recv() {
         if let Some(entry) = self.search_results.iter_mut().find(|e| e.video_id == meta.video_id) {
-          entry.upload_date = meta.upload_date;
-          entry.tags = meta.tags;
+          entry.upload_date = meta.upload_date.or(entry.upload_date.take());
+          entry.tags = meta.tags.or(entry.tags.take());
+          entry.duration = meta.duration.or(entry.duration.take());
+          entry.view_count = meta.view_count.or(entry.view_count.take());
+          entry.uploader = meta.uploader.or(entry.uploader.take());
           entry.enriched = true;
           updated = true;
         }
@@ -944,6 +947,9 @@ mod tests {
       video_id: "test123".to_string(),
       upload_date: None,
       tags: tags.map(|s| s.to_string()),
+      duration: None,
+      view_count: None,
+      uploader: None,
       enriched: false,
     }
   }
