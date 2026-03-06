@@ -284,7 +284,7 @@ pub fn spawn_transcription_pipeline(
 
       info!(offset = offset_secs, duration = chunk_secs, "transcript: downloading chunk");
 
-      let ffmpeg_result = tokio::process::Command::new("ffmpeg")
+      let ffmpeg_spawn = tokio::process::Command::new("ffmpeg")
         .args([
           "-y",
           "-ss",
@@ -305,16 +305,31 @@ pub fn spawn_transcription_pipeline(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .await;
+        .spawn();
 
-      match ffmpeg_result {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-          // Non-zero exit likely means we've gone past the end of the stream
-          info!(offset = offset_secs, code = ?status.code(), "transcript: ffmpeg exited non-zero, assuming end of stream");
-          break;
-        }
+      // Timeout: if ffmpeg hangs (e.g. seeking past end of an HTTP stream),
+      // kill it and treat as end-of-stream. 2x chunk duration is generous.
+      let ffmpeg_timeout = std::time::Duration::from_secs((chunk_secs * 2) as u64);
+
+      match ffmpeg_spawn {
+        Ok(mut child) => match tokio::time::timeout(ffmpeg_timeout, child.wait()).await {
+          Ok(Ok(status)) if status.success() => {}
+          Ok(Ok(status)) => {
+            // Non-zero exit likely means we've gone past the end of the stream
+            info!(offset = offset_secs, code = ?status.code(), "transcript: ffmpeg exited non-zero, assuming end of stream");
+            break;
+          }
+          Ok(Err(e)) => {
+            let _ = tx.send(TranscriptEvent::Failed(format!("Failed to wait for ffmpeg: {}", e)));
+            return;
+          }
+          Err(_) => {
+            // Timeout — ffmpeg hung, likely past end of stream on an HTTP URL
+            info!(offset = offset_secs, timeout = ?ffmpeg_timeout, "transcript: ffmpeg timed out, assuming end of stream");
+            let _ = child.kill().await;
+            break;
+          }
+        },
         Err(e) => {
           let msg = if e.kind() == std::io::ErrorKind::NotFound {
             "ffmpeg not found. Install with: brew install ffmpeg".to_string()
