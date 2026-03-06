@@ -778,7 +778,7 @@ impl App {
 
       let (tx, rx) = oneshot::channel();
       tokio::spawn(async move {
-        let _ = tx.send(list_channel_videos(&channel_url, 1, constants().channel_initial_size).await);
+        let _ = tx.send(list_channel_videos(&channel_url, 1, Some(constants().channel_initial_size)).await);
       });
       self.tasks.search_rx = Some(rx);
     } else {
@@ -806,7 +806,7 @@ impl App {
 
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
-      let _ = tx.send(list_channel_videos(&url, start, constants().channel_page_size).await);
+      let _ = tx.send(list_channel_videos(&url, start, Some(constants().channel_page_size)).await);
     });
     self.tasks.more_rx = Some(rx);
   }
@@ -831,7 +831,7 @@ impl App {
 
     let (tx, rx) = mpsc::channel(64);
     let handle = tokio::spawn(async move {
-      enrich_video_metadata(ids, tx).await;
+      enrich_video_metadata(ids, tx, constants().enrich_concurrency).await;
     });
     self.tasks.enrich_rx = Some(rx);
     self.tasks.enrich_handle = Some(handle);

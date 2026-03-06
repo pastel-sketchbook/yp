@@ -61,12 +61,18 @@ enum Command {
   Channel {
     /// Channel handle (@name), URL, or name (default: @ChrisH-v4e)
     channel: Option<String>,
-    /// Max videos to list (default: 30)
+    /// Max videos to list (default: 30, use --all for no limit)
     #[arg(short, long, default_value_t = 30)]
     limit: usize,
+    /// Fetch all videos from the channel (overrides --limit)
+    #[arg(short, long)]
+    all: bool,
     /// Skip metadata enrichment (faster, but no dates/tags/duration/views)
     #[arg(short, long)]
     fast: bool,
+    /// Number of concurrent enrichment processes (default: 5)
+    #[arg(short, long, default_value_t = 5)]
+    jobs: usize,
   },
 
   /// Fetch metadata for a specific video (output as JSON)
@@ -169,9 +175,10 @@ async fn main() -> Result<()> {
         Ok(())
       }
       Command::Search { query, limit } => cli::cmd_search(&query, limit).await,
-      Command::Channel { channel, limit, fast } => {
+      Command::Channel { channel, limit, all, fast, jobs } => {
         let channel = channel.unwrap_or_else(|| constants::constants().pastel_sketchbook_channel.clone());
-        cli::cmd_channel(&channel, limit, !fast).await
+        let count = if all { None } else { Some(limit) };
+        cli::cmd_channel(&channel, count, !fast, jobs).await
       }
       Command::Info { video } => cli::cmd_info(&video).await,
       Command::Transcript { video, raw } => cli::cmd_transcript(&video, raw).await,

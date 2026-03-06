@@ -76,20 +76,26 @@ pub async fn cmd_search(query: &str, limit: usize) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// List videos from a YouTube channel, output as JSONL.
-pub async fn cmd_channel(channel: &str, limit: usize, enrich: bool) -> Result<()> {
+///
+/// `count`: `Some(n)` for n videos, `None` for all.
+/// `jobs`: number of concurrent enrichment processes.
+pub async fn cmd_channel(channel: &str, count: Option<usize>, enrich: bool, jobs: usize) -> Result<()> {
   let channel_url =
     youtube::detect_channel_url(channel).ok_or_else(|| anyhow!("Could not detect channel URL from: {}", channel))?;
 
-  eprintln!("Listing videos from: {}", channel_url);
-  let entries = youtube::list_channel_videos(&channel_url, 1, limit).await.context("Failed to list channel videos")?;
+  let label = count.map_or("all".to_string(), |n| n.to_string());
+  eprintln!("Listing {} videos from: {}", label, channel_url);
+  let entries =
+    youtube::list_channel_videos(&channel_url, 1, count).await.context("Failed to list channel videos")?;
+  eprintln!("Found {} videos", entries.len());
 
   if enrich && !entries.is_empty() {
-    eprintln!("Enriching {} videos with metadata...", entries.len());
+    eprintln!("Enriching {} videos with metadata ({} concurrent)...", entries.len(), jobs);
     let video_ids: Vec<String> = entries.iter().map(|e| e.video_id.clone()).collect();
-    let (tx, mut rx) = mpsc::channel(video_ids.len());
+    let (tx, mut rx) = mpsc::channel(video_ids.len().max(1));
 
     // Spawn enrichment in background
-    let enrich_handle = tokio::spawn(youtube::enrich_video_metadata(video_ids, tx));
+    let enrich_handle = tokio::spawn(youtube::enrich_video_metadata(video_ids, tx, jobs));
 
     // Collect enriched metadata
     let mut enriched: std::collections::HashMap<String, youtube::VideoMeta> = std::collections::HashMap::new();
@@ -272,7 +278,8 @@ pub async fn cmd_summarize_latest(channel: &str, count: usize, raw: bool) -> Res
     youtube::detect_channel_url(channel).ok_or_else(|| anyhow!("Could not detect channel URL from: {}", channel))?;
 
   eprintln!("Listing latest {} video(s) from: {}", count, channel_url);
-  let entries = youtube::list_channel_videos(&channel_url, 1, count).await.context("Failed to list channel videos")?;
+  let entries =
+    youtube::list_channel_videos(&channel_url, 1, Some(count)).await.context("Failed to list channel videos")?;
 
   if entries.is_empty() {
     return print_json_error("no_videos", "No videos found in the channel");

@@ -477,10 +477,10 @@ pub struct VideoMeta {
   pub uploader: Option<String>,
 }
 
-/// Enrich a list of video IDs with full metadata (upload_date, tags).
-/// Spawns up to `enrich_concurrency` concurrent yt-dlp processes.
+/// Enrich a list of video IDs with full metadata (upload_date, tags, duration, etc.).
+/// Spawns up to `concurrency` concurrent yt-dlp processes.
 /// Each result is sent progressively through `tx` as it becomes available.
-pub async fn enrich_video_metadata(video_ids: Vec<String>, tx: mpsc::Sender<VideoMeta>) {
+pub async fn enrich_video_metadata(video_ids: Vec<String>, tx: mpsc::Sender<VideoMeta>, concurrency: usize) {
   use futures::stream::{self, StreamExt};
 
   let c = constants();
@@ -519,37 +519,33 @@ pub async fn enrich_video_metadata(video_ids: Vec<String>, tx: mpsc::Sender<Vide
         }
       }
     })
-    .buffer_unordered(c.enrich_concurrency)
+    .buffer_unordered(concurrency)
     .collect::<()>()
     .await;
 }
 
 /// Fetch a batch of videos from a channel URL using --flat-playlist for speed.
 /// Results will have titles and IDs but no date/tags (those come from enrichment).
-/// `start` is 1-indexed, `count` is how many to fetch.
-pub async fn list_channel_videos(channel_url: &str, start: usize, count: usize) -> Result<Vec<SearchEntry>> {
-  if count == 0 {
-    return Ok(Vec::new());
-  }
-  let end = start.saturating_add(count).saturating_sub(1);
-  let playlist_range = format!("{}:{}", start, end);
+/// `start` is 1-indexed, `count` is how many to fetch (`None` = all videos).
+pub async fn list_channel_videos(channel_url: &str, start: usize, count: Option<usize>) -> Result<Vec<SearchEntry>> {
+  let mut args = vec!["--flat-playlist", "--print", "%(title)s\t%(id)s"];
 
-  let output = run_yt_dlp(
-    &[
-      "--flat-playlist",
-      "--print",
-      "%(title)s\t%(id)s",
-      "--playlist-items",
-      &playlist_range,
-      "--no-warnings",
-      "--ignore-errors",
-      "--",
-      channel_url,
-    ],
-    "channel listing",
-  )
-  .await
-  .context("Failed to run yt-dlp for channel listing")?;
+  let playlist_range;
+  if let Some(n) = count {
+    if n == 0 {
+      return Ok(Vec::new());
+    }
+    let end = start.saturating_add(n).saturating_sub(1);
+    playlist_range = format!("{}:{}", start, end);
+    args.extend(["--playlist-items", &playlist_range]);
+  }
+  // When count is None, omit --playlist-items to fetch all videos.
+
+  args.extend(["--no-warnings", "--ignore-errors", "--", channel_url]);
+
+  let output = run_yt_dlp(&args, "channel listing")
+    .await
+    .context("Failed to run yt-dlp for channel listing")?;
 
   if !output.status.success() {
     return Err(anyhow!("yt-dlp channel listing failed: {}", String::from_utf8_lossy(&output.stderr)));
