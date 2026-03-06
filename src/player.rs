@@ -1,10 +1,9 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use image::DynamicImage;
 use reqwest::Client;
 use std::process::Stdio;
 use tokio::{
-  io::BufReader as TokioBufReader,
-  io::{AsyncBufReadExt, AsyncWriteExt},
+  io::{AsyncBufReadExt, BufReader as TokioBufReader},
   process::{Child as TokioChild, Command},
   sync::mpsc,
   task::JoinHandle,
@@ -137,56 +136,6 @@ impl MusicPlayer {
     self.paused = !self.paused;
     Ok(())
   }
-
-  /// Query mpv's IPC socket for the resolved audio stream URL.
-  ///
-  /// mpv resolves the YouTube URL to a direct CDN stream URL on startup.
-  /// We can reuse that URL to download audio with ffmpeg, skipping the
-  /// slow yt-dlp URL resolution step entirely.
-  #[allow(dead_code)]
-  pub async fn get_stream_url(&self) -> Result<Option<String>> {
-    let Some(ref socket_path) = self.ipc_socket_path else {
-      return Ok(None);
-    };
-
-    let mut stream =
-      tokio::net::UnixStream::connect(socket_path).await.context("Failed to connect to mpv IPC socket")?;
-
-    // Ask mpv for the resolved stream URL. `stream-open-filename` gives
-    // the URL that mpv's demuxer actually opened (i.e. the CDN URL).
-    let cmd = b"{\"command\":[\"get_property\",\"stream-open-filename\"],\"request_id\":1}\n";
-    stream.write_all(cmd).await.context("Failed to send get_property to mpv IPC")?;
-
-    // Read lines until we find our response (request_id == 1).
-    let reader = TokioBufReader::new(stream);
-    let mut lines = reader.lines();
-
-    // mpv may emit event lines before our response; read up to 20 lines.
-    for _ in 0..20 {
-      let line = tokio::time::timeout(std::time::Duration::from_secs(3), lines.next_line())
-        .await
-        .context("Timeout waiting for mpv IPC response")?
-        .context("Failed to read from mpv IPC socket")?;
-
-      let Some(line) = line else { break };
-
-      // Parse JSON response: {"data":"https://...","request_id":1,"error":"success"}
-      if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line)
-        && val.get("request_id").and_then(|v| v.as_i64()) == Some(1)
-      {
-        if val.get("error").and_then(|v| v.as_str()) == Some("success")
-          && let Some(url) = val.get("data").and_then(|v| v.as_str())
-        {
-          return Ok(Some(url.to_string()));
-        }
-        // Property exists but returned an error or non-string data
-        return Ok(None);
-      }
-    }
-
-    Ok(None)
-  }
-
   pub async fn stop(&mut self) -> Result<()> {
     if let Some(handle) = self.mpv_monitor_handle.take() {
       handle.abort();
