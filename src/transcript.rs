@@ -239,6 +239,7 @@ pub fn spawn_transcription_pipeline(
   url: String,
   whisper_cache: Arc<StdMutex<Option<whisper_cli::Whisper>>>,
   ipc_socket: Option<String>,
+  duration_hint: Option<u32>,
 ) -> JoinHandle<()> {
   tokio::spawn(async move {
     // Stage 1: Resolve the direct CDN stream URL.
@@ -274,6 +275,14 @@ pub fn spawn_transcription_pipeline(
     let mut offset_secs: u32 = 0;
 
     loop {
+      // If we know the video duration, skip chunks that start past the end.
+      if let Some(dur) = duration_hint
+        && offset_secs >= dur
+      {
+        info!(offset = offset_secs, duration = dur, "transcript: offset past video duration, done");
+        break;
+      }
+
       // Clean up previous chunk
       let _ = std::fs::remove_file(&chunk_path);
 
@@ -308,8 +317,8 @@ pub fn spawn_transcription_pipeline(
         .spawn();
 
       // Timeout: if ffmpeg hangs (e.g. seeking past end of an HTTP stream),
-      // kill it and treat as end-of-stream. 2x chunk duration is generous.
-      let ffmpeg_timeout = std::time::Duration::from_secs((chunk_secs * 2) as u64);
+      // kill it and treat as end-of-stream. 15s is generous for a CDN chunk.
+      let ffmpeg_timeout = std::time::Duration::from_secs(15);
 
       match ffmpeg_spawn {
         Ok(mut child) => match tokio::time::timeout(ffmpeg_timeout, child.wait()).await {

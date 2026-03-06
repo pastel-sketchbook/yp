@@ -85,8 +85,7 @@ pub async fn cmd_channel(channel: &str, count: Option<usize>, enrich: bool, jobs
 
   let label = count.map_or("all".to_string(), |n| n.to_string());
   eprintln!("Listing {} videos from: {}", label, channel_url);
-  let entries =
-    youtube::list_channel_videos(&channel_url, 1, count).await.context("Failed to list channel videos")?;
+  let entries = youtube::list_channel_videos(&channel_url, 1, count).await.context("Failed to list channel videos")?;
   eprintln!("Found {} videos", entries.len());
 
   if enrich && !entries.is_empty() {
@@ -176,7 +175,7 @@ pub async fn cmd_transcript(video: &str, raw: bool) -> Result<()> {
   let url = format!("https://youtube.com/watch?v={}", video_id);
   eprintln!("Transcribing video: {}", video_id);
 
-  let utterances = run_transcription(&url).await?;
+  let utterances = run_transcription(&url, None).await?;
 
   if raw {
     // Output raw utterances as JSONL
@@ -214,7 +213,8 @@ pub async fn cmd_summarize(video: &str, raw: bool) -> Result<()> {
   let details = youtube::get_video_info(&video_id).await.context("Failed to get video info")?;
 
   eprintln!("Transcribing video: {} — {}", video_id, details.title);
-  let utterances = run_transcription(&url).await?;
+  let duration_hint = details.duration.as_deref().and_then(parse_duration_secs);
+  let utterances = run_transcription(&url, duration_hint).await?;
 
   if raw {
     // Raw mode: video info + unprocessed transcript
@@ -305,7 +305,8 @@ pub async fn cmd_summarize_latest(channel: &str, count: usize, raw: bool) -> Res
         }
       };
 
-      let utterances = match run_transcription(&url).await {
+      let duration_hint = details.duration.as_deref().and_then(parse_duration_secs);
+      let utterances = match run_transcription(&url, duration_hint).await {
         Ok(u) => u,
         Err(e) => {
           eprintln!("Warning: transcription failed for {}: {}", video_id, e);
@@ -347,14 +348,33 @@ pub async fn cmd_summarize_latest(channel: &str, count: usize, raw: bool) -> Res
 // Shared transcription runner
 // ---------------------------------------------------------------------------
 
+/// Parse a duration string like "16:30" or "1:23:45" into total seconds.
+fn parse_duration_secs(s: &str) -> Option<u32> {
+  let parts: Vec<&str> = s.split(':').collect();
+  match parts.len() {
+    2 => {
+      let m: u32 = parts[0].parse().ok()?;
+      let s: u32 = parts[1].parse().ok()?;
+      Some(m * 60 + s)
+    }
+    3 => {
+      let h: u32 = parts[0].parse().ok()?;
+      let m: u32 = parts[1].parse().ok()?;
+      let s: u32 = parts[2].parse().ok()?;
+      Some(h * 3600 + m * 60 + s)
+    }
+    _ => None,
+  }
+}
+
 /// Run the headless transcription pipeline and collect all utterances.
 ///
 /// Uses `ipc_socket: None` to skip mpv IPC and go straight to `yt-dlp -g`.
-async fn run_transcription(url: &str) -> Result<Vec<whisper_cli::Utternace>> {
+async fn run_transcription(url: &str, duration_hint: Option<u32>) -> Result<Vec<whisper_cli::Utternace>> {
   let (tx, mut rx) = mpsc::unbounded_channel::<TranscriptEvent>();
   let whisper_cache: Arc<StdMutex<Option<whisper_cli::Whisper>>> = Arc::new(StdMutex::new(None));
 
-  let handle = crate::transcript::spawn_transcription_pipeline(tx, url.to_string(), whisper_cache, None);
+  let handle = crate::transcript::spawn_transcription_pipeline(tx, url.to_string(), whisper_cache, None, duration_hint);
 
   let mut all_utterances: Vec<whisper_cli::Utternace> = Vec::new();
   let mut chunk_count: u32 = 0;
@@ -430,5 +450,25 @@ mod tests {
   #[test]
   fn extract_video_id_short_url_with_params() {
     assert_eq!(extract_video_id("https://youtu.be/dQw4w9WgXcQ?t=30"), "dQw4w9WgXcQ");
+  }
+
+  #[test]
+  fn parse_duration_mm_ss() {
+    assert_eq!(parse_duration_secs("16:30"), Some(990));
+  }
+
+  #[test]
+  fn parse_duration_h_mm_ss() {
+    assert_eq!(parse_duration_secs("1:23:45"), Some(5025));
+  }
+
+  #[test]
+  fn parse_duration_zero() {
+    assert_eq!(parse_duration_secs("0:00"), Some(0));
+  }
+
+  #[test]
+  fn parse_duration_invalid() {
+    assert_eq!(parse_duration_secs("abc"), None);
   }
 }

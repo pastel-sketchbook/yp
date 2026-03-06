@@ -388,7 +388,7 @@ impl App {
 
     info!(url = %url, "transcript: starting chunked transcription pipeline");
 
-    let handle = transcript::spawn_transcription_pipeline(tx, url, whisper_cache, ipc_socket);
+    let handle = transcript::spawn_transcription_pipeline(tx, url, whisper_cache, ipc_socket, None);
 
     self.transcript_state = TranscriptState::ExtractingAudio { handle };
   }
