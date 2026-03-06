@@ -83,8 +83,8 @@ enum Command {
 
   /// Transcribe a video and return utterances (output as JSONL)
   Transcript {
-    /// Video ID or YouTube URL
-    video: String,
+    /// Video ID or YouTube URL (reads from stdin if omitted)
+    video: Option<String>,
     /// Disable classification, output raw utterances
     #[arg(short, long)]
     raw: bool,
@@ -181,7 +181,13 @@ async fn main() -> Result<()> {
         cli::cmd_channel(&channel, count, !fast, jobs).await
       }
       Command::Info { video } => cli::cmd_info(&video).await,
-      Command::Transcript { video, raw } => cli::cmd_transcript(&video, raw).await,
+      Command::Transcript { video, raw } => {
+        if let Some(video) = video {
+          cli::cmd_transcript(&video, raw).await
+        } else {
+          cli::cmd_transcript_stdin(raw).await
+        }
+      }
       Command::Summarize { video, latest, raw } => {
         if let Some(count) = latest {
           // --latest: treat `video` as a channel handle, default to configured channel

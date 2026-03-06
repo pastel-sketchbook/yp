@@ -200,6 +200,36 @@ pub async fn cmd_transcript(video: &str, raw: bool) -> Result<()> {
   Ok(())
 }
 
+/// Read JSONL from stdin (pipe mode), extract video_id, and transcribe.
+///
+/// Enables: `yp channel | fzf | yp transcript`
+pub async fn cmd_transcript_stdin(raw: bool) -> Result<()> {
+  use std::io::BufRead;
+
+  let stdin = std::io::stdin();
+  let line = stdin
+    .lock()
+    .lines()
+    .next()
+    .ok_or_else(|| anyhow!("No input on stdin. Provide a video ID or pipe from `yp channel | fzf`."))?
+    .context("Failed to read from stdin")?;
+
+  let trimmed = line.trim();
+  if trimmed.is_empty() {
+    return Err(anyhow!("Empty input on stdin."));
+  }
+
+  // Try parsing as JSON to extract video_id field
+  if let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed)
+    && let Some(id) = obj.get("video_id").and_then(|v| v.as_str())
+  {
+    return cmd_transcript(id, raw).await;
+  }
+
+  // Fall back: treat the whole line as a video ID or URL
+  cmd_transcript(trimmed, raw).await
+}
+
 // ---------------------------------------------------------------------------
 // Subcommand: summarize
 // ---------------------------------------------------------------------------
