@@ -1,6 +1,6 @@
 # yp
 
-A TUI YouTube player with image thumbnails, live transcription, channel browsing, and 12 themes -- all in the terminal.
+A TUI YouTube player with image thumbnails, live transcription, channel browsing, and 12 themes -- all in the terminal. Also a CLI for machines: search, browse channels, transcribe, and summarize videos as JSON for LLM pipelines.
 
 ## Features
 
@@ -12,6 +12,8 @@ A TUI YouTube player with image thumbnails, live transcription, channel browsing
 - **Filter** -- press `/` to filter results by title or tags with keyword highlighting
 - **12 themes** -- 6 dark, 5 light, cycle with `Ctrl+T`, persisted across sessions
 - **Preferences** -- theme and frame mode saved to `prefs.toml`
+- **CLI subcommands** -- JSON output for search, channel, info, transcript, summarize
+- **Pipe-first** -- `yp channel | fzf | yp summarize` composes with Unix tools and LLMs
 
 ## Dependencies
 
@@ -79,3 +81,49 @@ Preferences are stored at:
 - **Linux**: `~/.config/yp/prefs.toml`
 
 Logs are written daily to the same directory under `logs/`.
+
+## CLI
+
+All subcommands output JSON to stdout (progress/errors go to stderr). Bare `yp` with no subcommand launches the TUI.
+
+### Subcommands
+
+```bash
+# Search YouTube
+yp search "ambient guitar"
+
+# List channel videos (enriched with dates, tags, duration, views by default)
+yp channel @ChrisH-v4e
+yp channel @ChrisH-v4e --fast    # skip enrichment, titles + IDs only
+
+# Video metadata
+yp info dQw4w9WgXcQ
+
+# Transcribe a video (classify-reduce by default, --raw for full whisper output)
+yp transcript dQw4w9WgXcQ
+yp transcript dQw4w9WgXcQ --raw
+
+# Summarize: transcribe + classify + reduce to bounded JSON
+yp summarize dQw4w9WgXcQ
+yp summarize --latest              # latest from default channel
+yp summarize @TwoSetViolin --latest 3
+
+# Generate shell completions
+eval "$(yp completions zsh)"
+```
+
+### Pipe workflows
+
+```bash
+# Browse channel with fzf, summarize selection
+yp channel @ChrisH-v4e | fzf | yp summarize
+
+# Non-interactive fuzzy filter
+yp channel | fzf -f "algorithm" | yp summarize
+
+# Pipe to an LLM
+yp summarize --latest | opencode run "What is this video about?"
+
+# Classic jq pipeline
+yp channel --fast | jq -r '.video_id' | head -1 | xargs yp summarize
+```

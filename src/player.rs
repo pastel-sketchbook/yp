@@ -12,7 +12,7 @@ use tokio::{
 
 use crate::display::DisplayMode;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct VideoDetails {
   pub url: String,
   pub title: String,

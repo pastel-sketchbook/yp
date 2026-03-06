@@ -39,5 +39,5 @@
   // yt-dlp print template for listing commands.
   print_format: "%(title)s\t%(id)s\t%(upload_date>%Y-%m-%d)s\t%(tags)s",
   // yt-dlp print template for per-video metadata enrichment.
-  enrich_format: "%(id)s\t%(upload_date>%Y-%m-%d)s\t%(tags)s",
+  enrich_format: "%(id)s\t%(upload_date>%Y-%m-%d)s\t%(tags)s\t%(duration_string)s\t%(view_count)s\t%(uploader)s",
 )

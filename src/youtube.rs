@@ -373,7 +373,7 @@ pub async fn fetch_video_frames(video_id: &str) -> Result<FrameSource> {
 }
 
 /// A single entry from a search or channel listing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchEntry {
   pub title: String,
   pub video_id: String,
@@ -472,6 +472,9 @@ pub struct VideoMeta {
   pub video_id: String,
   pub upload_date: Option<String>,
   pub tags: Option<String>,
+  pub duration: Option<String>,
+  pub view_count: Option<String>,
+  pub uploader: Option<String>,
 }
 
 /// Enrich a list of video IDs with full metadata (upload_date, tags).
@@ -499,7 +502,19 @@ pub async fn enrich_video_metadata(video_ids: Vec<String>, tx: mpsc::Sender<Vide
           if !parts.is_empty() && !parts[0].is_empty() {
             let upload_date = opt_field(parts.get(1).copied());
             let tags = opt_field(parts.get(2).copied()).map(|s| clean_tags(&s)).filter(|s| !s.is_empty());
-            let _ = tx.send(VideoMeta { video_id: parts[0].trim().to_string(), upload_date, tags }).await;
+            let duration = opt_field(parts.get(3).copied());
+            let view_count = opt_field(parts.get(4).copied()).map(|s| format_view_count(&s));
+            let uploader = opt_field(parts.get(5).copied());
+            let _ = tx
+              .send(VideoMeta {
+                video_id: parts[0].trim().to_string(),
+                upload_date,
+                tags,
+                duration,
+                view_count,
+                uploader,
+              })
+              .await;
           }
         }
       }

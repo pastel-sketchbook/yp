@@ -1,10 +1,12 @@
 mod app;
+mod cli;
 mod config;
 mod constants;
 mod display;
 mod graphics;
 mod input;
 mod player;
+mod summarize;
 mod theme;
 mod transcript;
 mod ui;
@@ -12,7 +14,8 @@ mod window;
 mod youtube;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
 use ratatui::{
   DefaultTerminal,
   crossterm::event::{self, Event, KeyEventKind},
@@ -32,6 +35,67 @@ struct Args {
   /// Display mode: 'auto', 'kitty', 'sixel', 'direct', or 'ascii' (default: auto-detect)
   #[arg(short, long, default_value = "auto")]
   display_mode: CliDisplayMode,
+
+  #[command(subcommand)]
+  command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+  /// Generate shell completions for bash, zsh, fish, elvish, or powershell
+  Completions {
+    /// The shell to generate completions for
+    shell: Shell,
+  },
+
+  /// Search YouTube and return results as JSON
+  Search {
+    /// Search query
+    query: String,
+    /// Max results (default: 20)
+    #[arg(short, long, default_value_t = 20)]
+    limit: usize,
+  },
+
+  /// List videos from a YouTube channel (output as JSONL)
+  Channel {
+    /// Channel handle (@name), URL, or name (default: @ChrisH-v4e)
+    channel: Option<String>,
+    /// Max videos to list (default: 30)
+    #[arg(short, long, default_value_t = 30)]
+    limit: usize,
+    /// Skip metadata enrichment (faster, but no dates/tags/duration/views)
+    #[arg(short, long)]
+    fast: bool,
+  },
+
+  /// Fetch metadata for a specific video (output as JSON)
+  Info {
+    /// Video ID or YouTube URL
+    video: String,
+  },
+
+  /// Transcribe a video and return utterances (output as JSONL)
+  Transcript {
+    /// Video ID or YouTube URL
+    video: String,
+    /// Disable classification, output raw utterances
+    #[arg(short, long)]
+    raw: bool,
+  },
+
+  /// Transcribe + classify + reduce a video to a summary (output as JSON)
+  Summarize {
+    /// Video ID, YouTube URL, or channel handle (with --latest).
+    /// Defaults to the configured channel when used with --latest.
+    video: Option<String>,
+    /// Summarize the latest N videos from a channel (default: 1)
+    #[arg(long, num_args = 0..=1, default_missing_value = "1")]
+    latest: Option<usize>,
+    /// Output full unprocessed transcript
+    #[arg(short, long)]
+    raw: bool,
+  },
 }
 
 // --- Helpers ---
@@ -94,6 +158,37 @@ async fn main() -> Result<()> {
   }
 
   let args = Args::parse();
+
+  // Handle non-TUI subcommands before entering the terminal.
+  if let Some(command) = args.command {
+    return match command {
+      Command::Completions { shell } => {
+        let mut cmd = Args::command();
+        let bin_name = cmd.get_name().to_string();
+        generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+        Ok(())
+      }
+      Command::Search { query, limit } => cli::cmd_search(&query, limit).await,
+      Command::Channel { channel, limit, fast } => {
+        let channel = channel.unwrap_or_else(|| constants::constants().pastel_sketchbook_channel.clone());
+        cli::cmd_channel(&channel, limit, !fast).await
+      }
+      Command::Info { video } => cli::cmd_info(&video).await,
+      Command::Transcript { video, raw } => cli::cmd_transcript(&video, raw).await,
+      Command::Summarize { video, latest, raw } => {
+        if let Some(count) = latest {
+          // --latest: treat `video` as a channel handle, default to configured channel
+          let channel = video.unwrap_or_else(|| constants::constants().pastel_sketchbook_channel.clone());
+          cli::cmd_summarize_latest(&channel, count, raw).await
+        } else if let Some(video) = video {
+          cli::cmd_summarize(&video, raw).await
+        } else {
+          // No video arg and no --latest: read from stdin (pipe mode)
+          cli::cmd_summarize_stdin(raw).await
+        }
+      }
+    };
+  }
 
   let default_hook = std::panic::take_hook();
   std::panic::set_hook(Box::new(move |info| {
