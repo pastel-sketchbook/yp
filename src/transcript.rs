@@ -317,28 +317,36 @@ pub fn spawn_transcription_pipeline(
         .spawn();
 
       // Timeout: if ffmpeg hangs (e.g. seeking past end of an HTTP stream),
-      // kill it and treat as end-of-stream. 15s is generous for a CDN chunk.
-      let ffmpeg_timeout = std::time::Duration::from_secs(15);
+      // kill it and treat as end-of-stream. 90s is generous — most CDN chunks
+      // download in <5s, but slow connections or first-chunk setup can be slow.
+      let ffmpeg_timeout = std::time::Duration::from_secs(90);
+      let ffmpeg_start = std::time::Instant::now();
 
       match ffmpeg_spawn {
-        Ok(mut child) => match tokio::time::timeout(ffmpeg_timeout, child.wait()).await {
-          Ok(Ok(status)) if status.success() => {}
-          Ok(Ok(status)) => {
-            // Non-zero exit likely means we've gone past the end of the stream
-            info!(offset = offset_secs, code = ?status.code(), "transcript: ffmpeg exited non-zero, assuming end of stream");
-            break;
+        Ok(mut child) => {
+          info!(offset = offset_secs, pid = ?child.id(), "transcript: ffmpeg spawned, waiting");
+          match tokio::time::timeout(ffmpeg_timeout, child.wait()).await {
+            Ok(Ok(status)) if status.success() => {
+              info!(offset = offset_secs, elapsed = ?ffmpeg_start.elapsed(), "transcript: ffmpeg chunk downloaded");
+            }
+            Ok(Ok(status)) => {
+              // Non-zero exit likely means we've gone past the end of the stream
+              info!(offset = offset_secs, code = ?status.code(), elapsed = ?ffmpeg_start.elapsed(), "transcript: ffmpeg exited non-zero, assuming end of stream");
+              break;
+            }
+            Ok(Err(e)) => {
+              warn!(offset = offset_secs, err = %e, elapsed = ?ffmpeg_start.elapsed(), "transcript: ffmpeg wait failed");
+              let _ = tx.send(TranscriptEvent::Failed(format!("Failed to wait for ffmpeg: {}", e)));
+              return;
+            }
+            Err(_) => {
+              // Timeout — ffmpeg hung, likely past end of stream on an HTTP URL
+              warn!(offset = offset_secs, timeout = ?ffmpeg_timeout, elapsed = ?ffmpeg_start.elapsed(), "transcript: ffmpeg timed out, assuming end of stream");
+              let _ = child.kill().await;
+              break;
+            }
           }
-          Ok(Err(e)) => {
-            let _ = tx.send(TranscriptEvent::Failed(format!("Failed to wait for ffmpeg: {}", e)));
-            return;
-          }
-          Err(_) => {
-            // Timeout — ffmpeg hung, likely past end of stream on an HTTP URL
-            info!(offset = offset_secs, timeout = ?ffmpeg_timeout, "transcript: ffmpeg timed out, assuming end of stream");
-            let _ = child.kill().await;
-            break;
-          }
-        },
+        }
         Err(e) => {
           let msg = if e.kind() == std::io::ErrorKind::NotFound {
             "ffmpeg not found. Install with: brew install ffmpeg".to_string()
@@ -355,6 +363,7 @@ pub fn spawn_transcription_pipeline(
       // to panic with GenericError(-3).
       let min_chunk_bytes = constants().min_chunk_bytes;
       let chunk_size = std::fs::metadata(&chunk_path).map(|m| m.len()).unwrap_or(0);
+      info!(offset = offset_secs, chunk_size, min_chunk_bytes, "transcript: chunk file size check");
       if chunk_size <= 44 {
         info!(offset = offset_secs, "transcript: chunk has no audio data, end of stream");
         break;

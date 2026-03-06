@@ -543,9 +543,7 @@ pub async fn list_channel_videos(channel_url: &str, start: usize, count: Option<
 
   args.extend(["--no-warnings", "--ignore-errors", "--", channel_url]);
 
-  let output = run_yt_dlp(&args, "channel listing")
-    .await
-    .context("Failed to run yt-dlp for channel listing")?;
+  let output = run_yt_dlp(&args, "channel listing").await.context("Failed to run yt-dlp for channel listing")?;
 
   if !output.status.success() {
     return Err(anyhow!("yt-dlp channel listing failed: {}", String::from_utf8_lossy(&output.stderr)));
