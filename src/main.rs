@@ -1,4 +1,5 @@
 mod app;
+mod cache;
 mod cli;
 mod config;
 mod constants;
@@ -102,6 +103,14 @@ enum Command {
     #[arg(short, long)]
     raw: bool,
   },
+
+  /// Output cached video IDs for shell completion (hidden)
+  #[command(name = "_complete-ids", hide = true)]
+  CompleteIds {
+    /// Fetch from default channel if cache is empty
+    #[arg(long)]
+    live: bool,
+  },
 }
 
 // --- Helpers ---
@@ -169,9 +178,14 @@ async fn main() -> Result<()> {
   if let Some(command) = args.command {
     return match command {
       Command::Completions { shell } => {
-        let mut cmd = Args::command();
-        let bin_name = cmd.get_name().to_string();
-        generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+        if shell == Shell::Zsh {
+          // Custom zsh completion with dynamic video ID support.
+          cli::generate_zsh_completions();
+        } else {
+          let mut cmd = Args::command();
+          let bin_name = cmd.get_name().to_string();
+          generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+        }
         Ok(())
       }
       Command::Search { query, limit } => cli::cmd_search(&query, limit).await,
@@ -200,6 +214,7 @@ async fn main() -> Result<()> {
           cli::cmd_summarize_stdin(raw).await
         }
       }
+      Command::CompleteIds { live } => cli::cmd_complete_ids(live).await,
     };
   }
 

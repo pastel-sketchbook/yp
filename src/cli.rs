@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::mpsc;
 
+use crate::cache;
 use crate::summarize;
 use crate::transcript::TranscriptEvent;
 use crate::youtube;
@@ -57,6 +58,99 @@ fn print_json_error(error_code: &str, message: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Shell completions
+// ---------------------------------------------------------------------------
+
+/// Generate a custom zsh completion script with dynamic video ID support.
+///
+/// For the `info`, `transcript`, and `summarize` subcommands, the `video`
+/// positional argument is completed by calling `yp _complete-ids` which reads
+/// from the local cache (populated by `channel`, `search`, and `info`).
+pub fn generate_zsh_completions() {
+  print!(
+    r##"#compdef yp
+
+_yp_video_ids() {{
+  local -a ids
+  ids=(${{(f)"$(yp _complete-ids 2>/dev/null)"}})
+  _describe 'video' ids
+}}
+
+_yp() {{
+  local -a commands
+  commands=(
+    'completions:Generate shell completions'
+    'search:Search YouTube and return results as JSON'
+    'channel:List videos from a YouTube channel (JSONL)'
+    'info:Fetch metadata for a specific video (JSON)'
+    'transcript:Transcribe a video (JSONL)'
+    'summarize:Transcribe + classify + reduce to a summary (JSON)'
+  )
+
+  _arguments -C \
+    '-d+[Display mode]:mode:(auto kitty sixel direct ascii)' \
+    '--display-mode+[Display mode]:mode:(auto kitty sixel direct ascii)' \
+    '-h[Show help]' \
+    '--help[Show help]' \
+    '-V[Show version]' \
+    '--version[Show version]' \
+    '1:command:->cmd' \
+    '*::arg:->args'
+
+  case $state in
+    cmd)
+      _describe 'command' commands
+      ;;
+    args)
+      case $words[1] in
+        completions)
+          _arguments '1:shell:(bash zsh fish elvish powershell)'
+          ;;
+        search)
+          _arguments \
+            '1:query:' \
+            '-l+[Max results]:limit:' \
+            '--limit+[Max results]:limit:'
+          ;;
+        channel)
+          _arguments \
+            '1::channel:' \
+            '-l+[Max videos]:limit:' \
+            '--limit+[Max videos]:limit:' \
+            '-a[Fetch all videos]' \
+            '--all[Fetch all videos]' \
+            '-e[Enrich with tags]' \
+            '--enrich[Enrich with tags]' \
+            '-j+[Concurrent jobs]:jobs:' \
+            '--jobs+[Concurrent jobs]:jobs:'
+          ;;
+        info)
+          _arguments '1:video:_yp_video_ids'
+          ;;
+        transcript)
+          _arguments \
+            '1::video:_yp_video_ids' \
+            '-r[Output raw utterances]' \
+            '--raw[Output raw utterances]'
+          ;;
+        summarize)
+          _arguments \
+            '1::video:_yp_video_ids' \
+            '--latest+[Summarize latest N from channel]:count:' \
+            '-r[Output raw transcript]' \
+            '--raw[Output raw transcript]'
+          ;;
+      esac
+      ;;
+  esac
+}}
+
+_yp "$@"
+"##
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Subcommand: search
 // ---------------------------------------------------------------------------
 
@@ -65,6 +159,12 @@ pub async fn cmd_search(query: &str, limit: usize) -> Result<()> {
   eprintln!("Searching YouTube for: {}", query);
   let mut results = youtube::search_youtube(query).await.context("YouTube search failed")?;
   results.truncate(limit);
+
+  // Cache video IDs for shell completion.
+  let cache_pairs: Vec<(&str, &str)> = results.iter().map(|e| (e.video_id.as_str(), e.title.as_str())).collect();
+  if let Err(e) = cache::append_videos(&cache_pairs) {
+    tracing::warn!("Failed to update video cache: {}", e);
+  }
 
   let json = serde_json::to_string_pretty(&results).context("Failed to serialize search results")?;
   println!("{}", json);
@@ -148,6 +248,12 @@ pub async fn cmd_channel(channel: &str, count: Option<usize>, enrich: bool, jobs
   let entries = youtube::list_channel_videos(&channel_url, 1, count).await.context("Failed to list channel videos")?;
   eprintln!("Found {} videos", entries.len());
 
+  // Cache video IDs for shell completion.
+  let cache_pairs: Vec<(&str, &str)> = entries.iter().map(|e| (e.video_id.as_str(), e.title.as_str())).collect();
+  if let Err(e) = cache::append_videos(&cache_pairs) {
+    tracing::warn!("Failed to update video cache: {}", e);
+  }
+
   if enrich && !entries.is_empty() {
     eprintln!("Enriching {} videos with metadata ({} concurrent)...", entries.len(), jobs);
 
@@ -197,6 +303,11 @@ pub async fn cmd_info(video: &str) -> Result<()> {
   eprintln!("Fetching info for video: {}", video_id);
 
   let details = youtube::get_video_info(&video_id).await.context("Failed to get video info")?;
+
+  // Cache video ID for shell completion.
+  if let Err(e) = cache::append_videos(&[(&video_id, &details.title)]) {
+    tracing::warn!("Failed to update video cache: {}", e);
+  }
 
   let mut obj = serde_json::to_value(&details).context("Failed to serialize video details")?;
   obj["video_id"] = serde_json::Value::String(video_id);
@@ -484,6 +595,46 @@ async fn run_transcription(url: &str, duration_hint: Option<u32>) -> Result<Vec<
 
   let _ = handle.await;
   Ok(all_utterances)
+}
+
+// ---------------------------------------------------------------------------
+// Subcommand: _complete-ids (hidden, for shell completions)
+// ---------------------------------------------------------------------------
+
+/// Output cached video IDs for shell completion.
+///
+/// If the cache is empty and `live` is true, fetches videos from the default
+/// channel to seed the cache before outputting.
+///
+/// Output format: one `video_id\ttitle` line per entry (zsh `_describe` format).
+pub async fn cmd_complete_ids(live: bool) -> Result<()> {
+  use std::io::Write;
+
+  let mut entries = cache::read_videos();
+
+  // Live fallback: seed from default channel if cache is empty.
+  if entries.is_empty() && live {
+    let constants = crate::constants::constants();
+    let channel = &constants.pastel_sketchbook_channel;
+    if let Some(url) = youtube::detect_channel_url(channel)
+      && let Ok(videos) = youtube::list_channel_videos(&url, 1, Some(30)).await
+    {
+      let pairs: Vec<(&str, &str)> = videos.iter().map(|e| (e.video_id.as_str(), e.title.as_str())).collect();
+      let _ = cache::append_videos(&pairs);
+      entries = videos.into_iter().map(|e| (e.video_id, e.title)).collect();
+    }
+  }
+
+  let stdout = std::io::stdout();
+  let mut lock = stdout.lock();
+  for (id, title) in entries.iter().rev() {
+    // Escape colons in title (zsh _describe uses colon as delimiter).
+    let escaped = title.replace('\\', "\\\\").replace(':', "\\:");
+    writeln!(lock, "{}:{}", id, escaped).context("Failed to write completion entry")?;
+  }
+  lock.flush().context("Failed to flush completion output")?;
+
+  Ok(())
 }
 
 // ---------------------------------------------------------------------------
