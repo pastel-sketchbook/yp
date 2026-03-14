@@ -128,7 +128,43 @@ pub const THEMES: &[Theme] = &[
     tag: Color::Rgb(150, 180, 210),
     panel_bg: Color::Rgb(28, 28, 28),
   },
+  // FFE Dark (Fuzzy Find Everything)
+  Theme {
+    name: "FFE",
+    bg: Color::Rgb(30, 35, 43),              // #1e232b background
+    fg: Color::Rgb(216, 222, 233),           // #d8dee9 text
+    accent: Color::Rgb(161, 239, 211),       // #a1efd3 green accent
+    muted: Color::Rgb(108, 112, 134),        // #6c7086 comment/muted
+    border: Color::Rgb(59, 66, 82),          // #3b4252 border
+    error: Color::Rgb(255, 117, 127),        // #ff757f red
+    status: Color::Rgb(79, 214, 190),        // #4fd6be cyan
+    highlight_bg: Color::Rgb(46, 52, 64),    // #2e3440 element.hover
+    highlight_fg: Color::Rgb(240, 169, 136), // #f0a988 orange
+    stripe_bg: Color::Rgb(26, 31, 39),       // #1a1f27 surface
+    key_bg: Color::Rgb(59, 66, 82),          // #3b4252
+    key_fg: Color::Rgb(216, 222, 233),       // #d8dee9
+    tag: Color::Rgb(137, 220, 235),          // #89dceb blue
+    panel_bg: Color::Rgb(26, 31, 39),        // #1a1f27 panel
+  },
   // --- Light themes ---
+  // FFE Light (Fuzzy Find Everything)
+  Theme {
+    name: "FFE Light",
+    bg: Color::Rgb(232, 236, 240),           // #e8ecf0 background
+    fg: Color::Rgb(30, 35, 43),              // #1e232b text
+    accent: Color::Rgb(26, 138, 110),        // #1a8a6e green accent
+    muted: Color::Rgb(124, 132, 150),        // #7c8496 muted
+    border: Color::Rgb(201, 205, 214),       // #c9cdd6 border
+    error: Color::Rgb(201, 67, 78),          // #c9434e red
+    status: Color::Rgb(42, 157, 132),        // #2a9d84 cyan
+    highlight_bg: Color::Rgb(221, 225, 232), // #dde1e8 element.hover
+    highlight_fg: Color::Rgb(192, 121, 32),  // #c07920 orange
+    stripe_bg: Color::Rgb(245, 247, 250),    // #f5f7fa surface
+    key_bg: Color::Rgb(201, 205, 214),       // #c9cdd6
+    key_fg: Color::Rgb(30, 35, 43),          // #1e232b
+    tag: Color::Rgb(58, 142, 164),           // #3a8ea4 blue
+    panel_bg: Color::Rgb(245, 247, 250),     // #f5f7fa panel
+  },
   // Gruvbox Light
   Theme {
     name: "Gruvbox Light",
