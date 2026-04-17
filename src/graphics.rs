@@ -12,6 +12,32 @@ use std::io::{Cursor, Write};
 
 use crate::display::DisplayMode;
 
+/// Returns `true` when running inside a tmux session.
+fn in_tmux() -> bool {
+  std::env::var("TMUX").is_ok()
+}
+
+/// Wrap a raw escape sequence for tmux passthrough.
+///
+/// Inside tmux, Kitty graphics APC sequences are swallowed by the
+/// intermediate terminal multiplexer. The DCS passthrough mechanism
+/// (`\x1BPtmux;...\x1B\\`) forwards them to the outer terminal.
+/// Inner `\x1B` bytes must be doubled (`\x1B\x1B`).
+fn tmux_wrap(seq: &str) -> String {
+  let escaped = seq.replace('\x1B', "\x1B\x1B");
+  format!("\x1BPtmux;{}\x1B\\", escaped)
+}
+
+/// Write an escape sequence to stdout, wrapping in tmux passthrough if needed.
+fn write_esc(stdout: &mut impl Write, seq: &str) -> Result<()> {
+  if in_tmux() {
+    write!(stdout, "{}", tmux_wrap(seq)).context("Failed to write tmux-wrapped escape")?;
+  } else {
+    write!(stdout, "{}", seq).context("Failed to write escape")?;
+  }
+  Ok(())
+}
+
 // --- Thumbnail Widget ---
 
 pub struct ThumbnailWidget<'a> {
@@ -109,7 +135,7 @@ const KITTY_CHUNK_SIZE: usize = 4096;
 /// Use this when leaving the player view or clearing the thumbnail area.
 pub fn kitty_delete_placement() -> Result<()> {
   let mut stdout = std::io::stdout();
-  write!(stdout, "\x1B_Ga=d,d=i,i=1,q=2\x1B\\").context("Failed to write kitty delete placement")?;
+  write_esc(&mut stdout, "\x1B_Ga=d,d=i,i=1,q=2\x1B\\")?;
   stdout.flush().context("Failed to flush kitty delete placement")?;
   Ok(())
 }
@@ -117,7 +143,7 @@ pub fn kitty_delete_placement() -> Result<()> {
 /// Delete all Kitty images currently displayed (used on app exit).
 pub fn kitty_delete_all() -> Result<()> {
   let mut stdout = std::io::stdout();
-  write!(stdout, "\x1B_Ga=d,d=a,q=2\x1B\\").context("Failed to write kitty delete all")?;
+  write_esc(&mut stdout, "\x1B_Ga=d,d=a,q=2\x1B\\")?;
   stdout.flush().context("Failed to flush kitty delete")?;
   Ok(())
 }
@@ -143,6 +169,7 @@ pub fn kitty_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
 
   let mut stdout = std::io::stdout();
 
+  // Cursor positioning is a standard CSI sequence — no passthrough needed.
   write!(stdout, "\x1B[{};{}H", area.y.saturating_add(1), area.x.saturating_add(1))
     .context("Failed to position cursor for kitty image")?;
 
@@ -151,10 +178,11 @@ pub fn kitty_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
     let more = if i < last { 1 } else { 0 };
 
     if i == 0 {
-      write!(stdout, "\x1B_Ga=T,f=100,t=d,i=1,p=1,c={},r={},q=2,m={};{}\x1B\\", area.width, area.height, more, data)
-        .context("Failed to write kitty image header chunk")?;
+      let seq = format!("\x1B_Ga=T,f=100,t=d,i=1,p=1,c={},r={},q=2,m={};{}\x1B\\", area.width, area.height, more, data);
+      write_esc(&mut stdout, &seq)?;
     } else {
-      write!(stdout, "\x1B_Gm={};{}\x1B\\", more, data).context("Failed to write kitty image continuation chunk")?;
+      let seq = format!("\x1B_Gm={};{}\x1B\\", more, data);
+      write_esc(&mut stdout, &seq)?;
     }
   }
 
