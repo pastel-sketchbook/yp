@@ -100,26 +100,20 @@ fn handle_input_key(app: &mut App, key: event::KeyEvent) {
       app.input.insert(byte_idx, c);
       app.cursor_position += 1;
     }
-    KeyCode::Backspace => {
-      if app.cursor_position > 0 {
-        app.cursor_position -= 1;
-        let byte_idx = char_to_byte_index(&app.input, app.cursor_position);
-        app.input.remove(byte_idx);
-      }
+    KeyCode::Backspace if app.cursor_position > 0 => {
+      app.cursor_position -= 1;
+      let byte_idx = char_to_byte_index(&app.input, app.cursor_position);
+      app.input.remove(byte_idx);
     }
-    KeyCode::Delete => {
-      if app.cursor_position < app.input.chars().count() {
-        let byte_idx = char_to_byte_index(&app.input, app.cursor_position);
-        app.input.remove(byte_idx);
-      }
+    KeyCode::Delete if app.cursor_position < app.input.chars().count() => {
+      let byte_idx = char_to_byte_index(&app.input, app.cursor_position);
+      app.input.remove(byte_idx);
     }
     KeyCode::Left => {
       app.cursor_position = app.cursor_position.saturating_sub(1);
     }
-    KeyCode::Right => {
-      if app.cursor_position < app.input.chars().count() {
-        app.cursor_position += 1;
-      }
+    KeyCode::Right if app.cursor_position < app.input.chars().count() => {
+      app.cursor_position += 1;
     }
     KeyCode::Home => {
       app.cursor_position = 0;
@@ -138,10 +132,8 @@ fn handle_input_key(app: &mut App, key: event::KeyEvent) {
         app.should_quit = true;
       }
     }
-    KeyCode::Down => {
-      if !app.search_results.is_empty() {
-        app.mode = AppMode::Results;
-      }
+    KeyCode::Down if !app.search_results.is_empty() => {
+      app.mode = AppMode::Results;
     }
     _ => {}
   }
@@ -199,28 +191,22 @@ async fn handle_filter_key(app: &mut App, key: event::KeyEvent) -> Result<()> {
       app.filter_cursor += 1;
       app.recompute_filter();
     }
-    KeyCode::Backspace => {
-      if app.filter_cursor > 0 {
-        app.filter_cursor -= 1;
-        let byte_idx = char_to_byte_index(&app.filter, app.filter_cursor);
-        app.filter.remove(byte_idx);
-        app.recompute_filter();
-      }
+    KeyCode::Backspace if app.filter_cursor > 0 => {
+      app.filter_cursor -= 1;
+      let byte_idx = char_to_byte_index(&app.filter, app.filter_cursor);
+      app.filter.remove(byte_idx);
+      app.recompute_filter();
     }
-    KeyCode::Delete => {
-      if app.filter_cursor < app.filter.chars().count() {
-        let byte_idx = char_to_byte_index(&app.filter, app.filter_cursor);
-        app.filter.remove(byte_idx);
-        app.recompute_filter();
-      }
+    KeyCode::Delete if app.filter_cursor < app.filter.chars().count() => {
+      let byte_idx = char_to_byte_index(&app.filter, app.filter_cursor);
+      app.filter.remove(byte_idx);
+      app.recompute_filter();
     }
     KeyCode::Left => {
       app.filter_cursor = app.filter_cursor.saturating_sub(1);
     }
-    KeyCode::Right => {
-      if app.filter_cursor < app.filter.chars().count() {
-        app.filter_cursor += 1;
-      }
+    KeyCode::Right if app.filter_cursor < app.filter.chars().count() => {
+      app.filter_cursor += 1;
     }
     KeyCode::Home => {
       app.filter_cursor = 0;

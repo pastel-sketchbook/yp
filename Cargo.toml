@@ -1,7 +1,8 @@
 [package]
 name = "yp"
-version = "0.10.3"
+version = "0.10.4"
 edition = "2024"
+rust-version = "1.95.0"
 
 [dependencies]
 anyhow = "1.0.102"

@@ -20,7 +20,11 @@ use crate::transcript::TranscriptState;
 /// Non-RGB colors are returned as-is.
 fn dim_color(color: Color, factor: f32) -> Color {
   match color {
-    Color::Rgb(r, g, b) => Color::Rgb((r as f32 * factor) as u8, (g as f32 * factor) as u8, (b as f32 * factor) as u8),
+    Color::Rgb(r, g, b) => Color::Rgb(
+      (r as f32 * factor).clamp(0.0, 255.0) as u8,
+      (g as f32 * factor).clamp(0.0, 255.0) as u8,
+      (b as f32 * factor).clamp(0.0, 255.0) as u8,
+    ),
     other => other,
   }
 }
