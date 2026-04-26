@@ -1,7 +1,7 @@
 //! Transcript classify-reduce pipeline.
 //!
 //! Takes raw whisper utterances and produces a structured summary:
-//! 1. **Classify** — tag each utterance (NonSpeech, Filler, Repetition, TopicShift, KeySegment, Normal)
+//! 1. **Classify** — tag each utterance (`NonSpeech`, Filler, Repetition, `TopicShift`, `KeySegment`, Normal)
 //! 2. **Filter** — suppress noise (non-speech, filler, repetition)
 //! 3. **Reduce** — compress into bounded topics + key segments
 
@@ -107,6 +107,7 @@ fn normalize(text: &str) -> String {
 }
 
 /// Compute word-level similarity between two normalized strings (Jaccard index).
+#[allow(clippy::cast_precision_loss)]
 fn word_similarity(a: &str, b: &str) -> f64 {
   let set_a: std::collections::HashSet<&str> = a.split_whitespace().collect();
   let set_b: std::collections::HashSet<&str> = b.split_whitespace().collect();
@@ -133,6 +134,7 @@ fn is_non_speech(text: &str) -> bool {
 }
 
 /// Check if >50% of words are filler tokens.
+#[allow(clippy::cast_precision_loss)]
 fn is_filler(normalized: &str) -> bool {
   let words: Vec<&str> = normalized.split_whitespace().collect();
   if words.is_empty() {
@@ -163,6 +165,7 @@ fn is_filler(normalized: &str) -> bool {
 ///
 /// `utterances` should be `(start_centiseconds, stop_centiseconds, text)` triples
 /// as produced by `whisper_cli::Utternace`.
+#[allow(clippy::cast_precision_loss)]
 pub fn classify(utterances: &[(i64, i64, String)]) -> Vec<ClassifiedUtterance> {
   // Sliding window of recent normalized forms for repetition detection.
   let mut recent_window: Vec<String> = Vec::with_capacity(10);
@@ -288,10 +291,11 @@ const MAX_KEY_SEGMENTS: usize = 50;
 
 /// Reduce classified utterances into a bounded summary.
 ///
-/// - Suppresses NonSpeech, Filler, and Repetition
-/// - Groups utterances into topic segments (split at TopicShift boundaries)
+/// - Suppresses `NonSpeech`, Filler, and Repetition
+/// - Groups utterances into topic segments (split at `TopicShift` boundaries)
 /// - Extracts key segments
-/// - Caps output to MAX_TOPICS topics and MAX_KEY_SEGMENTS key moments
+/// - Caps output to `MAX_TOPICS` topics and `MAX_KEY_SEGMENTS` key moments
+#[allow(clippy::cast_precision_loss)]
 pub fn reduce(video: &VideoDetails, classified: &[ClassifiedUtterance]) -> SummaryOutput {
   let total_utterances = classified.len() as u64;
 
@@ -322,7 +326,7 @@ pub fn reduce(video: &VideoDetails, classified: &[ClassifiedUtterance]) -> Summa
   let time_range = if classified.is_empty() {
     (0.0, 0.0)
   } else {
-    (classified.first().map(|u| u.start).unwrap_or(0.0), classified.last().map(|u| u.end).unwrap_or(0.0))
+    (classified.first().map_or(0.0, |u| u.start), classified.last().map_or(0.0, |u| u.end))
   };
 
   // Build topic segments: split at TopicShift boundaries
@@ -390,8 +394,7 @@ pub fn reduce(video: &VideoDetails, classified: &[ClassifiedUtterance]) -> Summa
 
   let hint = format!(
     "YouTube video transcript summary. Summarize mode: filler, music, silence, and repeated utterances suppressed. \
-     {} of {} utterances omitted. Full transcript available with --raw.",
-    suppressed, total_utterances
+     {suppressed} of {total_utterances} utterances omitted. Full transcript available with --raw."
   );
 
   SummaryOutput {

@@ -53,7 +53,7 @@ enum Command {
     shell: Shell,
   },
 
-  /// Search YouTube and return results as JSON
+  /// Search `YouTube` and return results as JSON
   Search {
     /// Search query
     query: String,
@@ -62,7 +62,7 @@ enum Command {
     limit: usize,
   },
 
-  /// List videos from a YouTube channel (output as JSONL)
+  /// List videos from a `YouTube` channel (output as JSONL)
   Channel {
     /// Channel handle (@name), URL, or name (default: @ChrisH-v4e)
     channel: Option<String>,
@@ -82,13 +82,13 @@ enum Command {
 
   /// Fetch metadata for a specific video (output as JSON)
   Info {
-    /// Video ID or YouTube URL
+    /// Video ID or `YouTube` URL
     video: String,
   },
 
   /// Transcribe a video and return utterances (output as JSONL)
   Transcript {
-    /// Video ID or YouTube URL (reads from stdin if omitted)
+    /// Video ID or `YouTube` URL (reads from stdin if omitted)
     video: Option<String>,
     /// Disable classification, output raw utterances
     #[arg(short, long)]
@@ -97,7 +97,7 @@ enum Command {
 
   /// Transcribe + classify + reduce a video to a summary (output as JSON)
   Summarize {
-    /// Video ID, YouTube URL, or channel handle (with --latest).
+    /// Video ID, `YouTube` URL, or channel handle (with --latest).
     /// Defaults to the configured channel when used with --latest.
     video: Option<String>,
     /// Summarize the latest N videos from a channel (default: 1)
@@ -122,6 +122,7 @@ enum Command {
 /// Parse the time position (in seconds) from an mpv status string.
 ///
 /// Expects format: `Time: MM:SS / ... ` or `Time: H:MM:SS / ...`
+#[must_use]
 pub fn parse_mpv_time_secs(status: &str) -> Option<f64> {
   let time_part = status.strip_prefix("Time: ")?.split(" / ").next()?.trim();
   let parts: Vec<&str> = time_part.split(':').collect();
@@ -147,8 +148,7 @@ pub fn parse_mpv_time_secs(status: &str) -> Option<f64> {
 async fn main() -> Result<()> {
   // --- Daily file logging ---
   let log_dir = directories::BaseDirs::new()
-    .map(|d| d.data_dir().join("yp/logs"))
-    .unwrap_or_else(|| std::path::PathBuf::from("/tmp/yp/logs"));
+    .map_or_else(|| std::path::PathBuf::from("/tmp/yp/logs"), |d| d.data_dir().join("yp/logs"));
   let file_appender = tracing_appender::rolling::daily(&log_dir, "yp.log");
   let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
   tracing_subscriber::fmt()

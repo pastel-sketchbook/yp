@@ -16,6 +16,7 @@ pub fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
 
 // --- Event Handling ---
 
+#[allow(clippy::too_many_lines)]
 pub async fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()> {
   if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
     app.should_quit = true;
@@ -67,7 +68,7 @@ pub async fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()>
           });
         }
         Err(e) => {
-          app.set_error(format!("Failed to open browser: {}", e));
+          app.set_error(format!("Failed to open browser: {e}"));
         }
       }
     }
@@ -136,7 +137,7 @@ pub async fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()>
   match app.mode {
     AppMode::Input => handle_input_key(app, key),
     AppMode::Results => handle_results_key(app, key).await.context("Failed to handle results key event")?,
-    AppMode::Filter => handle_filter_key(app, key).await.context("Failed to handle filter key event")?,
+    AppMode::Filter => handle_filter_key(app, key).context("Failed to handle filter key event")?,
   }
   Ok(())
 }
@@ -200,7 +201,7 @@ async fn handle_results_key(app: &mut App, key: event::KeyEvent) -> Result<()> {
       if app.player.is_playing()
         && let Err(e) = app.player.toggle_pause().await
       {
-        app.set_error(format!("Pause error: {}", e));
+        app.set_error(format!("Pause error: {e}"));
       }
     }
     KeyCode::Char('/') => {
@@ -235,7 +236,8 @@ async fn handle_results_key(app: &mut App, key: event::KeyEvent) -> Result<()> {
   Ok(())
 }
 
-async fn handle_filter_key(app: &mut App, key: event::KeyEvent) -> Result<()> {
+#[allow(clippy::unnecessary_wraps)]
+fn handle_filter_key(app: &mut App, key: event::KeyEvent) -> Result<()> {
   match key.code {
     KeyCode::Char(c) => {
       let byte_idx = char_to_byte_index(&app.filter, app.filter_cursor);

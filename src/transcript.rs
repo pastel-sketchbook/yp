@@ -42,7 +42,7 @@ pub enum TranscriptState {
   Ready,
 }
 
-/// Resolve a direct CDN stream URL for the given YouTube video.
+/// Resolve a direct CDN stream URL for the given `YouTube` video.
 ///
 /// Fast path: query mpv's IPC socket for `stream-open-filename` (~0.5-4s).
 /// Fallback: use `yt-dlp -g --format bestaudio` to resolve the URL (~10-30s).
@@ -78,13 +78,10 @@ pub async fn resolve_stream_url(ipc_socket: Option<&str>, youtube_url: &str) -> 
       let mut found_response = false;
 
       for _ in 0..20 {
-        let line = match tokio::time::timeout(Duration::from_secs(3), lines.next_line()).await {
-          Ok(Ok(Some(line))) => line,
-          _ => break,
-        };
+        let Ok(Ok(Some(line))) = tokio::time::timeout(Duration::from_secs(3), lines.next_line()).await else { break };
 
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line)
-          && val.get("request_id").and_then(|v| v.as_i64()) == Some(1)
+          && val.get("request_id").and_then(serde_json::Value::as_i64) == Some(1)
         {
           found_response = true;
           if val.get("error").and_then(|v| v.as_str()) == Some("success")
@@ -119,7 +116,7 @@ pub async fn resolve_stream_url(ipc_socket: Option<&str>, youtube_url: &str) -> 
       if e.kind() == std::io::ErrorKind::NotFound {
         anyhow::anyhow!("yt-dlp not found. Install with: brew install yt-dlp")
       } else {
-        anyhow::anyhow!("Failed to start yt-dlp: {}", e)
+        anyhow::anyhow!("Failed to start yt-dlp: {e}")
       }
     })?;
 
@@ -234,6 +231,7 @@ impl Drop for SuppressStdio {
 /// 1. Resolve CDN stream URL (mpv IPC fast path, or yt-dlp fallback)
 /// 2. Download whisper model if needed
 /// 3. Loop: download 30s chunk via ffmpeg → transcribe → send utterances → next chunk
+#[allow(clippy::too_many_lines)]
 pub fn spawn_transcription_pipeline(
   tx: mpsc::UnboundedSender<TranscriptEvent>,
   url: String,
@@ -250,7 +248,7 @@ pub fn spawn_transcription_pipeline(
       }
       Err(e) => {
         tracing::error!(err = %e, "transcript: failed to resolve stream URL");
-        let _ = tx.send(TranscriptEvent::Failed(format!("{:#}", e)));
+        let _ = tx.send(TranscriptEvent::Failed(format!("{e:#}")));
         return;
       }
     };
@@ -263,7 +261,7 @@ pub fn spawn_transcription_pipeline(
     if !model_path.exists() {
       info!("transcript: whisper model not found, downloading");
       if let Err(e) = download_whisper_model(&tx, &model_path).await {
-        let _ = tx.send(TranscriptEvent::Failed(format!("Model download failed: {:#}", e)));
+        let _ = tx.send(TranscriptEvent::Failed(format!("Model download failed: {e:#}")));
         return;
       }
     }
@@ -336,7 +334,7 @@ pub fn spawn_transcription_pipeline(
             }
             Ok(Err(e)) => {
               warn!(offset = offset_secs, err = %e, elapsed = ?ffmpeg_start.elapsed(), "transcript: ffmpeg wait failed");
-              let _ = tx.send(TranscriptEvent::Failed(format!("Failed to wait for ffmpeg: {}", e)));
+              let _ = tx.send(TranscriptEvent::Failed(format!("Failed to wait for ffmpeg: {e}")));
               return;
             }
             Err(_) => {
@@ -351,7 +349,7 @@ pub fn spawn_transcription_pipeline(
           let msg = if e.kind() == std::io::ErrorKind::NotFound {
             "ffmpeg not found. Install with: brew install ffmpeg".to_string()
           } else {
-            format!("Failed to start ffmpeg: {}", e)
+            format!("Failed to start ffmpeg: {e}")
           };
           let _ = tx.send(TranscriptEvent::Failed(msg));
           return;
@@ -362,7 +360,7 @@ pub fn spawn_transcription_pipeline(
       // Also skip very short chunks (<32KB ≈ <1s of 16kHz mono 16-bit) that cause whisper
       // to panic with GenericError(-3).
       let min_chunk_bytes = constants().min_chunk_bytes;
-      let chunk_size = std::fs::metadata(&chunk_path).map(|m| m.len()).unwrap_or(0);
+      let chunk_size = std::fs::metadata(&chunk_path).map_or(0, |m| m.len());
       info!(offset = offset_secs, chunk_size, min_chunk_bytes, "transcript: chunk file size check");
       if chunk_size <= 44 {
         info!(offset = offset_secs, "transcript: chunk has no audio data, end of stream");
@@ -407,7 +405,7 @@ pub fn spawn_transcription_pipeline(
 
         // Adjust timestamps: whisper returns times relative to chunk start,
         // we need them relative to the full track.
-        let offset_cs = (chunk_offset as i64) * 100; // centiseconds
+        let offset_cs = i64::from(chunk_offset) * 100; // centiseconds
         let mut utterances = transcript.utterances;
         for u in &mut utterances {
           u.start = u.start.saturating_add(offset_cs);

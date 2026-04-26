@@ -30,7 +30,7 @@ pub type LoadResult = (String, VideoDetails, Option<DynamicImage>);
 pub enum FrameMode {
   /// Static thumbnail only (no extra work).
   Thumbnail,
-  /// YouTube storyboard sprite sheets (low-res 320x180, fast, no ffmpeg).
+  /// `YouTube` storyboard sprite sheets (low-res 320x180, fast, no ffmpeg).
   Storyboard,
   /// ffmpeg frame extraction (640x360, progressive, requires ffmpeg).
   Video,
@@ -115,6 +115,7 @@ pub(crate) struct AsyncTasks {
   pub(crate) wiki_raw_rx: Option<oneshot::Receiver<Result<Option<String>>>>,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
   pub input: String,
   pub cursor_position: usize,
@@ -157,11 +158,11 @@ pub struct App {
   whisper_cache: Arc<StdMutex<Option<whisper_cli::Whisper>>>,
   /// App start instant, used to drive UI animations (e.g. transcript progress indicator).
   pub started_at: Instant,
-  /// PiP (picture-in-picture) mode — terminal window shrinks to show only Now Playing.
+  /// `PiP` (picture-in-picture) mode — terminal window shrinks to show only Now Playing.
   pub pip_mode: bool,
-  /// Saved window geometry before entering PiP, for restoration on toggle-off or exit.
+  /// Saved window geometry before entering `PiP`, for restoration on toggle-off or exit.
   pip_original_geometry: Option<window::WindowGeometry>,
-  /// Whether the terminal was in fullscreen before entering PiP.
+  /// Whether the terminal was in fullscreen before entering `PiP`.
   pip_was_fullscreen: bool,
   /// When the last error was set — used for auto-dismiss after 5 seconds.
   error_time: Option<Instant>,
@@ -270,7 +271,7 @@ impl App {
       .current_details
       .as_ref()
       .and_then(|d| d.url.split("watch?v=").nth(1).or_else(|| d.url.split('/').next_back()))
-      .map(|s| s.to_string());
+      .map(std::string::ToString::to_string);
     // Also try from cached thumbnail video_id
     let video_id = video_id.or_else(|| self.player.cached_thumbnail.as_ref().map(|(id, _)| id.clone()));
     let Some(video_id) = video_id else { return };
@@ -295,7 +296,7 @@ impl App {
       .current_details
       .as_ref()
       .and_then(|d| d.url.split("watch?v=").nth(1).or_else(|| d.url.split('/').next_back()))
-      .map(|s| s.to_string());
+      .map(std::string::ToString::to_string);
     let video_id = video_id.or_else(|| self.player.cached_thumbnail.as_ref().map(|(id, _)| id.clone()));
     let Some(video_id) = video_id else { return };
 
@@ -471,7 +472,7 @@ impl App {
 
   // --- Auto-transcription ---
 
-  /// Start the auto-transcription pipeline for the given YouTube URL.
+  /// Start the auto-transcription pipeline for the given `YouTube` URL.
   ///
   /// Architecture: chunked transcription for fast first results.
   /// 1. Resolve CDN stream URL (mpv IPC fast path ~0.5-4s, or yt-dlp -g fallback ~10-30s)
@@ -490,7 +491,7 @@ impl App {
 
     let url = url.to_string();
     let whisper_cache = Arc::clone(&self.whisper_cache);
-    let ipc_socket = self.player.ipc_socket_path().map(|s| s.to_string());
+    let ipc_socket = self.player.ipc_socket_path().map(std::string::ToString::to_string);
 
     info!(url = %url, "transcript: starting chunked transcription pipeline");
 
@@ -538,7 +539,7 @@ impl App {
     }
   }
 
-  /// Toggle PiP (picture-in-picture) mode: shrink terminal to a small window showing
+  /// Toggle `PiP` (picture-in-picture) mode: shrink terminal to a small window showing
   /// only Now Playing, or restore to the original size.
   ///
   /// Handles fullscreen: if the terminal was fullscreen, exits fullscreen first,
@@ -550,7 +551,7 @@ impl App {
         info!("pip: restoring original window geometry");
         if let Err(e) = window::set_window_geometry(geom).await {
           warn!(err = %e, "pip: failed to restore window geometry");
-          self.set_error(format!("PiP restore failed: {}", e));
+          self.set_error(format!("PiP restore failed: {e}"));
         }
       }
       // Re-enter fullscreen if we were fullscreen before PiP
@@ -575,18 +576,18 @@ impl App {
             true
           } else {
             let screen = window::get_screen_size().await.ok();
-            screen.is_some_and(|s| window::is_likely_fullscreen(&original, &s))
+            screen.is_some_and(|s| window::is_likely_fullscreen(&original, s))
           };
 
           if was_fullscreen {
             info!("pip: exiting fullscreen before PiP");
             if let Err(e) = window::exit_fullscreen().await {
               warn!(err = %e, "pip: failed to exit fullscreen");
-              self.set_error(format!("PiP failed: could not exit fullscreen: {}", e));
+              self.set_error(format!("PiP failed: could not exit fullscreen: {e}"));
               return;
             }
             // Wait for macOS fullscreen exit animation
-            tokio::time::sleep(Duration::from_millis(1000)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
 
             // Verify fullscreen actually exited
             if window::is_native_fullscreen().await {
@@ -613,7 +614,7 @@ impl App {
               info!(pip_geom = ?pip_geom, "pip: setting PiP geometry");
               if let Err(e) = window::set_window_geometry(&pip_geom).await {
                 warn!(err = %e, "pip: failed to set PiP geometry");
-                self.set_error(format!("PiP failed: {}", e));
+                self.set_error(format!("PiP failed: {e}"));
                 self.pip_original_geometry = None;
                 self.pip_was_fullscreen = false;
               } else {
@@ -623,7 +624,7 @@ impl App {
             }
             Err(e) => {
               warn!(err = %e, "pip: failed to compute PiP geometry");
-              self.set_error(format!("PiP failed: {}", e));
+              self.set_error(format!("PiP failed: {e}"));
               self.pip_original_geometry = None;
               self.pip_was_fullscreen = false;
             }
@@ -631,13 +632,13 @@ impl App {
         }
         Err(e) => {
           warn!(err = %e, "pip: failed to get current window geometry");
-          self.set_error(format!("PiP failed: {}", e));
+          self.set_error(format!("PiP failed: {e}"));
         }
       }
     }
   }
 
-  /// Restore window geometry if PiP is active. Called on exit to ensure the
+  /// Restore window geometry if `PiP` is active. Called on exit to ensure the
   /// terminal returns to its original size.
   pub async fn restore_pip(&mut self) {
     if self.pip_mode {
@@ -656,6 +657,7 @@ impl App {
     }
   }
 
+  #[allow(clippy::too_many_lines)]
   pub async fn check_pending(&mut self) -> Result<()> {
     if let Some(mut rx) = self.tasks.search_rx.take() {
       match rx.try_recv() {
@@ -684,7 +686,7 @@ impl App {
               }
             }
             Err(e) => {
-              self.set_error(format!("Search failed: {:#}", e));
+              self.set_error(format!("Search failed: {e:#}"));
             }
           }
         }
@@ -706,7 +708,7 @@ impl App {
             Ok((video_id, details, thumbnail)) => {
               let play_url = details.url.clone();
               if let Err(e) = self.player.play(details).await {
-                self.set_error(format!("Playback error: {}", e));
+                self.set_error(format!("Playback error: {e}"));
                 let _ = self.player.stop().await;
               } else {
                 // Auto-trigger transcription for the new track
@@ -727,7 +729,7 @@ impl App {
               self.mode = AppMode::Input;
             }
             Err(e) => {
-              self.set_error(format!("Failed to load: {:#}", e));
+              self.set_error(format!("Failed to load: {e:#}"));
             }
           }
         }
@@ -766,7 +768,7 @@ impl App {
               self.recompute_filter();
             }
             Err(e) => {
-              self.set_error(format!("Failed to load more: {:#}", e));
+              self.set_error(format!("Failed to load more: {e:#}"));
             }
           }
           if should_enrich {
@@ -790,13 +792,12 @@ impl App {
         Ok(Ok(fs)) => {
           self.frames.source = Some(fs);
         }
-        Ok(Err(_)) => {
+        Ok(Err(_)) | Err(oneshot::error::TryRecvError::Closed) => {
           // Frame source fetch failed silently — static thumbnail continues to work
         }
         Err(oneshot::error::TryRecvError::Empty) => {
           self.frames.source_rx = Some(rx);
         }
-        Err(oneshot::error::TryRecvError::Closed) => {}
       }
     }
 
@@ -948,7 +949,7 @@ impl App {
       self.tasks.search_rx = Some(rx);
     } else {
       // Regular search mode
-      self.status_message = Some(format!("Searching '{}'…", query));
+      self.status_message = Some(format!("Searching '{query}'…"));
       self.channel_source = None;
 
       let (tx, rx) = oneshot::channel();

@@ -1,8 +1,8 @@
 //! macOS window geometry manipulation.
 //!
 //! Provides query/set operations for the frontmost terminal window position and size.
-//! Uses terminal-specific AppleScript (Terminal.app, iTerm2) or generic System Events
-//! AppleScript (Ghostty, and potentially other terminals). PiP is only supported on
+//! Uses terminal-specific `AppleScript` (Terminal.app, iTerm2) or generic System Events
+//! `AppleScript` (Ghostty, and potentially other terminals). `PiP` is only supported on
 //! Terminal.app, iTerm2, and Ghostty.
 //!
 //! For Ghostty, we use `System Events` to get/set the window position and size. This
@@ -36,9 +36,9 @@ pub struct ScreenSize {
 enum TerminalApp {
   AppleTerminal,
   ITerm2,
-  /// Ghostty terminal (TERM_PROGRAM=ghostty).
+  /// Ghostty terminal (`TERM_PROGRAM=ghostty`).
   Ghostty,
-  /// Any other terminal — PiP not supported.
+  /// Any other terminal — `PiP` not supported.
   Other,
 }
 
@@ -53,10 +53,10 @@ fn detect_terminal() -> TerminalApp {
   }
 }
 
-/// Returns `true` if the current terminal supports PiP window manipulation.
+/// Returns `true` if the current terminal supports `PiP` window manipulation.
 ///
 /// Only Terminal.app, iTerm2, and Ghostty are supported. Other terminals
-/// (Alacritty, kitty, tmux, etc.) are not — PiP keybinding and footer hint
+/// (Alacritty, kitty, tmux, etc.) are not — `PiP` keybinding and footer hint
 /// should be hidden when this returns `false`.
 pub fn pip_supported() -> bool {
   detect_terminal() != TerminalApp::Other
@@ -128,8 +128,9 @@ async fn run_osascript_jxa(script: &str) -> Result<String> {
 }
 
 /// Parse "x, y, w, h" or "x, y, right, bottom" from osascript output.
+#[allow(clippy::many_single_char_names)]
 fn parse_bounds(s: &str) -> Result<(i32, i32, i32, i32)> {
-  let parts: Vec<&str> = s.split(',').map(|p| p.trim()).collect();
+  let parts: Vec<&str> = s.split(',').map(str::trim).collect();
   if parts.len() != 4 {
     return Err(anyhow!("Expected 4 comma-separated values, got {}: {}", parts.len(), s));
   }
@@ -142,7 +143,7 @@ fn parse_bounds(s: &str) -> Result<(i32, i32, i32, i32)> {
 
 /// Parse "x, y" from osascript System Events position output.
 fn parse_position(s: &str) -> Result<(i32, i32)> {
-  let parts: Vec<&str> = s.split(',').map(|p| p.trim()).collect();
+  let parts: Vec<&str> = s.split(',').map(str::trim).collect();
   if parts.len() != 2 {
     return Err(anyhow!("Expected 2 comma-separated values for position, got {}: {}", parts.len(), s));
   }
@@ -153,7 +154,7 @@ fn parse_position(s: &str) -> Result<(i32, i32)> {
 
 /// Parse "w, h" from osascript System Events size output.
 fn parse_size(s: &str) -> Result<(u32, u32)> {
-  let parts: Vec<&str> = s.split(',').map(|p| p.trim()).collect();
+  let parts: Vec<&str> = s.split(',').map(str::trim).collect();
   if parts.len() != 2 {
     return Err(anyhow!("Expected 2 comma-separated values for size, got {}: {}", parts.len(), s));
   }
@@ -168,13 +169,13 @@ fn parse_size(s: &str) -> Result<(u32, u32)> {
 
 /// Check if the current window appears to be in fullscreen mode by comparing
 /// its size to the screen size. Allows some tolerance for menu bar / dock.
-pub fn is_likely_fullscreen(geom: &WindowGeometry, screen: &ScreenSize) -> bool {
-  let w_ratio = geom.width as f64 / screen.width as f64;
-  let h_ratio = geom.height as f64 / screen.height as f64;
+pub fn is_likely_fullscreen(geom: &WindowGeometry, screen: ScreenSize) -> bool {
+  let w_ratio = f64::from(geom.width) / f64::from(screen.width);
+  let h_ratio = f64::from(geom.height) / f64::from(screen.height);
   w_ratio > 0.95 && h_ratio > 0.90
 }
 
-/// Query the AXFullScreen attribute of the frontmost Ghostty window.
+/// Query the `AXFullScreen` attribute of the frontmost Ghostty window.
 ///
 /// Returns `true` if the window is in macOS native fullscreen. Returns `false`
 /// for non-Ghostty terminals or if the query fails (conservative default).
@@ -207,7 +208,7 @@ pub async fn is_native_fullscreen() -> bool {
 
 /// Exit macOS native fullscreen for the frontmost Ghostty window.
 ///
-/// Uses System Events AppleScript to set the "AXFullScreen" attribute to false.
+/// Uses System Events `AppleScript` to set the "`AXFullScreen`" attribute to false.
 /// No-op for non-Ghostty terminals (they don't typically run fullscreen, or
 /// handle it differently).
 pub async fn exit_fullscreen() -> Result<()> {
@@ -232,7 +233,7 @@ pub async fn exit_fullscreen() -> Result<()> {
 
 /// Enter macOS native fullscreen for the frontmost Ghostty window.
 ///
-/// Uses System Events AppleScript to set the "AXFullScreen" attribute to true.
+/// Uses System Events `AppleScript` to set the "`AXFullScreen`" attribute to true.
 /// No-op for non-Ghostty terminals.
 pub async fn enter_fullscreen() -> Result<()> {
   let terminal = detect_terminal();
@@ -255,6 +256,7 @@ pub async fn enter_fullscreen() -> Result<()> {
 }
 
 /// Query the current window geometry of the frontmost terminal window.
+#[allow(clippy::cast_sign_loss)]
 pub async fn get_window_geometry() -> Result<WindowGeometry> {
   let terminal = detect_terminal();
   info!(terminal = ?terminal, "pip: querying window geometry");
@@ -327,6 +329,7 @@ pub async fn get_window_geometry() -> Result<WindowGeometry> {
 }
 
 /// Set the window geometry of the frontmost terminal window.
+#[allow(clippy::cast_possible_wrap)]
 pub async fn set_window_geometry(geom: &WindowGeometry) -> Result<()> {
   let terminal = detect_terminal();
   info!(terminal = ?terminal, geom = ?geom, "pip: setting window geometry");
@@ -386,7 +389,7 @@ pub async fn set_window_geometry(geom: &WindowGeometry) -> Result<()> {
   Ok(())
 }
 
-/// Get the main screen dimensions in pixels using AppKit via JXA (JavaScript for Automation).
+/// Get the main screen dimensions in pixels using `AppKit` via JXA (JavaScript for Automation).
 pub async fn get_screen_size() -> Result<ScreenSize> {
   let output = run_osascript_jxa(
     "ObjC.import('AppKit'); var f = $.NSScreen.mainScreen.frame; Math.floor(f.size.width) + ',' + Math.floor(f.size.height)",
@@ -395,7 +398,7 @@ pub async fn get_screen_size() -> Result<ScreenSize> {
 
   let parts: Vec<&str> = output.split(',').collect();
   if parts.len() != 2 {
-    return Err(anyhow!("Expected 2 values from screen size query, got: {}", output));
+    return Err(anyhow!("Expected 2 values from screen size query, got: {output}"));
   }
   let width: u32 = parts[0].trim().parse().context("Failed to parse screen width")?;
   let height: u32 = parts[1].trim().parse().context("Failed to parse screen height")?;
@@ -404,7 +407,8 @@ pub async fn get_screen_size() -> Result<ScreenSize> {
   Ok(ScreenSize { width, height })
 }
 
-/// Compute the PiP window geometry: small window at the bottom-right of the screen.
+/// Compute the `PiP` window geometry: small window at the bottom-right of the screen.
+#[allow(clippy::cast_possible_wrap)]
 pub async fn pip_geometry() -> Result<WindowGeometry> {
   let c = constants();
   let screen = get_screen_size().await.unwrap_or_else(|e| {
@@ -499,14 +503,14 @@ mod tests {
   fn fullscreen_detection_fullscreen() {
     let geom = WindowGeometry { x: 0, y: 0, width: 2560, height: 1440 };
     let screen = ScreenSize { width: 2560, height: 1440 };
-    assert!(is_likely_fullscreen(&geom, &screen));
+    assert!(is_likely_fullscreen(&geom, screen));
   }
 
   #[test]
   fn fullscreen_detection_windowed() {
     let geom = WindowGeometry { x: 100, y: 100, width: 800, height: 600 };
     let screen = ScreenSize { width: 2560, height: 1440 };
-    assert!(!is_likely_fullscreen(&geom, &screen));
+    assert!(!is_likely_fullscreen(&geom, screen));
   }
 
   #[test]
@@ -514,7 +518,7 @@ mod tests {
     // macOS fullscreen with menu bar offset
     let geom = WindowGeometry { x: 0, y: 38, width: 2560, height: 1402 };
     let screen = ScreenSize { width: 2560, height: 1440 };
-    assert!(is_likely_fullscreen(&geom, &screen));
+    assert!(is_likely_fullscreen(&geom, screen));
   }
 
   #[test]

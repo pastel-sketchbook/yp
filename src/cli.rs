@@ -16,7 +16,7 @@ use crate::youtube;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Extract a YouTube video ID from a URL or bare ID string.
+/// Extract a `YouTube` video ID from a URL or bare ID string.
 ///
 /// Accepts:
 /// - `abc123` (bare 11-char ID)
@@ -68,7 +68,7 @@ fn print_json_error(error_code: &str, message: &str) -> Result<()> {
 /// from the local cache (populated by `channel`, `search`, and `info`).
 pub fn generate_zsh_completions() {
   print!(
-    r##"#compdef yp
+    r#"#compdef yp
 
 _yp_video_ids() {{
   local -a ids
@@ -146,7 +146,7 @@ _yp() {{
 }}
 
 _yp "$@"
-"##
+"#
   );
 }
 
@@ -154,9 +154,9 @@ _yp "$@"
 // Subcommand: search
 // ---------------------------------------------------------------------------
 
-/// Search YouTube and output results as a JSON array.
+/// Search `YouTube` and output results as a JSON array.
 pub async fn cmd_search(query: &str, limit: usize) -> Result<()> {
-  eprintln!("Searching YouTube for: {}", query);
+  eprintln!("Searching YouTube for: {query}");
   let mut results = youtube::search_youtube(query).await.context("YouTube search failed")?;
   results.truncate(limit);
 
@@ -167,7 +167,7 @@ pub async fn cmd_search(query: &str, limit: usize) -> Result<()> {
   }
 
   let json = serde_json::to_string_pretty(&results).context("Failed to serialize search results")?;
-  println!("{}", json);
+  println!("{json}");
   Ok(())
 }
 
@@ -176,7 +176,7 @@ pub async fn cmd_search(query: &str, limit: usize) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Build a JSON object for a channel entry, optionally merging enriched metadata.
-/// SearchEntry fields (from flat-playlist) are used as defaults; VideoMeta overrides when present.
+/// `SearchEntry` fields (from flat-playlist) are used as defaults; `VideoMeta` overrides when present.
 fn channel_entry_json(entry: &youtube::SearchEntry, meta: Option<&youtube::VideoMeta>) -> serde_json::Value {
   let mut obj = serde_json::json!({
     "video_id": entry.video_id,
@@ -235,16 +235,16 @@ fn write_jsonl(obj: &serde_json::Value) -> Result<()> {
   Ok(())
 }
 
-/// List videos from a YouTube channel, output as JSONL.
+/// List videos from a `YouTube` channel, output as JSONL.
 ///
 /// `count`: `Some(n)` for n videos, `None` for all.
 /// `jobs`: number of concurrent enrichment processes.
 pub async fn cmd_channel(channel: &str, count: Option<usize>, enrich: bool, jobs: usize) -> Result<()> {
   let channel_url =
-    youtube::detect_channel_url(channel).ok_or_else(|| anyhow!("Could not detect channel URL from: {}", channel))?;
+    youtube::detect_channel_url(channel).ok_or_else(|| anyhow!("Could not detect channel URL from: {channel}"))?;
 
   let label = count.map_or("all".to_string(), |n| n.to_string());
-  eprintln!("Listing {} videos from: {}", label, channel_url);
+  eprintln!("Listing {label} videos from: {channel_url}");
   let entries = youtube::list_channel_videos(&channel_url, 1, count).await.context("Failed to list channel videos")?;
   eprintln!("Found {} videos", entries.len());
 
@@ -300,7 +300,7 @@ pub async fn cmd_channel(channel: &str, count: Option<usize>, enrich: bool, jobs
 /// Fetch metadata for a specific video, output as JSON.
 pub async fn cmd_info(video: &str) -> Result<()> {
   let video_id = extract_video_id(video);
-  eprintln!("Fetching info for video: {}", video_id);
+  eprintln!("Fetching info for video: {video_id}");
 
   let details = youtube::get_video_info(&video_id).await.context("Failed to get video info")?;
 
@@ -312,7 +312,7 @@ pub async fn cmd_info(video: &str) -> Result<()> {
   let mut obj = serde_json::to_value(&details).context("Failed to serialize video details")?;
   obj["video_id"] = serde_json::Value::String(video_id);
   let json = serde_json::to_string_pretty(&obj).context("Failed to format video info JSON")?;
-  println!("{}", json);
+  println!("{json}");
   Ok(())
 }
 
@@ -323,10 +323,11 @@ pub async fn cmd_info(video: &str) -> Result<()> {
 /// Transcribe a video and output utterances as JSONL.
 ///
 /// This runs the full whisper pipeline headlessly (no mpv, no TUI).
+#[allow(clippy::cast_precision_loss)]
 pub async fn cmd_transcript(video: &str, raw: bool) -> Result<()> {
   let video_id = extract_video_id(video);
-  let url = format!("https://youtube.com/watch?v={}", video_id);
-  eprintln!("Transcribing video: {}", video_id);
+  let url = format!("https://youtube.com/watch?v={video_id}");
+  eprintln!("Transcribing video: {video_id}");
 
   let utterances = run_transcription(&url, None).await?;
 
@@ -346,14 +347,14 @@ pub async fn cmd_transcript(video: &str, raw: bool) -> Result<()> {
     let classified = summarize::classify(&triples);
     for u in &classified {
       let json = serde_json::to_string(u).context("Failed to serialize classified utterance")?;
-      println!("{}", json);
+      println!("{json}");
     }
   }
 
   Ok(())
 }
 
-/// Read JSONL from stdin (pipe mode), extract video_id, and transcribe.
+/// Read JSONL from stdin (pipe mode), extract `video_id`, and transcribe.
 ///
 /// Enables: `yp channel | fzf | yp transcript`
 pub async fn cmd_transcript_stdin(raw: bool) -> Result<()> {
@@ -388,9 +389,10 @@ pub async fn cmd_transcript_stdin(raw: bool) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Transcribe + classify + reduce a video to a summary, output as JSON.
+#[allow(clippy::cast_precision_loss)]
 pub async fn cmd_summarize(video: &str, raw: bool) -> Result<()> {
   let video_id = extract_video_id(video);
-  let url = format!("https://youtube.com/watch?v={}", video_id);
+  let url = format!("https://youtube.com/watch?v={video_id}");
 
   eprintln!("Fetching video info...");
   let details = youtube::get_video_info(&video_id).await.context("Failed to get video info")?;
@@ -411,21 +413,21 @@ pub async fn cmd_summarize(video: &str, raw: bool) -> Result<()> {
       })).collect::<Vec<_>>(),
     });
     let json = serde_json::to_string_pretty(&output).context("Failed to serialize raw output")?;
-    println!("{}", json);
+    println!("{json}");
   } else {
     // Classify + reduce
     let triples: Vec<(i64, i64, String)> = utterances.iter().map(|u| (u.start, u.stop, u.text.clone())).collect();
     let classified = summarize::classify(&triples);
     let output = summarize::reduce(&details, &classified);
     let json = serde_json::to_string_pretty(&output).context("Failed to serialize summary")?;
-    println!("{}", json);
+    println!("{json}");
   }
 
   eprintln!("Done.");
   Ok(())
 }
 
-/// Read JSONL from stdin (pipe mode), extract video_id, and summarize.
+/// Read JSONL from stdin (pipe mode), extract `video_id`, and summarize.
 ///
 /// Enables: `yp channel | fzf | yp summarize`
 pub async fn cmd_summarize_stdin(raw: bool) -> Result<()> {
@@ -456,11 +458,12 @@ pub async fn cmd_summarize_stdin(raw: bool) -> Result<()> {
 }
 
 /// Summarize the latest N videos from a channel.
+#[allow(clippy::cast_precision_loss)]
 pub async fn cmd_summarize_latest(channel: &str, count: usize, raw: bool) -> Result<()> {
   let channel_url =
-    youtube::detect_channel_url(channel).ok_or_else(|| anyhow!("Could not detect channel URL from: {}", channel))?;
+    youtube::detect_channel_url(channel).ok_or_else(|| anyhow!("Could not detect channel URL from: {channel}"))?;
 
-  eprintln!("Listing latest {} video(s) from: {}", count, channel_url);
+  eprintln!("Listing latest {count} video(s) from: {channel_url}");
   let entries =
     youtube::list_channel_videos(&channel_url, 1, Some(count)).await.context("Failed to list channel videos")?;
 
@@ -478,12 +481,12 @@ pub async fn cmd_summarize_latest(channel: &str, count: usize, raw: bool) -> Res
     for (i, entry) in entries.iter().enumerate() {
       eprintln!("\n--- Video {}/{}: {} ---", i + 1, entries.len(), entry.title);
       let video_id = &entry.video_id;
-      let url = format!("https://youtube.com/watch?v={}", video_id);
+      let url = format!("https://youtube.com/watch?v={video_id}");
 
       let details = match youtube::get_video_info(video_id).await {
         Ok(d) => d,
         Err(e) => {
-          eprintln!("Warning: failed to get info for {}: {}", video_id, e);
+          eprintln!("Warning: failed to get info for {video_id}: {e}");
           continue;
         }
       };
@@ -492,7 +495,7 @@ pub async fn cmd_summarize_latest(channel: &str, count: usize, raw: bool) -> Res
       let utterances = match run_transcription(&url, duration_hint).await {
         Ok(u) => u,
         Err(e) => {
-          eprintln!("Warning: transcription failed for {}: {}", video_id, e);
+          eprintln!("Warning: transcription failed for {video_id}: {e}");
           continue;
         }
       };
@@ -518,7 +521,7 @@ pub async fn cmd_summarize_latest(channel: &str, count: usize, raw: bool) -> Res
       if i > 0 {
         print!(",");
       }
-      print!("{}", json);
+      print!("{json}");
     }
     println!("]");
   }
@@ -553,6 +556,7 @@ fn parse_duration_secs(s: &str) -> Option<u32> {
 /// Run the headless transcription pipeline and collect all utterances.
 ///
 /// Uses `ipc_socket: None` to skip mpv IPC and go straight to `yt-dlp -g`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
 async fn run_transcription(url: &str, duration_hint: Option<u32>) -> Result<Vec<whisper_cli::Utternace>> {
   let (tx, mut rx) = mpsc::unbounded_channel::<TranscriptEvent>();
   let whisper_cache: Arc<StdMutex<Option<whisper_cli::Whisper>>> = Arc::new(StdMutex::new(None));
@@ -572,7 +576,7 @@ async fn run_transcription(url: &str, duration_hint: Option<u32>) -> Result<Vec<
           let pct = (downloaded as f64 / total as f64 * 100.0) as u32;
           let mb_down = downloaded / (1024 * 1024);
           let mb_total = total / (1024 * 1024);
-          eprintln!("Downloading whisper model... {}MB / {}MB [{}%]", mb_down, mb_total, pct);
+          eprintln!("Downloading whisper model... {mb_down}MB / {mb_total}MB [{pct}%]");
         }
       }
       TranscriptEvent::ChunkTranscribed(utterances) => {
@@ -588,7 +592,7 @@ async fn run_transcription(url: &str, duration_hint: Option<u32>) -> Result<Vec<
       TranscriptEvent::Failed(msg) => {
         // Wait for the spawned task to finish before returning.
         let _ = handle.await;
-        return Err(anyhow!("Transcription failed: {}", msg));
+        return Err(anyhow!("Transcription failed: {msg}"));
       }
     }
   }
@@ -630,7 +634,7 @@ pub async fn cmd_complete_ids(live: bool) -> Result<()> {
   for (id, title) in entries.iter().rev() {
     // Escape colons in title (zsh _describe uses colon as delimiter).
     let escaped = title.replace('\\', "\\\\").replace(':', "\\:");
-    writeln!(lock, "{}:{}", id, escaped).context("Failed to write completion entry")?;
+    writeln!(lock, "{id}:{escaped}").context("Failed to write completion entry")?;
   }
   lock.flush().context("Failed to flush completion output")?;
 

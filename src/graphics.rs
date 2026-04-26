@@ -8,6 +8,7 @@ use ratatui::{
   style::{Color, Style},
   widgets::Widget,
 };
+use std::fmt::Write as _;
 use std::io::{Cursor, Write};
 
 use crate::display::DisplayMode;
@@ -25,7 +26,7 @@ fn in_tmux() -> bool {
 /// Inner `\x1B` bytes must be doubled (`\x1B\x1B`).
 fn tmux_wrap(seq: &str) -> String {
   let escaped = seq.replace('\x1B', "\x1B\x1B");
-  format!("\x1BPtmux;{}\x1B\\", escaped)
+  format!("\x1BPtmux;{escaped}\x1B\\")
 }
 
 /// Write an escape sequence to stdout, wrapping in tmux passthrough if needed.
@@ -33,7 +34,7 @@ fn write_esc(stdout: &mut impl Write, seq: &str) -> Result<()> {
   if in_tmux() {
     write!(stdout, "{}", tmux_wrap(seq)).context("Failed to write tmux-wrapped escape")?;
   } else {
-    write!(stdout, "{}", seq).context("Failed to write escape")?;
+    write!(stdout, "{seq}").context("Failed to write escape")?;
   }
   Ok(())
 }
@@ -60,16 +61,17 @@ impl Widget for ThumbnailWidget<'_> {
   }
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
 fn render_direct(image: &DynamicImage, area: Rect, buf: &mut Buffer) {
   // Image is already resized by the caller; just convert to RGB8.
   let resized = image.to_rgb8();
-  let img_w = resized.width().min(area.width as u32);
+  let img_w = resized.width().min(u32::from(area.width));
   let img_h = resized.height();
   let cell_h = img_h.div_ceil(2);
-  let offset_x = (area.width as u32).saturating_sub(img_w) / 2;
-  let offset_y = (area.height as u32).saturating_sub(cell_h) / 2;
+  let offset_x = u32::from(area.width).saturating_sub(img_w) / 2;
+  let offset_y = u32::from(area.height).saturating_sub(cell_h) / 2;
 
-  for y in 0..cell_h.min(area.height as u32) {
+  for y in 0..cell_h.min(u32::from(area.height)) {
     for x in 0..img_w {
       let upper = resized.get_pixel(x, y * 2);
       let lower_y = y * 2 + 1;
@@ -81,8 +83,14 @@ fn render_direct(image: &DynamicImage, area: Rect, buf: &mut Buffer) {
         Color::Reset
       };
       buf.set_string(
-        area.x.saturating_add((offset_x.min(u16::MAX as u32)) as u16).saturating_add((x.min(u16::MAX as u32)) as u16),
-        area.y.saturating_add((offset_y.min(u16::MAX as u32)) as u16).saturating_add((y.min(u16::MAX as u32)) as u16),
+        area
+          .x
+          .saturating_add((offset_x.min(u32::from(u16::MAX))) as u16)
+          .saturating_add((x.min(u32::from(u16::MAX))) as u16),
+        area
+          .y
+          .saturating_add((offset_y.min(u32::from(u16::MAX))) as u16)
+          .saturating_add((y.min(u32::from(u16::MAX))) as u16),
         "▀",
         Style::default().fg(fg).bg(bg),
       );
@@ -90,22 +98,29 @@ fn render_direct(image: &DynamicImage, area: Rect, buf: &mut Buffer) {
   }
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
 fn render_ascii(image: &DynamicImage, area: Rect, buf: &mut Buffer) {
   // Image is already resized by the caller; just convert to grayscale.
   let resized = image.to_luma8();
-  let img_w = resized.width().min(area.width as u32);
-  let img_h = resized.height().min(area.height as u32);
-  let offset_x = (area.width as u32).saturating_sub(img_w) / 2;
-  let offset_y = (area.height as u32).saturating_sub(img_h) / 2;
+  let img_w = resized.width().min(u32::from(area.width));
+  let img_h = resized.height().min(u32::from(area.height));
+  let offset_x = u32::from(area.width).saturating_sub(img_w) / 2;
+  let offset_y = u32::from(area.height).saturating_sub(img_h) / 2;
 
   for y in 0..img_h {
     for x in 0..img_w {
       let pixel = resized.get_pixel(x, y)[0];
-      let idx = ((pixel as f32 / 255.0) * (ASCII_CHARS.len() - 1) as f32).round() as usize;
+      let idx = ((f32::from(pixel) / 255.0) * (ASCII_CHARS.len() - 1) as f32).round() as usize;
       let idx = idx.min(ASCII_CHARS.len() - 1);
       buf.set_string(
-        area.x.saturating_add((offset_x.min(u16::MAX as u32)) as u16).saturating_add((x.min(u16::MAX as u32)) as u16),
-        area.y.saturating_add((offset_y.min(u16::MAX as u32)) as u16).saturating_add((y.min(u16::MAX as u32)) as u16),
+        area
+          .x
+          .saturating_add((offset_x.min(u32::from(u16::MAX))) as u16)
+          .saturating_add((x.min(u32::from(u16::MAX))) as u16),
+        area
+          .y
+          .saturating_add((offset_y.min(u32::from(u16::MAX))) as u16)
+          .saturating_add((y.min(u32::from(u16::MAX))) as u16),
         ASCII_CHARS[idx],
         Style::default(),
       );
@@ -175,13 +190,13 @@ pub fn kitty_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
 
   for (i, chunk) in chunks.iter().enumerate() {
     let data = std::str::from_utf8(chunk).context("base64 chunk was not valid UTF-8")?;
-    let more = if i < last { 1 } else { 0 };
+    let more = i32::from(i < last);
 
     if i == 0 {
       let seq = format!("\x1B_Ga=T,f=100,t=d,i=1,p=1,c={},r={},q=2,m={};{}\x1B\\", area.width, area.height, more, data);
       write_esc(&mut stdout, &seq)?;
     } else {
-      let seq = format!("\x1B_Gm={};{}\x1B\\", more, data);
+      let seq = format!("\x1B_Gm={more};{data}\x1B\\");
       write_esc(&mut stdout, &seq)?;
     }
   }
@@ -210,13 +225,14 @@ pub fn kitty_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
 const SIXEL_MAX_COLORS: usize = 256;
 
 /// Render an image at `area` using the Sixel graphics protocol.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
 pub fn sixel_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
   if area.is_empty() {
     return Ok(());
   }
 
-  let pixel_w = area.width as u32 * 8;
-  let pixel_h = area.height as u32 * 16;
+  let pixel_w = u32::from(area.width) * 8;
+  let pixel_h = u32::from(area.height) * 16;
   let resized = image.resize_to_fill(pixel_w, pixel_h, FilterType::Lanczos3).into_rgb8();
   let (w, h) = (resized.width() as usize, resized.height() as usize);
 
@@ -238,13 +254,13 @@ pub fn sixel_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
   let mut out = String::with_capacity(w * h);
 
   out.push_str("\x1BPq");
-  out.push_str(&format!("\"1;1;{};{}", w, h));
+  let _ = write!(out, "\"1;1;{w};{h}");
 
   for (i, c) in palette.iter().enumerate() {
-    let r_pct = (c[0] as u32 * 100) / 255;
-    let g_pct = (c[1] as u32 * 100) / 255;
-    let b_pct = (c[2] as u32 * 100) / 255;
-    out.push_str(&format!("#{};2;{};{};{}", i, r_pct, g_pct, b_pct));
+    let r_pct = (u32::from(c[0]) * 100) / 255;
+    let g_pct = (u32::from(c[1]) * 100) / 255;
+    let b_pct = (u32::from(c[2]) * 100) / 255;
+    let _ = write!(out, "#{i};2;{r_pct};{g_pct};{b_pct}");
   }
 
   let sixel_rows = h.div_ceil(6);
@@ -276,7 +292,7 @@ pub fn sixel_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
         continue;
       }
 
-      out.push_str(&format!("#{}", color_idx));
+      let _ = write!(out, "#{color_idx}");
 
       let mut i = 0;
       while i < row_data.len() {
@@ -287,7 +303,7 @@ pub fn sixel_render_image(image: &DynamicImage, area: Rect) -> Result<()> {
           run += 1;
         }
         if run > 3 {
-          out.push_str(&format!("!{}{}", run, ch));
+          let _ = write!(out, "!{run}{ch}");
         } else {
           for _ in 0..run {
             out.push(ch);

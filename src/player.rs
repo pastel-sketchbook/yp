@@ -85,7 +85,7 @@ impl MusicPlayer {
     cmd.args([
       "--no-video",
       "--term-status-msg=Time: ${time-pos/full} / ${duration/full} | Title: ${media-title} | ${pause} ${percent-pos}%",
-      &format!("--input-ipc-server={}", socket_path_str),
+      &format!("--input-ipc-server={socket_path_str}"),
       &details.url,
     ]);
     cmd.stdin(Stdio::null());

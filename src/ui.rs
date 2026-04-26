@@ -18,12 +18,13 @@ use crate::transcript::TranscriptState;
 
 /// Dim an RGB color by the given factor (0.0 = black, 1.0 = unchanged).
 /// Non-RGB colors are returned as-is.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn dim_color(color: Color, factor: f32) -> Color {
   match color {
     Color::Rgb(r, g, b) => Color::Rgb(
-      (r as f32 * factor).clamp(0.0, 255.0) as u8,
-      (g as f32 * factor).clamp(0.0, 255.0) as u8,
-      (b as f32 * factor).clamp(0.0, 255.0) as u8,
+      (f32::from(r) * factor).clamp(0.0, 255.0) as u8,
+      (f32::from(g) * factor).clamp(0.0, 255.0) as u8,
+      (f32::from(b) * factor).clamp(0.0, 255.0) as u8,
     ),
     other => other,
   }
@@ -41,7 +42,7 @@ fn truncate_str(s: &str, max_width: usize) -> String {
     s.to_string()
   } else {
     let truncated: String = s.chars().take(max_width.saturating_sub(1)).collect();
-    format!("{}…", truncated)
+    format!("{truncated}…")
   }
 }
 
@@ -169,6 +170,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
   render_footer(frame, app, footer_area);
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn render_header(frame: &mut Frame, theme: &Theme, area: Rect) {
   let left = Line::from(Span::styled(" ▶ yp ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
   frame.render_widget(left, area);
@@ -180,8 +182,9 @@ fn render_header(frame: &mut Frame, theme: &Theme, area: Rect) {
   frame.render_widget(right, right_area);
 }
 
-/// PiP mode layout: thumbnail filling the window + status bar.
+/// `PiP` mode layout: thumbnail filling the window + status bar.
 /// Designed for a small (~550x350px) terminal window showing album art.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
 fn render_pip(frame: &mut Frame, app: &mut App) {
   let theme = app.theme();
 
@@ -213,7 +216,7 @@ fn render_pip(frame: &mut Frame, app: &mut App) {
     };
 
     // Center vertically to maintain 16:9 aspect ratio (half-block = 2 pixels per row)
-    let ideal_h = (thumb_area.width as f32 * 9.0 / 32.0).round() as u16;
+    let ideal_h = (f32::from(thumb_area.width) * 9.0 / 32.0).round() as u16;
     if ideal_h < thumb_area.height {
       let diff = thumb_area.height.saturating_sub(ideal_h);
       thumb_area.y = thumb_area.y.saturating_add(diff / 2);
@@ -231,7 +234,7 @@ fn render_pip(frame: &mut Frame, app: &mut App) {
           None => true,
         };
         if needs_resize {
-          let target_w = thumb_area.width as u32;
+          let target_w = u32::from(thumb_area.width);
           let target_h = match app.player.display_mode {
             DisplayMode::Direct => (target_w as f32 * 9.0 / 16.0) as u32,
             _ => (target_w as f32 * 9.0 / 32.0) as u32,
@@ -291,6 +294,7 @@ fn render_welcome(frame: &mut Frame, theme: &Theme, area: Rect) {
   frame.render_widget(paragraph, area);
 }
 
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
 fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
   let theme = app.theme();
   let left_pct = (app.split * 100.0).round().clamp(20.0, 80.0) as u16;
@@ -314,7 +318,7 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
   };
 
   // Center vertically to maintain 16:9 aspect ratio
-  let ideal_h = (thumb_area.width as f32 * 9.0 / 32.0).round() as u16;
+  let ideal_h = (f32::from(thumb_area.width) * 9.0 / 32.0).round() as u16;
   if ideal_h < thumb_area.height {
     let diff = thumb_area.height.saturating_sub(ideal_h);
     thumb_area.y = thumb_area.y.saturating_add(diff / 2);
@@ -335,7 +339,7 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
         None => true,
       };
       if needs_resize {
-        let target_w = thumb_area.width as u32;
+        let target_w = u32::from(thumb_area.width);
         let target_h = match app.player.display_mode {
           DisplayMode::Direct => (target_w as f32 * 9.0 / 16.0) as u32,
           _ => (target_w as f32 * 9.0 / 32.0) as u32,
@@ -444,6 +448,13 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
   }
 }
 
+#[allow(
+  clippy::too_many_lines,
+  clippy::cast_possible_truncation,
+  clippy::cast_sign_loss,
+  clippy::cast_precision_loss,
+  clippy::cast_possible_wrap
+)]
 fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
   let theme = app.theme();
 
@@ -593,6 +604,7 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
   frame.render_widget(paragraph, area);
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_wiki(frame: &mut Frame, app: &mut App, area: Rect) {
   let theme = app.theme();
   let inner_w = area.width.saturating_sub(4) as usize;
@@ -716,6 +728,7 @@ fn render_wiki(frame: &mut Frame, app: &mut App, area: Rect) {
   frame.render_widget(paragraph, area);
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_results(frame: &mut Frame, app: &mut App, area: Rect) {
   let theme = app.theme();
 
@@ -753,7 +766,7 @@ fn render_results(frame: &mut Frame, app: &mut App, area: Rect) {
       let tags_str = match entry.tags.as_deref() {
         Some(raw) if !raw.is_empty() => {
           let half_w = inner_w / 2;
-          let parts: Vec<&str> = raw.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
+          let parts: Vec<&str> = raw.split(',').map(str::trim).filter(|t| !t.is_empty()).collect();
           // Take up to max_display_tags, then shrink further if the joined string exceeds half the line width.
           let max = constants().max_display_tags.min(parts.len());
           let mut count = max;
@@ -770,7 +783,7 @@ fn render_results(frame: &mut Frame, app: &mut App, area: Rect) {
         _ => "",
       };
       let right = match (!tags_str.is_empty(), !date_str.is_empty()) {
-        (true, true) => format!("{}  {}", tags_str, date_str),
+        (true, true) => format!("{tags_str}  {date_str}"),
         (true, false) => tags_str.to_string(),
         (false, true) => date_str.to_string(),
         (false, false) => String::new(),
@@ -840,7 +853,7 @@ fn render_results(frame: &mut Frame, app: &mut App, area: Rect) {
   } else if is_channel {
     let count = app.search_results.len();
     let suffix = if loading_more { " (loading more…)" } else { "" };
-    format!(" Channel — {} videos{} ", count, suffix)
+    format!(" Channel — {count} videos{suffix} ")
   } else {
     " Results ".to_string()
   };
@@ -863,18 +876,18 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
   let theme = app.theme();
 
   let (text, style) = if let Some(msg) = &app.status_message {
-    (format!(" ⏳ {}", msg), Style::default().fg(theme.status))
+    (format!(" ⏳ {msg}"), Style::default().fg(theme.status))
   } else if let Some(err) = &app.last_error {
-    (format!(" ⚠  {}", err), Style::default().fg(theme.error))
+    (format!(" ⚠  {err}"), Style::default().fg(theme.error))
   } else if let Some(msg) = &app.info_message {
-    (format!(" ℹ  {}", msg), Style::default().fg(theme.muted))
+    (format!(" ℹ  {msg}"), Style::default().fg(theme.muted))
   } else {
     let mpv_status = app.player.get_last_mpv_status();
     match mpv_status {
       Some(status) => {
         // mpv's ${pause} emits "yes"/"no" — replace with icons.
         let status = status.replace("| yes ", "| ⏸ ").replace("| no ", "| ▶ ");
-        (format!(" ♪ {}", status), Style::default().fg(theme.status))
+        (format!(" ♪ {status}"), Style::default().fg(theme.status))
       }
       None if app.player.is_playing() => (" ♪ Buffering...".to_string(), Style::default().fg(theme.muted)),
       None => (" Ready".to_string(), Style::default().fg(theme.muted)),
@@ -883,6 +896,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
   frame.render_widget(Paragraph::new(text).style(style), area);
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn render_input(frame: &mut Frame, app: &mut App, area: Rect) {
   let theme = app.theme();
   let is_filter = app.mode == AppMode::Filter;
@@ -935,6 +949,7 @@ fn render_input(frame: &mut Frame, app: &mut App, area: Rect) {
   }
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
   let theme = app.theme();
   let has_results = !app.search_results.is_empty();
@@ -1010,8 +1025,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     .enumerate()
     .flat_map(|(i, (key, action))| {
       let mut s = vec![
-        Span::styled(format!(" {} ", key), Style::default().fg(theme.key_fg).bg(theme.key_bg)),
-        Span::styled(format!(" {}", action), Style::default().fg(theme.muted)),
+        Span::styled(format!(" {key} "), Style::default().fg(theme.key_fg).bg(theme.key_bg)),
+        Span::styled(format!(" {action}"), Style::default().fg(theme.muted)),
       ];
       if i < keys.len().saturating_sub(1) {
         s.push(Span::raw(" "));

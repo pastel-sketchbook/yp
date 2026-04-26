@@ -75,6 +75,7 @@ pub fn detect_display_mode() -> DisplayMode {
 
 /// Query the tmux client PID attached to the current pane, then walk its
 /// ancestor process chain looking for a known terminal emulator.
+#[allow(clippy::similar_names)]
 fn detect_via_tmux_client() -> Option<DisplayMode> {
   let output = std::process::Command::new("tmux").args(["display-message", "-p", "#{client_pid}"]).output().ok()?;
   let client_pid: u32 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;

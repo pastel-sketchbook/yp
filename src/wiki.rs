@@ -89,7 +89,7 @@ pub async fn fetch_wiki_detail(client: &Client, video_id: &str) -> Result<Option
 
 /// Fetch the raw transcript markdown for a video by ID.
 pub async fn fetch_raw_transcript(client: &Client, video_id: &str) -> Result<Option<String>> {
-  let url = format!("{}/{}.md", TRANSCRIPT_BASE_URL, video_id);
+  let url = format!("{TRANSCRIPT_BASE_URL}/{video_id}.md");
   info!(video_id = %video_id, "wiki: fetching raw transcript");
   let resp = client.get(&url).send().await.context("Failed to fetch raw transcript")?;
   if resp.status() == reqwest::StatusCode::NOT_FOUND {

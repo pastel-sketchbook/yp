@@ -24,10 +24,7 @@ fn cache_path() -> Option<PathBuf> {
 /// Each entry is a `(video_id, title)` pair. Duplicates update the title
 /// and move the entry to the end (most recent).
 pub fn append_videos(entries: &[(&str, &str)]) -> Result<()> {
-  let path = match cache_path() {
-    Some(p) => p,
-    None => return Ok(()), // silently skip if no cache dir
-  };
+  let Some(path) = cache_path() else { return Ok(()) }; // silently skip if no cache dir
 
   // Ensure parent directory exists.
   if let Some(parent) = path.parent() {
@@ -58,7 +55,7 @@ pub fn append_videos(entries: &[(&str, &str)]) -> Result<()> {
   {
     let mut f = fs::File::create(&tmp).context("Failed to create cache temp file")?;
     for (id, title) in &existing {
-      writeln!(f, "{}\t{}", id, title).context("Failed to write cache entry")?;
+      writeln!(f, "{id}\t{title}").context("Failed to write cache entry")?;
     }
     f.flush().context("Failed to flush cache file")?;
   }
@@ -72,25 +69,16 @@ pub fn append_videos(entries: &[(&str, &str)]) -> Result<()> {
 /// Returns entries in file order (oldest first), deduplicated (last wins).
 /// An empty vec is returned if the cache file doesn't exist or can't be read.
 pub fn read_videos() -> Vec<(String, String)> {
-  let path = match cache_path() {
-    Some(p) => p,
-    None => return Vec::new(),
-  };
+  let Some(path) = cache_path() else { return Vec::new() };
   dedup(read_raw(&path))
 }
 
 /// Internal: read lines from the TSV file without deduplication.
 fn read_raw(path: &PathBuf) -> Vec<(String, String)> {
-  let file = match fs::File::open(path) {
-    Ok(f) => f,
-    Err(_) => return Vec::new(),
-  };
+  let Ok(file) = fs::File::open(path) else { return Vec::new() };
   let mut entries = Vec::new();
   for line in std::io::BufReader::new(file).lines() {
-    let line = match line {
-      Ok(l) => l,
-      Err(_) => continue,
-    };
+    let Ok(line) = line else { continue };
     if let Some((id, title)) = line.split_once('\t') {
       entries.push((id.to_string(), title.to_string()));
     }
@@ -98,7 +86,7 @@ fn read_raw(path: &PathBuf) -> Vec<(String, String)> {
   entries
 }
 
-/// Deduplicate entries, keeping the *last* occurrence of each video_id.
+/// Deduplicate entries, keeping the *last* occurrence of each `video_id`.
 fn dedup(entries: Vec<(String, String)>) -> Vec<(String, String)> {
   let mut seen = HashMap::new();
   let mut result: Vec<(String, String)> = Vec::with_capacity(entries.len());

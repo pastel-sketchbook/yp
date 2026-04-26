@@ -14,7 +14,7 @@ use crate::player::VideoDetails;
 
 /// Parse an optional yt-dlp field value: trim, filter empty/"NA" sentinel.
 fn opt_field(s: Option<&str>) -> Option<String> {
-  s.map(str::trim).filter(|s| !s.is_empty() && *s != "NA").map(|s| s.to_string())
+  s.map(str::trim).filter(|s| !s.is_empty() && *s != "NA").map(std::string::ToString::to_string)
 }
 
 /// Spawn a yt-dlp command with the given arguments and wait for it to finish.
@@ -31,7 +31,7 @@ async fn run_yt_dlp(args: &[&str], context: &str) -> Result<Output> {
       if e.kind() == std::io::ErrorKind::NotFound {
         anyhow!("yt-dlp not found. Install it with: brew install yt-dlp (macOS) or pip install yt-dlp")
       } else {
-        anyhow!(e).context(format!("Failed to execute yt-dlp for {}", context))
+        anyhow!(e).context(format!("Failed to execute yt-dlp for {context}"))
       }
     })
 }
@@ -70,6 +70,7 @@ impl SpriteFrameSource {
   }
 
   /// Compute a global frame index for the given playback time.
+  #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
   pub fn frame_index_at(&self, time_secs: f64) -> usize {
     let fps = self.frames_per_sheet() as usize;
     if self.sheets.is_empty() || fps == 0 || time_secs < 0.0 {
@@ -92,6 +93,7 @@ impl SpriteFrameSource {
   }
 
   /// Extract the frame image at the given playback time.
+  #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
   pub fn frame_at(&self, time_secs: f64) -> Option<DynamicImage> {
     let fps = self.frames_per_sheet();
     if self.sheets.is_empty() || fps == 0 || time_secs < 0.0 {
@@ -123,9 +125,9 @@ impl SpriteFrameSource {
 pub struct VideoFrameSource {
   /// The video ID this source belongs to.
   pub video_id: String,
-  /// Directory containing extracted frame JPEGs (frame_0001.jpg, frame_0002.jpg, ...).
+  /// Directory containing extracted frame JPEGs (`frame_0001.jpg`, `frame_0002.jpg`, ...).
   frames_dir: PathBuf,
-  /// Interval between frames in seconds (1.0 / FRAME_EXTRACT_FPS).
+  /// Interval between frames in seconds (1.0 / `FRAME_EXTRACT_FPS`).
   frame_interval: f64,
   /// Handle to the running ffmpeg process (killed on drop).
   ffmpeg_handle: Option<TokioChild>,
@@ -133,6 +135,7 @@ pub struct VideoFrameSource {
 
 impl VideoFrameSource {
   /// Compute the 1-indexed frame number for the given playback time.
+  #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
   pub fn frame_index_at(&self, time_secs: f64) -> usize {
     if time_secs < 0.0 {
       return 1;
@@ -144,7 +147,7 @@ impl VideoFrameSource {
   /// Returns `None` if the frame hasn't been extracted yet.
   pub fn frame_at(&self, time_secs: f64) -> Option<DynamicImage> {
     let idx = self.frame_index_at(time_secs);
-    let path = self.frames_dir.join(format!("frame_{:04}.jpg", idx));
+    let path = self.frames_dir.join(format!("frame_{idx:04}.jpg"));
     image::open(&path).ok()
   }
 }
@@ -269,7 +272,7 @@ fn parse_storyboard_meta(json: &Value) -> Result<StoryboardMeta> {
 /// all sprite sheet images. This is a progressive enhancement — if it fails,
 /// the static thumbnail continues to work.
 pub async fn fetch_sprite_frames(client: &Client, video_id: &str) -> Result<FrameSource> {
-  let url = format!("https://youtube.com/watch?v={}", video_id);
+  let url = format!("https://youtube.com/watch?v={video_id}");
   let output = run_yt_dlp(&["--dump-json", "--no-warnings", "--", &url], "storyboard info")
     .await
     .context("Failed to run yt-dlp for storyboard info")?;
@@ -288,7 +291,7 @@ pub async fn fetch_sprite_frames(client: &Client, video_id: &str) -> Result<Fram
   for frag in &meta.fragments {
     let response = client.get(&frag.url).send().await.with_context(|| {
       let truncated: String = frag.url.chars().take(60).collect();
-      format!("Failed to fetch storyboard sheet: {}", truncated)
+      format!("Failed to fetch storyboard sheet: {truncated}")
     })?;
     let bytes = response.bytes().await.context("Failed to read storyboard sheet bytes")?;
     let image = image::load_from_memory(&bytes).context("Failed to decode storyboard sprite sheet")?;
@@ -314,7 +317,7 @@ pub async fn fetch_sprite_frames(client: &Client, video_id: &str) -> Result<Fram
 /// to progressively extract frames to a temp directory. Returns immediately —
 /// frames appear on disk as ffmpeg processes the stream.
 pub async fn fetch_video_frames(video_id: &str) -> Result<FrameSource> {
-  let yt_url = format!("https://youtube.com/watch?v={}", video_id);
+  let yt_url = format!("https://youtube.com/watch?v={video_id}");
   let output = run_yt_dlp(
     &["--get-url", "-f", "bestvideo[height<=480]/bestvideo", "--no-warnings", "--", &yt_url],
     "video frames",
@@ -396,7 +399,7 @@ pub(crate) fn clean_tags(raw: &str) -> String {
 /// Format a numeric view count string with comma separators.
 /// e.g. `"1234567"` → `"1,234,567"`
 pub(crate) fn format_view_count(raw: &str) -> String {
-  let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+  let digits: String = raw.chars().filter(char::is_ascii_digit).collect();
   if digits.is_empty() {
     return raw.to_string();
   }
@@ -410,7 +413,7 @@ pub(crate) fn format_view_count(raw: &str) -> String {
   result
 }
 
-/// Parse a single tab-separated yt-dlp output line into a SearchEntry.
+/// Parse a single tab-separated yt-dlp output line into a `SearchEntry`.
 /// Expected format: `title\tid[\tupload_date\ttags\tduration\tview_count\tuploader]`
 pub(crate) fn parse_search_line(line: &str) -> Option<SearchEntry> {
   let parts: Vec<&str> = line.split('\t').collect();
@@ -431,12 +434,12 @@ pub(crate) fn parse_search_line(line: &str) -> Option<SearchEntry> {
   Some(SearchEntry { title, video_id, upload_date, tags, duration, view_count, uploader, enriched })
 }
 
-/// Parse yt-dlp stdout lines into SearchEntry vec.
+/// Parse yt-dlp stdout lines into `SearchEntry` vec.
 fn parse_search_output(stdout: &str) -> Vec<SearchEntry> {
   stdout.lines().map(str::trim).filter(|l| !l.is_empty()).filter_map(parse_search_line).collect()
 }
 
-/// Detect whether user input refers to a YouTube channel.
+/// Detect whether user input refers to a `YouTube` channel.
 /// Returns the canonical channel URL if detected, or None for a regular search.
 pub fn detect_channel_url(input: &str) -> Option<String> {
   let trimmed = input.trim();
@@ -448,7 +451,7 @@ pub fn detect_channel_url(input: &str) -> Option<String> {
 
   // Bare @handle (e.g. "@TwoSetViolin")
   if candidate.starts_with('@') && !candidate.contains(' ') && candidate.len() > 1 {
-    return Some(format!("https://www.youtube.com/{}/videos", candidate));
+    return Some(format!("https://www.youtube.com/{candidate}/videos"));
   }
 
   // Full YouTube channel URL
@@ -460,13 +463,13 @@ pub fn detect_channel_url(input: &str) -> Option<String> {
     if url.ends_with("/videos") {
       return Some(url.to_string());
     }
-    return Some(format!("{}/videos", url));
+    return Some(format!("{url}/videos"));
   }
 
   // Only trigger for the /channel prefix form, not bare text
   if after_prefix.is_some() && !candidate.is_empty() {
     // Assume it's a channel name/handle without @
-    return Some(format!("https://www.youtube.com/@{}/videos", candidate));
+    return Some(format!("https://www.youtube.com/@{candidate}/videos"));
   }
 
   None
@@ -483,7 +486,7 @@ pub struct VideoMeta {
   pub uploader: Option<String>,
 }
 
-/// Enrich a list of video IDs with full metadata (upload_date, tags, duration, etc.).
+/// Enrich a list of video IDs with full metadata (`upload_date`, tags, duration, etc.).
 /// Spawns up to `concurrency` concurrent yt-dlp processes.
 /// Each result is sent progressively through `tx` as it becomes available.
 pub async fn enrich_video_metadata(video_ids: Vec<String>, tx: mpsc::Sender<VideoMeta>, concurrency: usize) {
@@ -495,7 +498,7 @@ pub async fn enrich_video_metadata(video_ids: Vec<String>, tx: mpsc::Sender<Vide
       let tx = tx.clone();
       let enrich_format = &c.enrich_format;
       async move {
-        let url = format!("https://youtube.com/watch?v={}", video_id);
+        let url = format!("https://youtube.com/watch?v={video_id}");
         let result =
           run_yt_dlp(&["--skip-download", "--print", enrich_format, "--no-warnings", "--", &url], "enrichment").await;
 
@@ -531,7 +534,7 @@ pub async fn enrich_video_metadata(video_ids: Vec<String>, tx: mpsc::Sender<Vide
 }
 
 /// Fetch a batch of videos from a channel URL using --flat-playlist for speed.
-/// With the rich print_format, entries include date/duration/views/uploader from
+/// With the rich `print_format`, entries include date/duration/views/uploader from
 /// the playlist page itself — only tags require per-video enrichment.
 /// `start` is 1-indexed, `count` is how many to fetch (`None` = all videos).
 pub async fn list_channel_videos(channel_url: &str, start: usize, count: Option<usize>) -> Result<Vec<SearchEntry>> {
@@ -544,7 +547,7 @@ pub async fn list_channel_videos(channel_url: &str, start: usize, count: Option<
       return Ok(Vec::new());
     }
     let end = start.saturating_add(n).saturating_sub(1);
-    playlist_range = format!("{}:{}", start, end);
+    playlist_range = format!("{start}:{end}");
     args.extend(["--playlist-items", &playlist_range]);
   }
   // When count is None, omit --playlist-items to fetch all videos.
@@ -591,7 +594,7 @@ pub async fn search_youtube(query: &str) -> Result<Vec<SearchEntry>> {
 }
 
 pub async fn get_video_info(video_id: &str) -> Result<VideoDetails> {
-  let url = format!("https://youtube.com/watch?v={}", video_id);
+  let url = format!("https://youtube.com/watch?v={video_id}");
   let output = run_yt_dlp(
     &[
       "--print",
@@ -642,23 +645,23 @@ pub async fn get_video_info(video_id: &str) -> Result<VideoDetails> {
 
 pub async fn fetch_thumbnail(client: &Client, video_id: &str) -> Result<DynamicImage> {
   let thumbnail_urls = [
-    format!("https://img.youtube.com/vi/{}/maxresdefault.jpg", video_id),
-    format!("https://img.youtube.com/vi/{}/sddefault.jpg", video_id),
-    format!("https://img.youtube.com/vi/{}/hqdefault.jpg", video_id),
-    format!("https://img.youtube.com/vi/{}/0.jpg", video_id),
+    format!("https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"),
+    format!("https://img.youtube.com/vi/{video_id}/sddefault.jpg"),
+    format!("https://img.youtube.com/vi/{video_id}/hqdefault.jpg"),
+    format!("https://img.youtube.com/vi/{video_id}/0.jpg"),
   ];
 
   for url in &thumbnail_urls {
     if let Ok(response) = client.get(url).send().await
       && response.status().is_success()
     {
-      let image_bytes = response.bytes().await.with_context(|| format!("Failed to read image bytes from {}", url))?;
+      let image_bytes = response.bytes().await.with_context(|| format!("Failed to read image bytes from {url}"))?;
       let image = image::load_from_memory(&image_bytes)
-        .with_context(|| format!("Failed to decode image from memory (URL: {})", url))?;
+        .with_context(|| format!("Failed to decode image from memory (URL: {url})"))?;
       return Ok(image);
     }
   }
-  Err(anyhow!("Failed to fetch any thumbnail for video ID: {}", video_id))
+  Err(anyhow!("Failed to fetch any thumbnail for video ID: {video_id}"))
 }
 
 #[cfg(test)]
