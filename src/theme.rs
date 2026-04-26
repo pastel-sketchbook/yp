@@ -74,24 +74,6 @@ pub const THEMES: &[Theme] = &[
     tag: Color::Rgb(108, 113, 196),
     panel_bg: Color::Rgb(7, 54, 66),
   },
-  // Flexoki Dark
-  Theme {
-    name: "Flexoki",
-    bg: Color::Rgb(16, 15, 15),
-    fg: Color::Rgb(206, 205, 195),
-    accent: Color::Rgb(36, 131, 123),
-    muted: Color::Rgb(135, 133, 128),
-    border: Color::Rgb(40, 39, 38),
-    error: Color::Rgb(209, 77, 65),
-    status: Color::Rgb(208, 162, 21),
-    highlight_bg: Color::Rgb(28, 27, 26),
-    highlight_fg: Color::Rgb(208, 162, 21),
-    stripe_bg: Color::Rgb(22, 21, 20),
-    key_bg: Color::Rgb(52, 51, 49),
-    key_fg: Color::Rgb(206, 205, 195),
-    tag: Color::Rgb(142, 139, 206),
-    panel_bg: Color::Rgb(24, 23, 22),
-  },
   // Ayu Dark
   Theme {
     name: "Ayu",
@@ -109,6 +91,24 @@ pub const THEMES: &[Theme] = &[
     key_fg: Color::Rgb(191, 191, 191),
     tag: Color::Rgb(210, 154, 230),
     panel_bg: Color::Rgb(18, 22, 30),
+  },
+  // Flexoki Dark
+  Theme {
+    name: "Flexoki",
+    bg: Color::Rgb(16, 15, 15),
+    fg: Color::Rgb(206, 205, 195),
+    accent: Color::Rgb(36, 131, 123),
+    muted: Color::Rgb(135, 133, 128),
+    border: Color::Rgb(40, 39, 38),
+    error: Color::Rgb(209, 77, 65),
+    status: Color::Rgb(208, 162, 21),
+    highlight_bg: Color::Rgb(28, 27, 26),
+    highlight_fg: Color::Rgb(208, 162, 21),
+    stripe_bg: Color::Rgb(22, 21, 20),
+    key_bg: Color::Rgb(52, 51, 49),
+    key_fg: Color::Rgb(206, 205, 195),
+    tag: Color::Rgb(142, 139, 206),
+    panel_bg: Color::Rgb(24, 23, 22),
   },
   // Zoegi Dark
   Theme {
@@ -130,40 +130,58 @@ pub const THEMES: &[Theme] = &[
   },
   // FFE Dark (Fuzzy Find Everything)
   Theme {
-    name: "FFE",
-    bg: Color::Rgb(30, 35, 43),              // #1e232b background
-    fg: Color::Rgb(216, 222, 233),           // #d8dee9 text
-    accent: Color::Rgb(161, 239, 211),       // #a1efd3 green accent
-    muted: Color::Rgb(108, 112, 134),        // #6c7086 comment/muted
-    border: Color::Rgb(59, 66, 82),          // #3b4252 border
-    error: Color::Rgb(255, 117, 127),        // #ff757f red
-    status: Color::Rgb(79, 214, 190),        // #4fd6be cyan
-    highlight_bg: Color::Rgb(46, 52, 64),    // #2e3440 element.hover
-    highlight_fg: Color::Rgb(240, 169, 136), // #f0a988 orange
-    stripe_bg: Color::Rgb(26, 31, 39),       // #1a1f27 surface
-    key_bg: Color::Rgb(59, 66, 82),          // #3b4252
-    key_fg: Color::Rgb(216, 222, 233),       // #d8dee9
-    tag: Color::Rgb(137, 220, 235),          // #89dceb blue
-    panel_bg: Color::Rgb(26, 31, 39),        // #1a1f27 panel
+    name: "FFE Dark",
+    bg: Color::Rgb(30, 35, 43),
+    fg: Color::Rgb(216, 222, 233),
+    accent: Color::Rgb(79, 214, 190),
+    muted: Color::Rgb(155, 162, 175),
+    border: Color::Rgb(59, 66, 82),
+    error: Color::Rgb(255, 117, 127),
+    status: Color::Rgb(161, 239, 211),
+    highlight_bg: Color::Rgb(46, 52, 64),
+    highlight_fg: Color::Rgb(240, 169, 136),
+    stripe_bg: Color::Rgb(26, 31, 39),
+    key_bg: Color::Rgb(59, 66, 82),
+    key_fg: Color::Rgb(216, 222, 233),
+    tag: Color::Rgb(137, 220, 235),
+    panel_bg: Color::Rgb(26, 31, 39),
+  },
+  // Postrboard Dark
+  Theme {
+    name: "Postrboard",
+    bg: Color::Rgb(26, 27, 38),
+    fg: Color::Rgb(226, 232, 240),
+    accent: Color::Rgb(79, 182, 232),
+    muted: Color::Rgb(124, 141, 163),
+    border: Color::Rgb(42, 45, 61),
+    error: Color::Rgb(248, 113, 113),
+    status: Color::Rgb(132, 204, 22),
+    highlight_bg: Color::Rgb(54, 58, 79),
+    highlight_fg: Color::Rgb(251, 138, 77),
+    stripe_bg: Color::Rgb(30, 31, 43),
+    key_bg: Color::Rgb(54, 58, 79),
+    key_fg: Color::Rgb(226, 232, 240),
+    tag: Color::Rgb(96, 165, 250),
+    panel_bg: Color::Rgb(22, 23, 31),
   },
   // --- Light themes ---
-  // FFE Light (Fuzzy Find Everything)
+  // Default Light
   Theme {
-    name: "FFE Light",
-    bg: Color::Rgb(232, 236, 240),           // #e8ecf0 background
-    fg: Color::Rgb(30, 35, 43),              // #1e232b text
-    accent: Color::Rgb(26, 138, 110),        // #1a8a6e green accent
-    muted: Color::Rgb(124, 132, 150),        // #7c8496 muted
-    border: Color::Rgb(201, 205, 214),       // #c9cdd6 border
-    error: Color::Rgb(201, 67, 78),          // #c9434e red
-    status: Color::Rgb(42, 157, 132),        // #2a9d84 cyan
-    highlight_bg: Color::Rgb(221, 225, 232), // #dde1e8 element.hover
-    highlight_fg: Color::Rgb(192, 121, 32),  // #c07920 orange
-    stripe_bg: Color::Rgb(245, 247, 250),    // #f5f7fa surface
-    key_bg: Color::Rgb(201, 205, 214),       // #c9cdd6
-    key_fg: Color::Rgb(30, 35, 43),          // #1e232b
-    tag: Color::Rgb(58, 142, 164),           // #3a8ea4 blue
-    panel_bg: Color::Rgb(245, 247, 250),     // #f5f7fa panel
+    name: "Default Light",
+    bg: Color::Reset,
+    fg: Color::Rgb(40, 40, 50),
+    accent: Color::Rgb(0, 140, 180),
+    muted: Color::Rgb(120, 120, 130),
+    border: Color::Rgb(180, 180, 190),
+    error: Color::Rgb(200, 40, 40),
+    status: Color::Rgb(0, 140, 180),
+    highlight_bg: Color::Rgb(220, 225, 235),
+    highlight_fg: Color::Rgb(30, 30, 40),
+    stripe_bg: Color::Rgb(240, 240, 245),
+    key_bg: Color::Rgb(180, 180, 190),
+    key_fg: Color::Rgb(40, 40, 50),
+    tag: Color::Rgb(100, 80, 180),
+    panel_bg: Color::Rgb(235, 235, 240),
   },
   // Gruvbox Light
   Theme {
@@ -254,5 +272,41 @@ pub const THEMES: &[Theme] = &[
     key_fg: Color::Rgb(51, 51, 51),
     tag: Color::Rgb(80, 120, 160),
     panel_bg: Color::Rgb(245, 245, 245),
+  },
+  // FFE Light (Fuzzy Find Everything)
+  Theme {
+    name: "FFE Light",
+    bg: Color::Rgb(232, 236, 240),
+    fg: Color::Rgb(30, 35, 43),
+    accent: Color::Rgb(42, 157, 132),
+    muted: Color::Rgb(74, 80, 96),
+    border: Color::Rgb(201, 205, 214),
+    error: Color::Rgb(201, 67, 78),
+    status: Color::Rgb(26, 138, 110),
+    highlight_bg: Color::Rgb(221, 225, 232),
+    highlight_fg: Color::Rgb(192, 121, 32),
+    stripe_bg: Color::Rgb(245, 247, 250),
+    key_bg: Color::Rgb(201, 205, 214),
+    key_fg: Color::Rgb(30, 35, 43),
+    tag: Color::Rgb(58, 142, 164),
+    panel_bg: Color::Rgb(245, 247, 250),
+  },
+  // Postrboard Light
+  Theme {
+    name: "Postrboard Light",
+    bg: Color::Rgb(250, 250, 250),
+    fg: Color::Rgb(17, 24, 39),
+    accent: Color::Rgb(2, 132, 199),
+    muted: Color::Rgb(100, 116, 139),
+    border: Color::Rgb(203, 213, 225),
+    error: Color::Rgb(220, 38, 38),
+    status: Color::Rgb(77, 124, 15),
+    highlight_bg: Color::Rgb(226, 232, 240),
+    highlight_fg: Color::Rgb(194, 65, 12),
+    stripe_bg: Color::Rgb(248, 250, 252),
+    key_bg: Color::Rgb(203, 213, 225),
+    key_fg: Color::Rgb(17, 24, 39),
+    tag: Color::Rgb(12, 74, 110),
+    panel_bg: Color::Rgb(241, 245, 249),
   },
 ];

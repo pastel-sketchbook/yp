@@ -4,7 +4,7 @@ use ratatui::{
   layout::{Alignment, Constraint, Layout, Rect},
   style::{Color, Modifier, Style, Stylize},
   text::{Line, Span},
-  widgets::{Block, Gauge, List, ListItem, Padding, Paragraph, Wrap},
+  widgets::{Block, Clear, Gauge, List, ListItem, Padding, Paragraph, Wrap},
 };
 
 use crate::app::{App, AppMode};
@@ -108,12 +108,43 @@ pub fn highlight_text(text: &str, needle: &str, normal_style: Style, match_style
   spans
 }
 
+// --- Size guard ---
+
+pub const MIN_TERM_WIDTH: u16 = 60;
+pub const MIN_TERM_HEIGHT: u16 = 12;
+
+/// Render a "terminal too small" message and return `true` if the terminal is too small.
+fn render_size_guard(frame: &mut Frame, theme: &Theme) -> bool {
+  let area = frame.area();
+  if area.width >= MIN_TERM_WIDTH && area.height >= MIN_TERM_HEIGHT {
+    return false;
+  }
+  frame.render_widget(Clear, area);
+  let msg = format!(
+    "Terminal too small ({}\u{00d7}{}). Need at least {MIN_TERM_WIDTH}\u{00d7}{MIN_TERM_HEIGHT}.",
+    area.width, area.height,
+  );
+  let p = Paragraph::new(msg).style(Style::default().fg(theme.error)).block(
+    Block::bordered()
+      .border_type(ratatui::widgets::BorderType::Rounded)
+      .border_style(Style::default().fg(theme.border)),
+  );
+  frame.render_widget(p, area);
+  true
+}
+
 // --- UI Rendering ---
 
 pub fn ui(frame: &mut Frame, app: &mut App) {
   let theme = app.theme();
   app.gfx.thumb_area = None;
+  app.info_pane_area = None;
 
+  if render_size_guard(frame, theme) {
+    return;
+  }
+
+  frame.render_widget(Clear, frame.area());
   frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), frame.area());
 
   // PiP mode: compact layout showing only Now Playing + status
@@ -262,8 +293,11 @@ fn render_welcome(frame: &mut Frame, theme: &Theme, area: Rect) {
 
 fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
   let theme = app.theme();
+  let left_pct = (app.split * 100.0).round().clamp(20.0, 80.0) as u16;
+  let right_pct = 100 - left_pct;
   let [thumb_layout_area, info_area] =
-    Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)]).areas(area);
+    Layout::horizontal([Constraint::Percentage(left_pct), Constraint::Percentage(right_pct)]).areas(area);
+  app.info_pane_area = Some(info_area);
 
   // Glow border around thumbnail
   let glow_color = dim_color(theme.accent, 0.35);
@@ -320,12 +354,18 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
   let show_transcript =
     app.transcript_visible && (!app.utterances.is_empty() || !matches!(app.transcript_state, TranscriptState::Idle));
 
-  let (np_area, transcript_area) = if show_transcript {
+  let (np_area, transcript_area) = if show_transcript && !app.wiki_visible {
     let [top, bottom] = Layout::vertical([Constraint::Percentage(62), Constraint::Percentage(38)]).areas(info_area);
     (top, Some(bottom))
   } else {
     (info_area, None)
   };
+
+  // Wiki pane replaces the info pane when visible
+  if app.wiki_visible {
+    render_wiki(frame, app, np_area);
+    return;
+  }
 
   let info_title = Line::from(vec![
     Span::styled(" Now Playing ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
@@ -550,6 +590,129 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
   };
 
   let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false }).scroll((scroll, 0));
+  frame.render_widget(paragraph, area);
+}
+
+fn render_wiki(frame: &mut Frame, app: &mut App, area: Rect) {
+  let theme = app.theme();
+  let inner_w = area.width.saturating_sub(4) as usize;
+
+  // Tab indicator in title
+  let (detail_style, raw_style) = match app.wiki_tab {
+    crate::app::WikiTab::Detail => {
+      (Style::default().fg(theme.accent).add_modifier(Modifier::BOLD), Style::default().fg(theme.muted))
+    }
+    crate::app::WikiTab::Raw => {
+      (Style::default().fg(theme.muted), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
+    }
+  };
+  let title = Line::from(vec![
+    Span::styled(" Detail ", detail_style),
+    Span::styled("│", Style::default().fg(theme.border)),
+    Span::styled(" Raw ", raw_style),
+  ]);
+  let block = Block::bordered()
+    .title(title)
+    .border_type(ratatui::widgets::BorderType::Rounded)
+    .border_style(Style::default().fg(theme.accent))
+    .padding(Padding::horizontal(1))
+    .style(Style::default().bg(theme.panel_bg));
+
+  // Raw tab: raw transcript content (independent of wiki detail)
+  if app.wiki_tab == crate::app::WikiTab::Raw {
+    if app.tasks.wiki_raw_rx.is_some() {
+      let lines =
+        vec![Line::from(""), Line::from(Span::styled("Loading transcript…", Style::default().fg(theme.muted)))];
+      let paragraph = Paragraph::new(lines).block(block).alignment(Alignment::Center);
+      frame.render_widget(paragraph, area);
+      return;
+    }
+    let Some(ref raw) = app.wiki_raw else {
+      let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled("No raw transcript for this video.", Style::default().fg(theme.muted))),
+      ];
+      let paragraph = Paragraph::new(lines).block(block).alignment(Alignment::Center);
+      frame.render_widget(paragraph, area);
+      return;
+    };
+    let lines: Vec<Line> =
+      raw.lines().map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(theme.fg)))).collect();
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false }).scroll((app.wiki_scroll, 0));
+    frame.render_widget(paragraph, area);
+    return;
+  }
+
+  if app.tasks.wiki_rx.is_some() {
+    // Loading state
+    let lines = vec![Line::from(""), Line::from(Span::styled("Loading wiki…", Style::default().fg(theme.muted)))];
+    let paragraph = Paragraph::new(lines).block(block).alignment(Alignment::Center);
+    frame.render_widget(paragraph, area);
+    return;
+  }
+
+  let Some(ref detail) = app.wiki_detail else {
+    let lines =
+      vec![Line::from(""), Line::from(Span::styled("No wiki entry for this video.", Style::default().fg(theme.muted)))];
+    let paragraph = Paragraph::new(lines).block(block).alignment(Alignment::Center);
+    frame.render_widget(paragraph, area);
+    return;
+  };
+
+  let mut lines: Vec<Line> = vec![
+    Line::from(""),
+    Line::from(Span::styled("Summary", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))),
+    Line::from(""),
+    Line::from(Span::styled(detail.summary.clone(), Style::default().fg(theme.fg))),
+  ];
+
+  // Takeaways
+  if !detail.takeaways.is_empty() {
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Takeaways", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))));
+    lines.push(Line::from(""));
+    for takeaway in &detail.takeaways {
+      lines.push(Line::from(Span::styled(
+        format!("• {}", truncate_str(takeaway, inner_w.saturating_sub(2).max(1) * 4)),
+        Style::default().fg(theme.fg),
+      )));
+      lines.push(Line::from(""));
+    }
+  }
+
+  // Topics
+  if !detail.topics.is_empty() {
+    lines.push(Line::from(Span::styled("Topics", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))));
+    lines.push(Line::from(""));
+    let topics_str = detail.topics.join(", ");
+    lines.push(Line::from(Span::styled(truncate_str(&topics_str, inner_w * 3), Style::default().fg(theme.tag))));
+  }
+
+  // Related
+  if !detail.related.is_empty() {
+    lines.push(Line::from(""));
+    lines
+      .push(Line::from(Span::styled("Related [1-5]", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))));
+    lines.push(Line::from(""));
+    for (i, rel) in detail.related.iter().take(5).enumerate() {
+      let num = format!("{} ", i + 1);
+      let title_text = rel.title.as_deref().unwrap_or(&rel.id);
+      let topics =
+        if rel.shared_topics.is_empty() { String::new() } else { format!("  ({})", rel.shared_topics.join(", ")) };
+      lines.push(Line::from(vec![
+        Span::styled(num, Style::default().fg(theme.key_bg)),
+        Span::styled(truncate_str(title_text, inner_w.saturating_sub(3)), Style::default().fg(theme.status)),
+      ]));
+      if !topics.is_empty() {
+        lines.push(Line::from(Span::styled(
+          truncate_str(&format!("  {topics}"), inner_w),
+          Style::default().fg(theme.muted),
+        )));
+      }
+    }
+  }
+
+  let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false }).scroll((app.wiki_scroll, 0));
   frame.render_widget(paragraph, area);
 }
 
@@ -786,11 +949,13 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
   } else {
     ("^a", "Transcript")
   };
+  let wiki_hint: (&str, &str) = if app.wiki_visible { ("^w", "Hide Wiki") } else { ("^w", "Wiki") };
   let keys: Vec<(&str, &str)> = match app.mode {
     AppMode::Input => {
       let mut k = vec![("Enter", "Search"), ("^t", "Theme"), ("^f", "Frame")];
       if is_playing {
         k.push(transcript_hint);
+        k.push(wiki_hint);
         if crate::window::pip_supported() {
           k.push(("^m", "PiP"));
         }
@@ -809,6 +974,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
       let mut k = vec![("Enter", "Play"), ("j/k", "Navigate"), ("/", "Filter")];
       if is_playing {
         k.push(transcript_hint);
+        k.push(wiki_hint);
         let pause_label = if app.player.paused { "Resume" } else { "Pause" };
         k.push(("Space", pause_label));
         if crate::window::pip_supported() {
@@ -826,6 +992,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
       let mut k = vec![("Enter", "Apply"), ("Esc", "Clear"), ("↑↓", "Navigate")];
       if is_playing {
         k.push(transcript_hint);
+        k.push(wiki_hint);
         let pause_label = if app.player.paused { "Resume" } else { "Pause" };
         k.push(("Space", pause_label));
         if crate::window::pip_supported() {
@@ -844,10 +1011,10 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     .flat_map(|(i, (key, action))| {
       let mut s = vec![
         Span::styled(format!(" {} ", key), Style::default().fg(theme.key_fg).bg(theme.key_bg)),
-        Span::styled(format!(" {} ", action), Style::default().fg(theme.muted)),
+        Span::styled(format!(" {}", action), Style::default().fg(theme.muted)),
       ];
       if i < keys.len().saturating_sub(1) {
-        s.push(Span::raw("  "));
+        s.push(Span::raw(" "));
       }
       s
     })

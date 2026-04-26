@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use ratatui::crossterm::event::{self, KeyCode, KeyModifiers};
+use ratatui::crossterm::{
+  self as crossterm,
+  event::{self, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
+};
 
 use crate::app::{App, AppMode};
 use crate::window;
@@ -37,6 +40,7 @@ pub async fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()>
       app.clear_frame_state();
       app.gfx.last_sent = None;
       app.gfx.resized_thumb = None;
+      app.dragging = false;
     }
     return Ok(());
   }
@@ -73,6 +77,54 @@ pub async fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()>
   if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
     app.transcript_toggle();
     return Ok(());
+  }
+
+  // Ctrl+W — toggle wiki pane (only when playing)
+  if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('w') {
+    if app.player.is_playing() {
+      app.wiki_toggle();
+    }
+    return Ok(());
+  }
+
+  // Wiki controls when wiki pane is visible
+  if app.wiki_visible {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('j') {
+      app.wiki_scroll = app.wiki_scroll.saturating_add(1);
+      return Ok(());
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
+      app.wiki_scroll = app.wiki_scroll.saturating_sub(1);
+      return Ok(());
+    }
+    // Tab — switch between Detail and Raw wiki views
+    if key.code == KeyCode::Tab && key.modifiers.is_empty() {
+      use crate::app::WikiTab;
+      app.wiki_tab = match app.wiki_tab {
+        WikiTab::Detail => WikiTab::Raw,
+        WikiTab::Raw => WikiTab::Detail,
+      };
+      app.wiki_scroll = 0;
+      // Trigger raw transcript fetch on first switch to Raw tab
+      if app.wiki_tab == WikiTab::Raw && app.wiki_raw.is_none() {
+        app.trigger_wiki_raw_fetch();
+      }
+      return Ok(());
+    }
+    // Number keys 1-5: load related video from wiki (Detail tab only)
+    if app.wiki_tab == crate::app::WikiTab::Detail
+      && key.modifiers.is_empty()
+      && let KeyCode::Char(c @ '1'..='5') = key.code
+    {
+      let idx = (c as usize) - ('1' as usize);
+      if let Some(ref detail) = app.wiki_detail
+        && let Some(rel) = detail.related.get(idx)
+      {
+        let video_id = rel.id.clone();
+        app.trigger_load_by_id(video_id);
+      }
+      return Ok(());
+    }
   }
 
   // Ctrl+M — toggle PiP (picture-in-picture) mode (only on supported terminals)
@@ -251,6 +303,63 @@ async fn handle_filter_key(app: &mut App, key: event::KeyEvent) -> Result<()> {
     _ => {}
   }
   Ok(())
+}
+
+/// Check if the mouse position is within the wiki/info pane.
+fn mouse_in_info_pane(app: &App, col: u16, row: u16) -> bool {
+  app.wiki_visible
+    && app.info_pane_area.is_some_and(|a| {
+      col >= a.x && col < a.x.saturating_add(a.width) && row >= a.y && row < a.y.saturating_add(a.height)
+    })
+}
+
+/// Handle mouse events: scroll in results/wiki, drag to resize split.
+pub fn handle_mouse_event(app: &mut App, m: MouseEvent) {
+  match m.kind {
+    MouseEventKind::Down(MouseButton::Left) if app.player.is_playing() && app.info_pane_area.is_some() => {
+      app.dragging = true;
+    }
+    MouseEventKind::Drag(MouseButton::Left) if app.dragging => {
+      let col = f64::from(m.column);
+      let width = f64::from(crossterm::terminal::size().map_or(80, |(w, _)| w).max(1));
+      app.split = (col / width).clamp(0.2, 0.8);
+    }
+    MouseEventKind::Up(MouseButton::Left) => {
+      app.dragging = false;
+    }
+    MouseEventKind::ScrollDown => {
+      if mouse_in_info_pane(app, m.column, m.row) {
+        app.wiki_scroll = app.wiki_scroll.saturating_add(2);
+        return;
+      }
+      if matches!(app.mode, AppMode::Results | AppMode::Filter) {
+        let count = app.filtered_indices.len();
+        if count > 0 {
+          let i = app.list_state.selected().map_or(0, |i| (i + 1).min(count.saturating_sub(1)));
+          app.list_state.select(Some(i));
+          if let Some(&actual_idx) = app.filtered_indices.get(i)
+            && actual_idx >= app.search_results.len().saturating_sub(5)
+          {
+            app.trigger_load_more();
+          }
+        }
+      }
+    }
+    MouseEventKind::ScrollUp => {
+      if mouse_in_info_pane(app, m.column, m.row) {
+        app.wiki_scroll = app.wiki_scroll.saturating_sub(2);
+        return;
+      }
+      if matches!(app.mode, AppMode::Results | AppMode::Filter) {
+        let count = app.filtered_indices.len();
+        if count > 0 {
+          let i = app.list_state.selected().map_or(0, |i| i.saturating_sub(1));
+          app.list_state.select(Some(i));
+        }
+      }
+    }
+    _ => {}
+  }
 }
 
 #[cfg(test)]

@@ -13,6 +13,7 @@ use crate::display::DisplayMode;
 use crate::player::{MusicPlayer, VideoDetails};
 use crate::theme::THEMES;
 use crate::transcript::{self, TranscriptEvent, TranscriptState};
+use crate::wiki::{self, WikiDetail};
 use crate::window;
 use crate::youtube::{
   FrameSource, SearchEntry, VideoMeta, detect_channel_url, enrich_video_metadata, fetch_sprite_frames, fetch_thumbnail,
@@ -75,6 +76,14 @@ pub enum AppMode {
   Filter,
 }
 
+/// Which tab is active in the wiki pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WikiTab {
+  #[default]
+  Detail,
+  Raw,
+}
+
 /// Terminal graphics protocol rendering state (Kitty/Sixel).
 #[derive(Default)]
 pub struct GraphicsCache {
@@ -102,6 +111,8 @@ pub(crate) struct AsyncTasks {
   pub(crate) more_rx: Option<oneshot::Receiver<Result<SearchResult>>>,
   pub(crate) enrich_rx: Option<mpsc::Receiver<VideoMeta>>,
   pub(crate) enrich_handle: Option<JoinHandle<()>>,
+  pub(crate) wiki_rx: Option<oneshot::Receiver<Result<Option<WikiDetail>>>>,
+  pub(crate) wiki_raw_rx: Option<oneshot::Receiver<Result<Option<String>>>>,
 }
 
 pub struct App {
@@ -154,6 +165,24 @@ pub struct App {
   pip_was_fullscreen: bool,
   /// When the last error was set — used for auto-dismiss after 5 seconds.
   error_time: Option<Instant>,
+  /// Wiki detail for the currently playing video (fetched from pastelsketchbook.vercel.app).
+  pub wiki_detail: Option<WikiDetail>,
+  /// Whether the wiki pane is visible (toggled with Ctrl+W).
+  pub wiki_visible: bool,
+  /// Scroll offset for the wiki pane content.
+  pub wiki_scroll: u16,
+  /// Index of the currently highlighted related video in the wiki pane (0-based, max 4).
+  pub wiki_related_index: Option<usize>,
+  /// Active wiki tab (Detail or Raw).
+  pub wiki_tab: WikiTab,
+  /// Raw transcript content (fetched on demand when switching to Raw tab).
+  pub wiki_raw: Option<String>,
+  /// Thumbnail/info horizontal split ratio (0.0–1.0, left panel share). Persisted.
+  pub split: f64,
+  /// True while the user holds the left mouse button on the divider.
+  pub dragging: bool,
+  /// The wiki/info pane area from the last render, used for mouse scroll targeting.
+  pub info_pane_area: Option<Rect>,
 }
 
 impl App {
@@ -200,7 +229,84 @@ impl App {
       pip_original_geometry: None,
       pip_was_fullscreen: false,
       error_time: None,
+      wiki_detail: None,
+      wiki_visible: false,
+      wiki_scroll: 0,
+      wiki_related_index: None,
+      wiki_tab: WikiTab::default(),
+      wiki_raw: None,
+      split: 0.68,
+      dragging: false,
+      info_pane_area: None,
     }
+  }
+
+  /// Toggle wiki pane visibility. Triggers a fetch if wiki hasn't been loaded yet.
+  pub fn wiki_toggle(&mut self) {
+    if self.wiki_visible {
+      self.wiki_visible = false;
+      self.wiki_scroll = 0;
+      self.wiki_related_index = None;
+      self.wiki_tab = WikiTab::default();
+      self.wiki_raw = None;
+      return;
+    }
+    // Show wiki
+    self.wiki_visible = true;
+    self.wiki_scroll = 0;
+    self.wiki_related_index = None;
+    self.wiki_tab = WikiTab::default();
+    self.wiki_raw = None;
+    // Fetch if we don't have wiki detail and no fetch in progress
+    if self.wiki_detail.is_none() && self.tasks.wiki_rx.is_none() {
+      self.trigger_wiki_fetch();
+    }
+  }
+
+  /// Fetch wiki detail for the currently playing video.
+  fn trigger_wiki_fetch(&mut self) {
+    let video_id = self
+      .player
+      .current_details
+      .as_ref()
+      .and_then(|d| d.url.split("watch?v=").nth(1).or_else(|| d.url.split('/').next_back()))
+      .map(|s| s.to_string());
+    // Also try from cached thumbnail video_id
+    let video_id = video_id.or_else(|| self.player.cached_thumbnail.as_ref().map(|(id, _)| id.clone()));
+    let Some(video_id) = video_id else { return };
+
+    let client = self.player.http_client.clone();
+    let vid = video_id.clone();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+      let _ = tx.send(wiki::fetch_wiki_detail(&client, &vid).await);
+    });
+    self.tasks.wiki_rx = Some(rx);
+    info!(video_id = %video_id, "wiki: fetch triggered");
+  }
+
+  /// Fetch raw transcript for the currently playing video.
+  pub fn trigger_wiki_raw_fetch(&mut self) {
+    if self.tasks.wiki_raw_rx.is_some() {
+      return; // already in flight
+    }
+    let video_id = self
+      .player
+      .current_details
+      .as_ref()
+      .and_then(|d| d.url.split("watch?v=").nth(1).or_else(|| d.url.split('/').next_back()))
+      .map(|s| s.to_string());
+    let video_id = video_id.or_else(|| self.player.cached_thumbnail.as_ref().map(|(id, _)| id.clone()));
+    let Some(video_id) = video_id else { return };
+
+    let client = self.player.http_client.clone();
+    let vid = video_id.clone();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+      let _ = tx.send(wiki::fetch_raw_transcript(&client, &vid).await);
+    });
+    self.tasks.wiki_raw_rx = Some(rx);
+    info!(video_id = %video_id, "wiki: raw transcript fetch triggered");
   }
 
   pub fn theme(&self) -> &'static crate::theme::Theme {
@@ -605,6 +711,14 @@ impl App {
               } else {
                 // Auto-trigger transcription for the new track
                 self.trigger_transcription(&play_url);
+                // Clear previous wiki state and auto-fetch for new video
+                self.wiki_detail = None;
+                self.wiki_scroll = 0;
+                self.wiki_related_index = None;
+                self.wiki_raw = None;
+                if self.wiki_visible {
+                  self.trigger_wiki_fetch();
+                }
                 if let Some(thumb) = thumbnail {
                   self.frames.original_thumbnail = Some((video_id.clone(), thumb.clone()));
                   self.player.cached_thumbnail = Some((video_id, thumb));
@@ -753,6 +867,54 @@ impl App {
       }
     }
 
+    // --- Wiki polling ---
+    if let Some(mut rx) = self.tasks.wiki_rx.take() {
+      match rx.try_recv() {
+        Ok(Ok(detail)) => {
+          if detail.is_some() {
+            info!("wiki: detail loaded");
+          } else {
+            debug!("wiki: no detail found for this video");
+          }
+          self.wiki_detail = detail;
+        }
+        Ok(Err(e)) => {
+          warn!(err = %e, "wiki: fetch failed");
+          self.wiki_detail = None;
+        }
+        Err(oneshot::error::TryRecvError::Empty) => {
+          self.tasks.wiki_rx = Some(rx);
+        }
+        Err(oneshot::error::TryRecvError::Closed) => {
+          self.wiki_detail = None;
+        }
+      }
+    }
+
+    // --- Wiki raw transcript polling ---
+    if let Some(mut rx) = self.tasks.wiki_raw_rx.take() {
+      match rx.try_recv() {
+        Ok(Ok(raw)) => {
+          if raw.is_some() {
+            info!("wiki: raw transcript loaded");
+          } else {
+            debug!("wiki: no raw transcript found for this video");
+          }
+          self.wiki_raw = raw;
+        }
+        Ok(Err(e)) => {
+          warn!(err = %e, "wiki: raw transcript fetch failed");
+          self.wiki_raw = None;
+        }
+        Err(oneshot::error::TryRecvError::Empty) => {
+          self.tasks.wiki_raw_rx = Some(rx);
+        }
+        Err(oneshot::error::TryRecvError::Closed) => {
+          self.wiki_raw = None;
+        }
+      }
+    }
+
     Ok(())
   }
 
@@ -890,6 +1052,34 @@ impl App {
     self.tasks.load_rx = Some(rx);
 
     // Spawn background frame source fetch based on current mode
+    self.trigger_frame_source_for(Some(&frame_vid));
+  }
+
+  /// Load a video directly by ID (e.g. from wiki related videos).
+  pub fn trigger_load_by_id(&mut self, video_id: String) {
+    let client = self.player.http_client.clone();
+    self.clear_error();
+    self.status_message = Some("Loading…".to_string());
+    self.frames.source = None;
+    self.frames.source_rx = None;
+    self.frames.idx = None;
+    self.frames.original_thumbnail = None;
+
+    let frame_vid = video_id.clone();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+      let details = get_video_info(&video_id).await;
+      match details {
+        Ok(d) => {
+          let thumb = fetch_thumbnail(&client, &video_id).await.ok();
+          let _ = tx.send(Ok((video_id, d, thumb)));
+        }
+        Err(e) => {
+          let _ = tx.send(Err(e));
+        }
+      }
+    });
+    self.tasks.load_rx = Some(rx);
     self.trigger_frame_source_for(Some(&frame_vid));
   }
 

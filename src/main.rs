@@ -11,6 +11,7 @@ mod summarize;
 mod theme;
 mod transcript;
 mod ui;
+mod wiki;
 mod window;
 mod youtube;
 
@@ -19,7 +20,10 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use ratatui::{
   DefaultTerminal,
-  crossterm::event::{self, Event, KeyEventKind},
+  crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
+    execute,
+  },
 };
 use std::time::Duration;
 use tracing::info;
@@ -225,7 +229,9 @@ async fn main() -> Result<()> {
   }));
 
   let mut terminal = ratatui::init();
+  execute!(std::io::stdout(), EnableMouseCapture)?;
   let result = run(&mut terminal, args).await;
+  execute!(std::io::stdout(), DisableMouseCapture)?;
   ratatui::restore();
   result
 }
@@ -298,6 +304,9 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
       match event::read().context("Failed to read terminal event")? {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
           input::handle_key_event(&mut app, key).await.context("Failed to handle key event")?;
+        }
+        Event::Mouse(m) => {
+          input::handle_mouse_event(&mut app, m);
         }
         _ => {}
       }
