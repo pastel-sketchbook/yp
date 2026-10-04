@@ -257,7 +257,14 @@ impl App {
   }
 
   /// Toggle wiki pane visibility. Triggers a fetch if wiki hasn't been loaded yet.
+  ///
+  /// Refuses for videos outside the Pastel Sketchbook channel, whose wiki bundle
+  /// has no entry for them.
   pub fn wiki_toggle(&mut self) {
+    if !self.wiki_available() {
+      self.set_error("The wiki covers the Pastel Sketchbook channel only.".to_string());
+      return;
+    }
     if self.wiki_visible {
       self.wiki_visible = false;
       self.wiki_scroll = 0;
@@ -361,6 +368,27 @@ impl App {
   /// True while the display has bars or peaks still settling.
   pub fn spectrum_needs_animation(&self) -> bool {
     self.spectrum_view.needs_animation()
+  }
+
+  /// True when the playing video comes from the Pastel Sketchbook channel.
+  ///
+  /// The wiki bundle is published for that channel alone, so offering the pane
+  /// for any other video advertises a feature that renders nothing.
+  ///
+  /// Detection is by uploader name because that is the only channel signal
+  /// available synchronously: `--flat-playlist` omits it entirely, so the
+  /// handle in `constants` cannot be matched against a watch URL. When the
+  /// uploader is unknown — enrichment still running, or rate limited — the
+  /// feature is offered rather than hidden, since a missing metadata field is
+  /// not evidence that the video is from another channel.
+  pub fn wiki_available(&self) -> bool {
+    let Some(details) = &self.player.current_details else {
+      return false;
+    };
+    let Some(uploader) = details.uploader.as_deref() else {
+      return true;
+    };
+    uploader.trim().eq_ignore_ascii_case(constants().pastel_sketchbook_uploader.trim())
   }
 
   /// True when the spectrum should occupy part of the Now Playing pane.

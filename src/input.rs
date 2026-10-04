@@ -88,7 +88,8 @@ pub async fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()>
     return Ok(());
   }
 
-  // Ctrl+W — toggle wiki pane (only when playing)
+  // Ctrl+W — toggle wiki pane. Only offered for the channel the wiki covers;
+  // `wiki_toggle` reports the refusal if the shortcut is pressed anyway.
   if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('w') {
     if app.player.is_playing() {
       app.wiki_toggle();

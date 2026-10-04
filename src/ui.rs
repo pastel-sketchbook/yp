@@ -1030,7 +1030,15 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
   } else {
     ("^a", "Transcript")
   };
-  let wiki_hint: (&str, &str) = if app.wiki_visible { ("^w", "Hide Wiki") } else { ("^w", "Wiki") };
+  // The wiki bundle covers one channel only, so the shortcut is offered only
+  // when the playing video can actually use it.
+  let wiki_hint: Option<(&str, &str)> = if app.wiki_visible {
+    Some(("^w", "Hide Wiki"))
+  } else if app.wiki_available() {
+    Some(("^w", "Wiki"))
+  } else {
+    None
+  };
   let keys: Vec<(&str, &str)> = match app.mode {
     AppMode::Input => {
       let mut k = vec![("Enter", "Search"), ("^t", "Theme"), ("^f", "Frame")];
@@ -1041,7 +1049,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         k.push(("←/→", "Seek"));
         k.push(("^v", "Spectrum"));
         k.push(transcript_hint);
-        k.push(wiki_hint);
+        k.extend(wiki_hint);
         if crate::window::pip_supported() {
           k.push(("^m", "PiP"));
         }
@@ -1060,7 +1068,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
       let mut k = vec![("Enter", "Play"), ("j/k", "Navigate"), ("/", "Filter")];
       if is_playing {
         k.push(transcript_hint);
-        k.push(wiki_hint);
+        k.extend(wiki_hint);
         let pause_label = if app.player.paused { "Resume" } else { "Pause" };
         k.push(("Space", pause_label));
         k.push(("←/→", "Seek"));
@@ -1080,7 +1088,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
       let mut k = vec![("Enter", "Apply"), ("Esc", "Clear"), ("↑↓", "Navigate")];
       if is_playing {
         k.push(transcript_hint);
-        k.push(wiki_hint);
+        k.extend(wiki_hint);
         let pause_label = if app.player.paused { "Resume" } else { "Pause" };
         k.push(("Space", pause_label));
         k.push(("←/→", "Seek"));
@@ -1140,11 +1148,15 @@ mod tests {
 
   /// A Now Playing pane with a full set of metadata, as a real track produces.
   fn playing_app(tags: usize) -> App {
+    playing_app_from("Play&Enjoy", tags)
+  }
+
+  fn playing_app_from(uploader: &str, tags: usize) -> App {
     let mut app = App::new(DisplayMode::Ascii);
     app.player.current_details = Some(VideoDetails {
       url: "https://youtube.com/watch?v=abc".into(),
       title: "Relaxing Rock Ambient Guitar".into(),
-      uploader: Some("Play&Enjoy".into()),
+      uploader: Some(uploader.into()),
       duration: Some("1:57:50".into()),
       upload_date: Some("20261003".into()),
       view_count: Some("1.2M".into()),
@@ -1152,6 +1164,86 @@ mod tests {
     });
     app.poll_spectrum();
     app
+  }
+
+  /// Renders just the footer row and returns its text.
+  fn render_footer_row(app: &App, width: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, 4)).expect("test backend");
+    terminal.draw(|f| render_footer(f, app, Rect { x: 0, y: 0, width, height: 1 })).expect("draw");
+    let buffer = terminal.backend().buffer();
+    (0..width).map(|x| buffer[(x, 0)].symbol()).collect()
+  }
+
+  #[test]
+  fn the_wiki_shortcut_appears_only_for_the_owning_channel() {
+    let expected = crate::constants::constants().pastel_sketchbook_uploader.clone();
+
+    let mut channel = playing_app_from(&expected, 0);
+    channel.player.set_playing_for_test(true);
+    assert!(channel.wiki_available());
+    assert!(render_footer_row(&channel, 200).contains("Wiki"), "channel videos must offer the wiki");
+
+    let mut other = playing_app_from("Some Other Channel", 0);
+    other.player.set_playing_for_test(true);
+    assert!(!other.wiki_available());
+    let row = render_footer_row(&other, 200);
+    assert!(!row.contains("Wiki"), "other channels must not offer the wiki: {row}");
+  }
+
+  #[test]
+  fn the_wiki_shortcut_matches_the_uploader_case_insensitively() {
+    let expected = crate::constants::constants().pastel_sketchbook_uploader.clone();
+    let mut app = playing_app_from(&expected.to_lowercase(), 0);
+    app.player.set_playing_for_test(true);
+    assert!(app.wiki_available(), "channel matching must tolerate case");
+  }
+
+  #[test]
+  fn an_unknown_uploader_still_offers_the_wiki() {
+    // A missing metadata field is not evidence of another channel, and hiding
+    // the shortcut would break the feature for anyone rate limited.
+    let mut app = playing_app_from("Play&Enjoy", 0);
+    app.player.current_details.as_mut().expect("details").uploader = None;
+    app.player.set_playing_for_test(true);
+    assert!(app.wiki_available());
+    assert!(render_footer_row(&app, 200).contains("Wiki"));
+  }
+
+  #[test]
+  fn no_wiki_without_a_loaded_video() {
+    let mut app = App::new(DisplayMode::Ascii);
+    assert!(!app.wiki_available(), "nothing is loaded");
+
+    app.player.current_details = Some(VideoDetails {
+      url: "https://youtube.com/watch?v=abc".into(),
+      title: "t".into(),
+      uploader: Some("Some Other Channel".into()),
+      duration: None,
+      upload_date: None,
+      view_count: None,
+      tags: Vec::new(),
+    });
+    assert!(!app.wiki_available(), "another channel's video has no wiki entry");
+  }
+
+  #[test]
+  fn toggling_the_wiki_refuses_outside_the_channel() {
+    // Only the refusal is exercised here: the accepting path fetches the
+    // bundle over the network, which does not belong in a unit test.
+    let mut app = playing_app_from("Some Other Channel", 0);
+    app.wiki_toggle();
+    assert!(!app.wiki_visible, "the pane must not open for another channel");
+    assert!(app.last_error.is_some(), "the refusal must be explained");
+  }
+
+  #[test]
+  fn hiding_the_wiki_stays_available() {
+    // Once open, the hint must still offer a way back out.
+    let expected = crate::constants::constants().pastel_sketchbook_uploader.clone();
+    let mut app = playing_app_from(&expected, 0);
+    app.player.set_playing_for_test(true);
+    app.wiki_visible = true;
+    assert!(render_footer_row(&app, 200).contains("Hide Wiki"));
   }
 
   #[test]

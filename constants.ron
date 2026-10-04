@@ -1,6 +1,10 @@
 (
   // Default channel handle shown in the input field on startup.
   pastel_sketchbook_channel: "@ChrisH-v4e",
+  // Channel display name as yt-dlp reports it in `%(uploader)s`. The
+  // handle above cannot be used for this: per-video metadata exposes
+  // only the display name, and `--flat-playlist` omits it entirely.
+  pastel_sketchbook_uploader: "Pastel Sketchbook",
 
   // --- Ghostty terminal ---
   // TERM_PROGRAM env var value (lowercase).

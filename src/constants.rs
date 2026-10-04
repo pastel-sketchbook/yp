@@ -10,6 +10,7 @@ use std::sync::LazyLock;
 #[derive(Debug, Deserialize)]
 pub struct Constants {
   pub pastel_sketchbook_channel: String,
+  pub pastel_sketchbook_uploader: String,
 
   // Ghostty terminal
   pub ghostty_term_program: String,

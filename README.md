@@ -65,6 +65,7 @@ cargo run -- -d ascii
 | `Space` | Pause / resume |
 | `←` / `→` | Seek back / forward 10s |
 | `Ctrl+A` | Toggle transcript / cancel transcription |
+| `Ctrl+W` | Toggle wiki (Pastel Sketchbook videos only) |
 | `Ctrl+T` | Cycle theme |
 | `Ctrl+F` | Cycle frame mode (thumbnail / storyboard / video) |
 | `Ctrl+V` | Cycle spectrum style |
@@ -75,6 +76,12 @@ cargo run -- -d ascii
 ### Channel browsing
 
 Type a `@handle`, channel URL, or `/channel <name>` in the search bar to browse a channel's videos. Results load in pages as you scroll.
+
+### Wiki
+
+The wiki pane (`Ctrl+W`) is backed by a bundle published for the Pastel Sketchbook channel, so the shortcut is only offered while one of that channel's videos is playing. It refuses with an explanation for anything else, rather than opening an empty pane.
+
+When the uploader has not been resolved yet — enrichment still running, or YouTube rate limiting — the shortcut stays visible, since a missing metadata field is not evidence the video is from another channel.
 
 ### Spectrum
 
