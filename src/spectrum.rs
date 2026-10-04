@@ -46,7 +46,10 @@ pub struct SpectrumFrame {
   pub active: bool,
   pub low_hz: f32,
   pub high_hz: f32,
+  /// Left channel bands.
   pub levels: [f32; BANDS],
+  /// Right channel bands, kept separate so the stereo display can show width.
+  pub levels_right: [f32; BANDS],
 }
 
 struct Block {
@@ -266,23 +269,14 @@ impl Analyzer {
   }
 
   /// Maps the current window onto [`BANDS`] logarithmic bands in 0..1.
-  fn levels(&mut self, rate: u32) -> [f32; BANDS] {
-    let mut power = [0.0_f32; FFT_SIZE / 2 + 1];
-    for ch in 0..2 {
-      for i in 0..FFT_SIZE {
-        self.input[i] = Complex::new(self.pcm[ch][(self.cursor + i) % FFT_SIZE] * self.window[i], 0.0);
-      }
-      self.fft.process_with_scratch(&mut self.input, &mut self.scratch);
-      // Summing both channels raises a mono signal by 3 dB, which the window's
-      // own gain already accounts for.
-      for (p, bin) in power.iter_mut().zip(&self.input) {
-        *p += bin.norm_sqr() * 0.5;
-      }
+  /// Transforms one channel into per-band magnitudes.
+  fn channel_levels(&mut self, channel: usize, rate: u32, high: f32) -> [f32; BANDS] {
+    for i in 0..FFT_SIZE {
+      self.input[i] = Complex::new(self.pcm[channel][(self.cursor + i) % FFT_SIZE] * self.window[i], 0.0);
     }
-    let high = (rate as f32 / 2.0).min(HIGH_HZ);
-    if high <= LOW_HZ {
-      return [0.0; BANDS];
-    }
+    self.fft.process_with_scratch(&mut self.input, &mut self.scratch);
+    let power: Vec<f32> = self.input.iter().map(|bin| bin.norm_sqr() * 0.5).collect();
+
     std::array::from_fn(|band| {
       let low = LOW_HZ * (high / LOW_HZ).powf(band as f32 / BANDS as f32);
       let upper = LOW_HZ * (high / LOW_HZ).powf((band + 1) as f32 / BANDS as f32);
@@ -294,6 +288,20 @@ impl Analyzer {
       let amplitude = peak.sqrt() * 4.0 / FFT_SIZE as f32;
       ((20.0 * amplitude.max(1e-10).log10() - FLOOR_DB) / (CEILING_DB - FLOOR_DB)).clamp(0.0, 1.0)
     })
+  }
+
+  /// Band magnitudes for both channels.
+  ///
+  /// Kept separate rather than summed: the stereo display needs to show how
+  /// wide the image is, and a mono sum throws that away.
+  fn levels(&mut self, rate: u32) -> ([f32; BANDS], [f32; BANDS]) {
+    let high = (rate as f32 / 2.0).min(HIGH_HZ);
+    if high <= LOW_HZ {
+      return ([0.0; BANDS], [0.0; BANDS]);
+    }
+    let left = self.channel_levels(0, rate, high);
+    let right = self.channel_levels(1, rate, high);
+    (left, right)
   }
 
   fn update(&mut self, spectrum: &Spectrum) {
@@ -316,7 +324,7 @@ impl Analyzer {
     }
     let active = enabled && self.filled == FFT_SIZE && self.last_sample.elapsed() < LIVENESS;
     let rate = spectrum.rate();
-    let levels = if active { self.levels(rate) } else { [0.0; BANDS] };
+    let (levels, levels_right) = if active { self.levels(rate) } else { ([0.0; BANDS], [0.0; BANDS]) };
     if spectrum.generation.load(Ordering::Acquire) != generation {
       return;
     }
@@ -327,6 +335,7 @@ impl Analyzer {
       low_hz: LOW_HZ,
       high_hz: (rate as f32 / 2.0).min(HIGH_HZ),
       levels,
+      levels_right,
     };
     spectrum.frames.send_if_modified(|frame| {
       // Active frames double as liveness heartbeats: a view must keep decaying

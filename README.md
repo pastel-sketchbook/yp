@@ -85,7 +85,23 @@ When the uploader has not been resolved yet — enrichment still running, or You
 
 ### Spectrum
 
-The Now Playing pane shows a live spectrum of the audio you are hearing, with no setup — it appears as soon as a track is playing. `Ctrl+V` cycles six styles: `gradient` (default), `bars`, `mono`, `mirror`, `dots`, `waterfall`. The choice is saved to `prefs.toml`.
+The Now Playing pane shows a live spectrum of the audio you are hearing, with no setup — it appears as soon as a track is playing. `Ctrl+V` cycles eleven styles:
+
+| Style | What it shows |
+|-------|--------------|
+| `gradient` (default) | Bars colored by a continuous gradient across their height |
+| `smooth` | Braille dots at two columns and four rows per cell, with bands interpolated — four times the vertical detail of `gradient` |
+| `dots` | A ladder of lit dots |
+| `squares` | The same ladder filled with whole cells and colored by the gradient, like a contribution graph |
+| `bars` | Flat bars colored by height zone |
+| `trail` | Bars with a fading tail from recent frames |
+| `stereo` | Left and right channels as opposing meters, showing stereo width |
+| `mono` | A single accent color |
+| `mirror` | Bars mirrored about the vertical center |
+| `waterfall` | Scrolling history of recent frames |
+| `radial` | Bands around a circle, level as radius |
+
+Styles that need more room than they have — `radial`, `stereo` and `smooth` — fall back to plain bars in a small pane rather than drawing nonsense. The axis is labelled in decade marks (100, 1k, 10k) to match the logarithmic bands. The choice is saved to `prefs.toml`.
 
 The bars are a real FFT of the samples reaching the sound device, not a decoration. `mpv` decodes to a FIFO instead of the sound card and runs ahead as fast as it can; yp drains that FIFO at exactly device rate, which paces `mpv` to real time and makes the position readout the audio actually heard. Seeking therefore restarts `mpv` with `--start`, since a FIFO cannot be rewound.
 
