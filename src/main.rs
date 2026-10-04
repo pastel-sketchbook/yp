@@ -10,6 +10,7 @@ mod input;
 mod player;
 mod spectrum;
 mod spectrum_view;
+mod speech;
 mod summarize;
 mod theme;
 mod transcript;

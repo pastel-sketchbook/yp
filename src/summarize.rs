@@ -573,6 +573,7 @@ mod tests {
       upload_date: None,
       view_count: None,
       tags: vec![],
+      categories: vec![],
     };
     let output = reduce(&video, &classified);
 
@@ -605,6 +606,7 @@ mod tests {
       upload_date: None,
       view_count: None,
       tags: vec![],
+      categories: vec![],
     };
     let output = reduce(&video, &classified);
 
@@ -622,6 +624,7 @@ mod tests {
       upload_date: None,
       view_count: None,
       tags: vec![],
+      categories: vec![],
     };
     let output = reduce(&video, &classified);
 
@@ -644,6 +647,7 @@ mod tests {
       upload_date: None,
       view_count: None,
       tags: vec![],
+      categories: vec![],
     };
     let output = reduce(&video, &classified);
 

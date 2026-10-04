@@ -199,70 +199,78 @@ fn render_pip(frame: &mut Frame, app: &mut App) {
   // Status bar
   render_status(frame, app, status_area);
 
-  // Thumbnail area — fills most of the PiP window
-  if app.player.cached_thumbnail.is_some() {
-    // Glow border
-    let glow_color = dim_color(theme.accent, 0.35);
-    let glow_block = Block::bordered()
-      .border_type(ratatui::widgets::BorderType::Rounded)
-      .border_style(Style::default().fg(glow_color));
-    frame.render_widget(glow_block, main_area);
+  // Shared with the split layout so both letterbox identically.
+  render_thumbnail_pane(frame, app, main_area, theme);
 
-    // Inner thumbnail area (1 cell inset for border)
-    let mut thumb_area = Rect {
-      x: main_area.x.saturating_add(1),
-      y: main_area.y.saturating_add(1),
-      width: main_area.width.saturating_sub(2),
-      height: main_area.height.saturating_sub(2),
-    };
+  // Bottom hint
+  let hint = Line::from(Span::styled(" [Ctrl+M] exit PiP", Style::default().fg(theme.muted)));
+  frame.render_widget(hint, hint_area);
+}
 
-    // Center vertically to maintain 16:9 aspect ratio (half-block = 2 pixels per row)
-    let ideal_h = (f32::from(thumb_area.width) * 9.0 / 32.0).round() as u16;
+/// Draws the thumbnail inside a bordered pane.
+///
+/// Shared by the split Now Playing layout and by PiP. These two used to carry
+/// separate copies of the aspect arithmetic, which is how PiP kept the squashing
+/// bug after it was fixed in the main layout.
+fn render_thumbnail_pane(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
+  let glow_color = dim_color(theme.accent, 0.35);
+  let glow_block =
+    Block::bordered().border_type(ratatui::widgets::BorderType::Rounded).border_style(Style::default().fg(glow_color));
+  frame.render_widget(glow_block, area);
+
+  // Inside the glow border: 1 cell inset on all sides.
+  let mut thumb_area = Rect {
+    x: area.x.saturating_add(1),
+    y: area.y.saturating_add(1),
+    width: area.width.saturating_sub(2),
+    height: area.height.saturating_sub(2),
+  };
+
+  let Some((ref video_id, ref image)) = app.player.cached_thumbnail else {
+    return;
+  };
+
+  // Kitty and Sixel take the whole pane: the terminal scales the image into the
+  // given cells using its own pixel metrics and letterboxes the result.
+  // Deriving a cell height instead is guesswork about cell aspect, and getting
+  // it wrong pushes the image outside its frame.
+  //
+  // Buffer modes blit pixels themselves, so they must letterbox by hand.
+  let protocol_mode = matches!(app.player.display_mode, DisplayMode::Kitty | DisplayMode::Sixel);
+  if !protocol_mode {
+    let ideal_h = ideal_thumb_height(app.player.display_mode, image, thumb_area.width);
     if ideal_h < thumb_area.height {
       let diff = thumb_area.height.saturating_sub(ideal_h);
       thumb_area.y = thumb_area.y.saturating_add(diff / 2);
       thumb_area.height = ideal_h;
     }
-
-    if let Some((ref video_id, ref image)) = app.player.cached_thumbnail {
-      if matches!(app.player.display_mode, DisplayMode::Kitty | DisplayMode::Sixel) {
-        // Kitty/Sixel: rendering handled outside ratatui in the run loop.
-        app.gfx.thumb_area = Some(thumb_area);
-      } else {
-        // Direct/Ascii: resize and render via ThumbnailWidget.
-        let needs_resize = match &app.gfx.resized_thumb {
-          Some((id, w, h, _)) => id != video_id || *w != thumb_area.width || *h != thumb_area.height,
-          None => true,
-        };
-        if needs_resize {
-          let target_w = u32::from(thumb_area.width);
-          let target_h = match app.player.display_mode {
-            DisplayMode::Direct => (target_w as f32 * 9.0 / 16.0) as u32,
-            _ => (target_w as f32 * 9.0 / 32.0) as u32,
-          };
-          let resized = image.resize_to_fill(target_w, target_h.max(1), FilterType::Lanczos3);
-          app.gfx.resized_thumb = Some((video_id.clone(), thumb_area.width, thumb_area.height, resized));
-        }
-        if let Some((_, _, _, ref resized)) = app.gfx.resized_thumb {
-          let widget = ThumbnailWidget { image: resized, display_mode: app.player.display_mode };
-          frame.render_widget(widget, thumb_area);
-        }
-      }
-    }
-  } else {
-    // No thumbnail — show a placeholder
-    let lines = vec![Line::from(""), Line::from(Span::styled("Nothing playing", Style::default().fg(theme.muted)))];
-    let block = Block::bordered()
-      .border_type(ratatui::widgets::BorderType::Rounded)
-      .border_style(Style::default().fg(theme.border))
-      .style(Style::default().bg(theme.panel_bg));
-    let paragraph = Paragraph::new(lines).block(block).alignment(Alignment::Center);
-    frame.render_widget(paragraph, main_area);
   }
 
-  // Bottom hint
-  let hint = Line::from(Span::styled(" [Ctrl+M] exit PiP", Style::default().fg(theme.muted)));
-  frame.render_widget(hint, hint_area);
+  if protocol_mode {
+    // Kitty/Sixel: rendering is handled outside ratatui, in the run loop.
+    // Record the pane and skip the resize and widget render that only the
+    // buffer modes use.
+    app.gfx.thumb_area = Some(thumb_area);
+    return;
+  }
+
+  let needs_resize = match &app.gfx.resized_thumb {
+    Some((id, w, h, _)) => id != video_id || *w != thumb_area.width || *h != thumb_area.height,
+    None => true,
+  };
+  if needs_resize {
+    let target_w = u32::from(thumb_area.width);
+    // Half-block glyphs render two pixel rows per cell, so one cell of height
+    // is two pixel rows. Matching the placement rect keeps the blitted pixels
+    // the same shape as the area they land in.
+    let target_h = u32::from(thumb_area.height) * 2;
+    let resized = image.resize_to_fill(target_w, target_h.max(1), FilterType::Lanczos3);
+    app.gfx.resized_thumb = Some((video_id.clone(), thumb_area.width, thumb_area.height, resized));
+  }
+  if let Some((_, _, _, ref resized)) = app.gfx.resized_thumb {
+    let widget = ThumbnailWidget { image: resized, display_mode: app.player.display_mode };
+    frame.render_widget(widget, thumb_area);
+  }
 }
 
 fn render_main(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -353,65 +361,7 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
     Layout::horizontal([Constraint::Percentage(left_pct), Constraint::Percentage(right_pct)]).areas(area);
   app.info_pane_area = Some(info_area);
 
-  // Glow border around thumbnail
-  let glow_color = dim_color(theme.accent, 0.35);
-  let glow_block =
-    Block::bordered().border_type(ratatui::widgets::BorderType::Rounded).border_style(Style::default().fg(glow_color));
-  frame.render_widget(glow_block, thumb_layout_area);
-
-  // Thumbnail area: inside the glow border (1 cell inset on all sides)
-  let mut thumb_area = Rect {
-    x: thumb_layout_area.x.saturating_add(1),
-    y: thumb_layout_area.y.saturating_add(1),
-    width: thumb_layout_area.width.saturating_sub(2),
-    height: thumb_layout_area.height.saturating_sub(2),
-  };
-
-  if let Some((ref video_id, ref image)) = app.player.cached_thumbnail {
-    // Kitty and Sixel take the whole pane: the terminal scales the image into
-    // the given cells using its own pixel metrics and letterboxes the result.
-    // Computing a cell height here instead is guesswork about cell aspect, and
-    // getting it wrong pushes the image outside its frame.
-    //
-    // Buffer modes blit pixels ourselves, so they must letterbox by hand. A
-    // cell is about twice as tall as it is wide, so a 16:9 image needs a rect
-    // about 32:9 in cells to look 16:9 on screen.
-    let protocol_mode = matches!(app.player.display_mode, DisplayMode::Kitty | DisplayMode::Sixel);
-    if !protocol_mode {
-      let ideal_h = ideal_thumb_height(app.player.display_mode, image, thumb_area.width);
-      if ideal_h < thumb_area.height {
-        let diff = thumb_area.height.saturating_sub(ideal_h);
-        thumb_area.y = thumb_area.y.saturating_add(diff / 2);
-        thumb_area.height = ideal_h;
-      }
-    }
-    if protocol_mode {
-      // Kitty/Sixel: rendering is handled outside ratatui (in the run loop).
-      // Record the full pane and skip the expensive resize and widget render
-      // that only the buffer modes use.
-      app.gfx.thumb_area = Some(thumb_area);
-    } else {
-      // Direct/Ascii: resize and render via ThumbnailWidget into the buffer.
-      let needs_resize = match &app.gfx.resized_thumb {
-        Some((id, w, h, _)) => id != video_id || *w != thumb_area.width || *h != thumb_area.height,
-        None => true,
-      };
-      if needs_resize {
-        let target_w = u32::from(thumb_area.width);
-        // Half-block glyphs render two pixel rows per cell, so one cell of
-        // height is two pixel rows. Matching the placement rect keeps the
-        // blitted pixels the same shape as the area they land in.
-        let target_h = u32::from(thumb_area.height) * 2;
-        let resized = image.resize_to_fill(target_w, target_h.max(1), FilterType::Lanczos3);
-        app.gfx.resized_thumb = Some((video_id.clone(), thumb_area.width, thumb_area.height, resized));
-      }
-
-      if let Some((_, _, _, ref resized)) = app.gfx.resized_thumb {
-        let widget = ThumbnailWidget { image: resized, display_mode: app.player.display_mode };
-        frame.render_widget(widget, thumb_area);
-      }
-    }
-  }
+  render_thumbnail_pane(frame, app, thumb_layout_area, theme);
 
   let show_transcript =
     app.transcript_visible && (!app.utterances.is_empty() || !matches!(app.transcript_state, TranscriptState::Idle));
@@ -1161,6 +1111,7 @@ mod tests {
       upload_date: Some("20261003".into()),
       view_count: Some("1.2M".into()),
       tags: (0..tags).map(|i| format!("tag{i}")).collect(),
+      categories: Vec::new(),
     });
     app.poll_spectrum();
     app
@@ -1222,6 +1173,7 @@ mod tests {
       upload_date: None,
       view_count: None,
       tags: Vec::new(),
+      categories: Vec::new(),
     });
     assert!(!app.wiki_available(), "another channel's video has no wiki entry");
   }

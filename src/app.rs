@@ -12,6 +12,7 @@ use crate::constants::constants;
 use crate::display::DisplayMode;
 use crate::player::{MusicPlayer, VideoDetails};
 use crate::spectrum_view::{SpectrumStyle, SpectrumView};
+use crate::speech;
 use crate::theme::THEMES;
 use crate::transcript::{self, TranscriptEvent, TranscriptState};
 use crate::wiki::{self, WikiDetail};
@@ -341,6 +342,11 @@ impl App {
   pub fn set_error(&mut self, msg: String) {
     self.last_error = Some(msg);
     self.error_time = Some(Instant::now());
+  }
+
+  /// Show a low-priority informational message.
+  pub fn set_info(&mut self, msg: String) {
+    self.info_message = Some(msg);
   }
 
   /// Clear the current error message and its expiry timer.
@@ -864,8 +870,14 @@ impl App {
                 self.set_error(format!("Playback error: {e}"));
                 let _ = self.player.stop().await;
               } else {
-                // Auto-trigger transcription for the new track
-                self.trigger_transcription(&play_url);
+                // Auto-trigger transcription for the new track, unless it is
+                // instrumental: whisper invents text for music, which is worse
+                // than no transcript. Ctrl+A still forces it.
+                if self.player.current_details.as_ref().is_some_and(speech::likely_no_speech) {
+                  self.set_info("Instrumental track: skipped transcription (Ctrl+A to force)".to_string());
+                } else {
+                  self.trigger_transcription(&play_url);
+                }
                 // Clear previous wiki state and auto-fetch for new video
                 self.wiki_detail = None;
                 self.wiki_scroll = 0;
@@ -964,6 +976,8 @@ impl App {
           entry.duration = meta.duration.or(entry.duration.take());
           entry.view_count = meta.view_count.or(entry.view_count.take());
           entry.uploader = meta.uploader.or(entry.uploader.take());
+          // Drives the instrumental check, so it must survive the merge.
+          entry.categories = meta.categories.or(entry.categories.take());
           entry.enriched = true;
           updated = true;
         }
@@ -1300,6 +1314,7 @@ mod tests {
       duration: None,
       view_count: None,
       uploader: None,
+      categories: None,
       enriched: false,
     }
   }

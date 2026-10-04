@@ -455,6 +455,8 @@ pub struct SearchEntry {
   pub duration: Option<String>,
   pub view_count: Option<String>,
   pub uploader: Option<String>,
+  /// YouTube's own categories, e.g. `Music`. `None` until enrichment runs.
+  pub categories: Option<String>,
   /// Whether this entry has been enriched with full metadata (tags).
   /// Entries from `--flat-playlist` start as `false` but carry date/duration/views.
   pub enriched: bool,
@@ -500,8 +502,9 @@ pub(crate) fn parse_search_line(line: &str) -> Option<SearchEntry> {
   let duration = opt_field(parts.get(4).copied());
   let view_count = opt_field(parts.get(5).copied()).map(|s| format_view_count(&s));
   let uploader = opt_field(parts.get(6).copied());
+  let categories = opt_field(parts.get(7).copied()).map(|s| clean_tags(&s)).filter(|s| !s.is_empty());
   let enriched = tags.is_some();
-  Some(SearchEntry { title, video_id, upload_date, tags, duration, view_count, uploader, enriched })
+  Some(SearchEntry { title, video_id, upload_date, tags, duration, view_count, uploader, categories, enriched })
 }
 
 /// Parse yt-dlp stdout lines into `SearchEntry` vec.
@@ -554,6 +557,7 @@ pub struct VideoMeta {
   pub duration: Option<String>,
   pub view_count: Option<String>,
   pub uploader: Option<String>,
+  pub categories: Option<String>,
 }
 
 /// Enrich a list of video IDs with full metadata (`upload_date`, tags, duration, etc.).
@@ -591,6 +595,7 @@ pub async fn enrich_video_metadata(video_ids: Vec<String>, tx: mpsc::Sender<Vide
                 let duration = opt_field(parts.get(3).copied());
                 let view_count = opt_field(parts.get(4).copied()).map(|s| format_view_count(&s));
                 let uploader = opt_field(parts.get(5).copied());
+                let categories = opt_field(parts.get(6).copied()).map(|s| clean_tags(&s)).filter(|s| !s.is_empty());
                 let _ = tx
                   .send(VideoMeta {
                     video_id: parts[0].trim().to_string(),
@@ -599,6 +604,7 @@ pub async fn enrich_video_metadata(video_ids: Vec<String>, tx: mpsc::Sender<Vide
                     duration,
                     view_count,
                     uploader,
+                    categories,
                   })
                   .await;
               } else {
@@ -690,6 +696,10 @@ pub async fn get_video_info(video_id: &str) -> Result<VideoDetails> {
       "%(view_count)s",
       "--print",
       "%(tags)s",
+      // Last, matching the read order in `get_video_info`. Drives the
+      // instrumental check that skips transcription.
+      "--print",
+      "%(categories)s",
       "--no-warnings",
       "--",
       &url,
@@ -718,7 +728,12 @@ pub async fn get_video_info(video_id: &str) -> Result<VideoDetails> {
           .collect()
       })
       .unwrap_or_default();
-    Ok(VideoDetails { url, title, uploader, duration, upload_date, view_count, tags })
+    let categories: Vec<String> = opt_field(lines.next())
+      .map(|s| clean_tags(&s))
+      .filter(|s| !s.is_empty())
+      .map(|s| s.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect())
+      .unwrap_or_default();
+    Ok(VideoDetails { url, title, uploader, duration, upload_date, view_count, tags, categories })
   } else {
     Err(anyhow!("yt-dlp failed to get video info: {}", String::from_utf8_lossy(&output.stderr).trim()))
   }
@@ -843,6 +858,22 @@ mod tests {
   }
 
   // --- parse_search_line ---
+
+  #[test]
+  fn parse_search_line_reads_categories() {
+    // The instrumental gate depends on this field surviving the parse.
+    let line = "Title\tabc\t2026-01-01\ttag1\t3:30\t100\tUploader\t['Music']";
+    let entry = parse_search_line(line).expect("parses");
+    assert_eq!(entry.categories.as_deref(), Some("Music"));
+  }
+
+  #[test]
+  fn parse_search_line_tolerates_missing_categories() {
+    // Older output, or a listing without the field, must not break parsing.
+    let entry = parse_search_line("Title\tabc\t2026-01-01\ttag1\t3:30\t100\tUploader").expect("parses");
+    assert_eq!(entry.categories, None);
+    assert_eq!(entry.uploader.as_deref(), Some("Uploader"));
+  }
 
   #[test]
   fn parse_search_line_basic() {

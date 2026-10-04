@@ -18,6 +18,8 @@ pub struct VideoDetails {
   pub upload_date: Option<String>,
   pub view_count: Option<String>,
   pub tags: Vec<String>,
+  /// YouTube's own categories, used to skip transcription for music.
+  pub categories: Vec<String>,
 }
 
 pub struct MusicPlayer {
