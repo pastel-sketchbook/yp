@@ -85,7 +85,7 @@ When the uploader has not been resolved yet — enrichment still running, or You
 
 ### Spectrum
 
-The Now Playing pane shows a live spectrum of the audio you are hearing, with no setup — it appears as soon as a track is playing. `Ctrl+V` cycles eleven styles:
+The Now Playing pane shows a live spectrum of the audio you are hearing, with no setup — it appears as soon as a track is playing. `Ctrl+V` cycles fourteen styles:
 
 | Style | What it shows |
 |-------|--------------|
@@ -99,9 +99,16 @@ The Now Playing pane shows a live spectrum of the audio you are hearing, with no
 | `mono` | A single accent color |
 | `mirror` | Bars mirrored about the vertical center |
 | `waterfall` | Scrolling history of recent frames |
-| `radial` | Bands around a circle, level as radius |
+| `fire` | Doom-style fire climbing the bands on half-block pixels. The ramp inverts on a light theme, where the hottest flame becomes the strongest ink |
+| `ridge` | Ridgelines of recent frames, nearest at the bottom, the stacked-plot look from Joy Division's *Unknown Pleasures* |
+| `sparks` | Sparks thrown off the bar tops when a band jumps between frames, flying under gravity and cooling as they fall |
+| `radial` | Polar petals around a ring. The lower half mirrors the upper so the axis labels stay true, and a jump between frames sends a wave outward |
 
-Styles that need more room than they have — `radial`, `stereo` and `smooth` — fall back to plain bars in a small pane rather than drawing nonsense. The axis is labelled in decade marks (100, 1k, 10k) to match the logarithmic bands. The choice is saved to `prefs.toml`.
+The last four animate on their own — `fire` keeps burning until its heat runs out, `sparks` throw and fall, and `radial` sends waves on an onset — so they keep the display ticking for a moment after the audio stops. All of them settle to rest when playback pauses, which stops yp redrawing at full rate.
+
+`radial` needs the terminal's cell size to stay round, and it widens into an ellipse in a short, wide pane; too short for a circle and it falls back to a mirrored strip. `smooth`, `stereo`, and `radial` all degrade to plain bars in a pane too small to show their shape.
+
+The axis is labelled in decade marks (100, 1k, 10k) to match the logarithmic bands, dropping back to `LOW`/`HIGH` when a pane is too narrow for them. The choice is saved to `prefs.toml`.
 
 The bars are a real FFT of the samples reaching the sound device, not a decoration. `mpv` decodes to a FIFO instead of the sound card and runs ahead as fast as it can; yp drains that FIFO at exactly device rate, which paces `mpv` to real time and makes the position readout the audio actually heard. Seeking therefore restarts `mpv` with `--start`, since a FIFO cannot be rewound.
 

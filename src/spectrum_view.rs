@@ -1,50 +1,62 @@
-//! Drawing for the spectrum display.
+//! The Now Playing spectrum panel.
 //!
-//! Pure rendering plus the interpolation state that smooths the bars between
-//! analyzer frames: levels decay toward the newest data and peak markers fall
-//! behind them, so the display animates continuously instead of stepping.
+//! Each style lives in its own file under `spectrum_view/`; this module owns the
+//! style list, the shared animation state, and the dispatch that picks a
+//! renderer. Anything two styles agree on — bar geometry, band merging, band
+//! interpolation — is in `geometry.rs`; anything that draws dots at braille
+//! resolution is in `braille.rs`.
 
+mod bars;
+mod braille;
+mod fire;
+mod geometry;
+mod radial;
+mod ridge;
+mod smooth;
+mod sparks;
+mod stereo;
+mod trail;
+mod waterfall;
+
+use crate::spectrum::{BANDS, SpectrumFrame};
+use crate::theme::Theme;
+use bars::BarKind;
+use fire::Fire;
+use radial::Radial;
+use rand::{SeedableRng, rngs::SmallRng};
 use ratatui::{
   Frame,
-  buffer::Buffer,
   layout::Rect,
-  style::{Color, Style},
+  style::Style,
   text::Line,
   widgets::{Block, Borders, Paragraph},
 };
+use sparks::Sparks;
 
-use crate::{
-  spectrum::{BANDS, SpectrumFrame},
-  theme::{Theme, spectrum_gradient},
-};
-
-/// Eighth-height blocks, used for bars and their partial top cells.
-const BLOCKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-/// Waterfall rows remembered, more than any pane shows.
+/// Rows the waterfall and ridge remember; more than any pane shows, bounded for memory.
 const HISTORY: usize = 256;
-/// Recent frames drawn behind the bars in the trail style.
-const TRAIL_LENGTH: usize = 6;
 /// Decade markers for the frequency axis: (power of ten, label).
 const AXIS_MARKS: &[(f32, &str)] = &[(1.0, "10"), (2.0, "100"), (3.0, "1k"), (4.0, "10k")];
-/// How fast bars fall toward their target, in levels per second.
+/// Narrowest pane that carries decade labels; below it the ends read better.
+const AXIS_MIN_WIDTH: u16 = 12;
 const DECAY: f32 = 1.8;
-/// How fast an expired peak marker falls.
 const PEAK_DECAY: f32 = 0.8;
-/// How long a peak marker holds before it starts falling.
 const PEAK_HOLD: std::time::Duration = std::time::Duration::from_millis(180);
-/// A frame older than this is treated as stale, so bars fall on a stalled read.
 const LIVENESS: std::time::Duration = std::time::Duration::from_millis(300);
 
-/// How the spectrum is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SpectrumStyle {
   /// Continuous gradient across bar heights.
   #[default]
   Gradient,
   /// Bars drawn with braille dots: two columns and four rows per cell, with
-  /// band values interpolated between them. Four times the vertical resolution
-  /// of half-blocks and twice the horizontal.
+  /// band values interpolated between them.
   Smooth,
+  /// Ladder of lit dots.
+  Dots,
+  /// Contribution-graph squares: a ladder of whole cells colored by the
+  /// gradient spectrum rather than a flat per-row zone.
+  Squares,
   /// Flat bars colored by height zone.
   Bars,
   /// Bars with a fading tail from recent frames behind them.
@@ -55,22 +67,20 @@ pub enum SpectrumStyle {
   Mono,
   /// Bars mirrored about the vertical center.
   Mirror,
-  /// Ladder of lit dots.
-  Dots,
-  /// Contribution-graph squares: a ladder of whole cells colored by the
-  /// gradient spectrum rather than a flat per-row zone.
-  Squares,
   /// Scrolling history of recent frames.
   Waterfall,
-  /// Bands arranged around a circle, level as radius. Falls back to bars when
-  /// the pane is too short to hold a circle.
+  /// Doom-style fire climbing the bands on half-block pixels.
+  Fire,
+  /// Ridgelines of recent frames, nearest at the bottom.
+  Ridge,
+  /// Sparks thrown from the bar tops when a band jumps.
+  Sparks,
+  /// Polar petals around a ring, with onset waves.
   Radial,
 }
 
 impl SpectrumStyle {
-  /// Cycle order, starting from the [`SpectrumStyle::default`] so the first
-  /// `Ctrl+V` press moves to the next style rather than back to the default.
-  pub const ALL: [SpectrumStyle; 11] = [
+  pub const ALL: [SpectrumStyle; 14] = [
     SpectrumStyle::Gradient,
     SpectrumStyle::Smooth,
     SpectrumStyle::Dots,
@@ -81,15 +91,19 @@ impl SpectrumStyle {
     SpectrumStyle::Mono,
     SpectrumStyle::Mirror,
     SpectrumStyle::Waterfall,
+    SpectrumStyle::Fire,
+    SpectrumStyle::Ridge,
+    SpectrumStyle::Sparks,
     SpectrumStyle::Radial,
   ];
 
   /// Next style in the cycle.
   pub fn next(self) -> Self {
-    let index = Self::ALL.iter().position(|s| *s == self).unwrap_or(0);
+    let index = Self::ALL.iter().position(|style| *style == self).unwrap_or(0);
     Self::ALL[(index + 1) % Self::ALL.len()]
   }
 
+  /// Stable name for the preferences file.
   pub fn id(self) -> &'static str {
     match self {
       SpectrumStyle::Gradient => "gradient",
@@ -102,70 +116,35 @@ impl SpectrumStyle {
       SpectrumStyle::Dots => "dots",
       SpectrumStyle::Squares => "squares",
       SpectrumStyle::Waterfall => "waterfall",
+      SpectrumStyle::Fire => "fire",
+      SpectrumStyle::Ridge => "ridge",
+      SpectrumStyle::Sparks => "sparks",
       SpectrumStyle::Radial => "radial",
     }
   }
 
-  /// Parses a persisted style name, falling back to the default.
+  /// Reads a style back from its stored name, defaulting when unrecognized.
   pub fn from_id(id: &str) -> Self {
-    Self::ALL.into_iter().find(|s| s.id() == id).unwrap_or_default()
+    Self::ALL.iter().copied().find(|style| style.id() == id).unwrap_or_default()
   }
 
-  /// True when the style keeps animating on its own rather than only on new data.
-  fn animates_between_frames(self) -> bool {
-    self != SpectrumStyle::Waterfall
+  /// Styles drawn from the frame history; they change only when a frame arrives.
+  fn follows_frames(self) -> bool {
+    matches!(self, SpectrumStyle::Waterfall | SpectrumStyle::Ridge | SpectrumStyle::Trail)
   }
-}
 
-/// Reads a band value at a fractional position, interpolating between bands.
-///
-/// [`BANDS`] values spread across a pane far wider than the band count leave
-/// visible steps. Interpolating fills them in, which is what makes bars read as
-/// a curve rather than a staircase.
-fn sample_interpolated(levels: &[f32; BANDS], position: f32) -> f32 {
-  if BANDS == 1 {
-    return levels[0];
+  /// The bar look a style draws, for the styles that are a bar variant.
+  fn bar_kind(self) -> Option<BarKind> {
+    Some(match self {
+      SpectrumStyle::Bars => BarKind::Zoned,
+      SpectrumStyle::Gradient => BarKind::Gradient,
+      SpectrumStyle::Mono => BarKind::Mono,
+      SpectrumStyle::Mirror => BarKind::Mirror,
+      SpectrumStyle::Dots => BarKind::Dots,
+      SpectrumStyle::Squares => BarKind::Squares,
+      _ => return None,
+    })
   }
-  let position = position.clamp(0.0, 1.0) * (BANDS - 1) as f32;
-  let low = position.floor() as usize;
-  let high = (low + 1).min(BANDS - 1);
-  let t = position - low as f32;
-  levels[low] * (1.0 - t) + levels[high] * t
-}
-
-/// Dot rows per braille cell.
-const BRAILLE_ROWS: usize = 4;
-/// Dot columns per braille cell.
-const BRAILLE_COLUMNS: usize = 2;
-/// Braille bit for a dot, addressed by column and row counted from the top.
-const fn braille_bit(column: usize, row: usize) -> u16 {
-  match (column, row) {
-    (0, 0) => 0x0001,
-    (0, 1) => 0x0002,
-    (0, 2) => 0x0004,
-    (0, 3) => 0x0040,
-    (1, 0) => 0x0008,
-    (1, 1) => 0x0010,
-    (1, 2) => 0x0020,
-    (1, 3) => 0x0080,
-    _ => 0,
-  }
-}
-
-/// Builds a braille glyph from a per-dot occupancy grid.
-///
-/// `filled[column][row]` with row 0 at the top, matching the glyph's own
-/// numbering rather than the bar's bottom-up sense.
-fn braille_glyph(filled: &[[bool; BRAILLE_ROWS]; BRAILLE_COLUMNS]) -> char {
-  let mut bits = 0_u16;
-  for (column, rows) in filled.iter().enumerate() {
-    for (row, on) in rows.iter().enumerate() {
-      if *on {
-        bits |= braille_bit(column, row);
-      }
-    }
-  }
-  char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ')
 }
 
 pub struct SpectrumView {
@@ -179,9 +158,16 @@ pub struct SpectrumView {
   /// Right channel, tracked separately so the stereo display can show width.
   levels_right: [f32; BANDS],
   peaks_right: [f32; BANDS],
-  /// Levels of recent active frames, oldest first; the waterfall draws these.
+  /// Levels of recent active frames, oldest first; waterfall and ridge draw these.
   history: std::collections::VecDeque<[f32; BANDS]>,
+  /// Frames ever pushed, so ridge can keep its depth stable as old rows drop.
+  pushed: u64,
   redraw: bool,
+  /// Styles that carry their own animation state rather than reading the frame.
+  fire: Fire,
+  radial: Radial,
+  sparks: Sparks,
+  rng: SmallRng,
 }
 
 impl SpectrumView {
@@ -198,13 +184,23 @@ impl SpectrumView {
       levels_right: [0.0; BANDS],
       peaks_right: [0.0; BANDS],
       history: std::collections::VecDeque::with_capacity(HISTORY),
+      pushed: 0,
       redraw: true,
+      fire: Fire::default(),
+      radial: Radial::default(),
+      sparks: Sparks::default(),
+      rng: SmallRng::seed_from_u64(0x5EED),
     }
   }
 
-  /// Switches rendering only; levels, peaks, and history carry over.
+  /// Switches rendering only; levels, peaks, and history carry over. Styles that
+  /// animate on their own start cold, since their state describes a look rather
+  /// than the audio.
   pub fn set_style(&mut self, style: SpectrumStyle) {
     self.style = style;
+    self.fire.reset();
+    self.radial.reset();
+    self.sparks.reset();
     self.redraw = true;
   }
 
@@ -212,7 +208,11 @@ impl SpectrumView {
   pub fn clear(&mut self) {
     self.frame = None;
     self.history.clear();
+    self.pushed = 0;
     self.reset_levels();
+    self.fire.reset();
+    self.radial.reset();
+    self.sparks.reset();
   }
 
   fn reset_levels(&mut self) {
@@ -224,8 +224,25 @@ impl SpectrumView {
   }
 
   /// True while the display still has something to animate.
+  ///
+  /// The particle styles keep moving after the last frame, so they report
+  /// themselves active rather than relying on the levels being nonzero.
   pub fn needs_animation(&self) -> bool {
-    self.redraw || (self.style.animates_between_frames() && self.levels.iter().chain(&self.peaks).any(|v| *v > 0.0))
+    if self.style.follows_frames() {
+      // Rows only appear with frames; nothing moves between them.
+      return self.redraw;
+    }
+    self.redraw
+      || self.fire.is_hot()
+      || self.radial.is_active()
+      || self.sparks.is_active()
+      || self
+        .levels
+        .iter()
+        .chain(&self.peaks)
+        .chain(&self.levels_right)
+        .chain(&self.peaks_right)
+        .any(|value| *value > 0.0)
   }
 
   /// Adopts a new analyzer frame, resetting state when the track changes.
@@ -236,16 +253,34 @@ impl SpectrumView {
     if new_track {
       self.frame = None;
       self.history.clear();
+      self.pushed = 0;
       self.reset_levels();
     } else if new_generation {
       self.reset_levels();
+      // A seek, pause, or resume is not a musical onset, so the styles that
+      // compare frames drop what they were holding.
+      self.fire.reset();
+      self.radial.reset();
+      self.sparks.reset();
     }
     if frame.active {
       if self.history.len() == HISTORY {
         self.history.pop_front();
       }
       self.history.push_back(frame.levels);
-      self.redraw |= self.style == SpectrumStyle::Waterfall;
+      self.pushed += 1;
+      self.redraw |= self.style.follows_frames();
+      // Onsets compare two consecutive frames of one stream; a reset or a gap
+      // starts the comparison over.
+      if self.received.elapsed() < LIVENESS
+        && let Some(previous) = self.frame.as_ref().filter(|f| f.active && f.generation == frame.generation)
+      {
+        match self.style {
+          SpectrumStyle::Radial => self.radial.observe(&previous.levels, &frame.levels),
+          SpectrumStyle::Sparks => self.sparks.observe(&previous.levels, &frame.levels),
+          _ => {}
+        }
+      }
     }
     self.frame = Some(frame);
     self.received = std::time::Instant::now();
@@ -253,37 +288,37 @@ impl SpectrumView {
   }
 
   /// Advances decay and peak hold, then draws the body.
-  pub fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, playing: bool) {
+  ///
+  /// `cell` is the terminal cell size in pixels, which is what keeps the radial
+  /// style round on a terminal whose cells are not square.
+  pub fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, playing: bool, cell: (u16, u16)) {
     self.redraw = false;
     let inner = self.header(frame, area, theme);
     if inner.width == 0 || inner.height == 0 {
       return;
     }
     let body = Rect { height: inner.height.saturating_sub(1), ..inner };
+    // History styles have nothing to decay between frames, and advancing them
+    // would let peaks fall out from under a line that is already drawn.
+    let dt = if self.style.follows_frames() { 0.0 } else { self.advance(playing) };
+    let buf = frame.buffer_mut();
     match self.style {
-      SpectrumStyle::Waterfall => self.draw_waterfall(frame.buffer_mut(), body, theme),
-      // Radial needs both channels only as much as bars do, and it animates
-      // between frames, so it shares the decay path.
-      SpectrumStyle::Smooth => {
-        self.advance(playing);
-        self.draw_smooth(frame.buffer_mut(), body, theme);
-      }
-      SpectrumStyle::Trail => {
-        self.advance(playing);
-        self.draw_trail(frame.buffer_mut(), body, theme);
-      }
-      SpectrumStyle::Stereo => {
-        self.advance(playing);
-        self.draw_stereo(frame.buffer_mut(), body, theme);
-      }
+      SpectrumStyle::Smooth => self.draw_smooth(buf, body, theme),
+      SpectrumStyle::Trail => self.draw_trail(buf, body, theme),
+      SpectrumStyle::Stereo => self.draw_stereo(buf, body, theme),
+      SpectrumStyle::Waterfall => self.draw_waterfall(buf, body, theme),
       SpectrumStyle::Radial => {
-        self.advance(playing);
-        self.draw_radial(frame.buffer_mut(), body, theme);
+        self.radial.advance(dt);
+        self.radial.draw(buf, body, theme, &self.levels, &self.peaks, cell);
       }
-      _ => {
-        self.advance(playing);
-        self.draw_bars(frame.buffer_mut(), body, theme);
+      SpectrumStyle::Fire => self.fire.draw(buf, body, theme, &self.levels, dt, &mut self.rng),
+      SpectrumStyle::Ridge => ridge::draw(buf, body, theme, &self.history, self.pushed),
+      SpectrumStyle::Sparks => {
+        self.draw_bars(buf, body, theme, BarKind::Zoned);
+        self.sparks.draw(buf, body, theme, &self.levels, dt, &mut self.rng);
       }
+      // The rest are bar variants and share one renderer.
+      _ => self.draw_bars(buf, body, theme, self.style.bar_kind().unwrap_or(BarKind::Zoned)),
     }
     self.draw_axis(frame, inner, body, theme);
   }
@@ -302,7 +337,10 @@ impl SpectrumView {
   }
 
   /// Bar decay and peak hold, shared by every style with falling peaks.
-  fn advance(&mut self, playing: bool) {
+  ///
+  /// Returns the seconds since the previous call, which the styles with their own
+  /// physics use to step forward.
+  fn advance(&mut self, playing: bool) -> f32 {
     let now = std::time::Instant::now();
     let dt = now.duration_since(self.updated).as_secs_f32().min(0.2);
     self.updated = now;
@@ -327,142 +365,46 @@ impl SpectrumView {
         self.peaks_right[i] = self.levels_right[i].max(self.peaks_right[i] - dt * PEAK_DECAY);
       }
     }
-  }
-
-  fn draw_bars(&self, buf: &mut Buffer, body: Rect, theme: &Theme) {
-    let height = body.height;
-    if height == 0 || body.width == 0 {
-      return;
-    }
-    // One blank column between bars keeps them visually separate.
-    let count = BANDS.min((body.width as usize).div_ceil(2)).max(1);
-    let step = (body.width as usize + 1) / count;
-    let width = step.saturating_sub(1).max(1);
-    let offset = (body.width as usize - (count * step - (step - width))) / 2;
-    let rows = if self.style == SpectrumStyle::Mirror { height & !1 } else { height };
-    if rows == 0 {
-      return;
-    }
-    let half = rows / 2;
-    let scale = f32::from(if self.style == SpectrumStyle::Mirror { half } else { rows });
-    let bottom = body.y + height;
-    for bar in 0..count {
-      // Narrow panes merge several bands into one bar rather than clipping.
-      let start = bar * BANDS / count;
-      let end = ((bar + 1) * BANDS / count).max(start + 1);
-      let level = self.levels[start..end].iter().copied().fold(0.0, f32::max) * scale;
-      let peak = self.peaks[start..end].iter().copied().fold(0.0, f32::max) * scale;
-      for col in 0..width {
-        let x = body.x + (offset + bar * step + col) as u16;
-        if x >= body.x + body.width {
-          break;
-        }
-        match self.style {
-          SpectrumStyle::Mirror => {
-            for row in 0..half {
-              let (glyph, color) = self.bar_cell(theme, row, half, level, peak);
-              buf[(x, bottom - half - 1 - row)].set_char(glyph).set_fg(color).set_bg(theme.panel_bg);
-              // The lower half inverts fg and bg so a partial cell reads as a
-              // solid bar without a second glyph set.
-              let cell = &mut buf[(x, bottom - half + row)];
-              match (glyph, Self::units(level, row)) {
-                (' ', _) => cell.set_char(' ').set_fg(theme.panel_bg).set_bg(theme.panel_bg),
-                ('▔', _) => cell.set_char('▁').set_fg(color).set_bg(theme.panel_bg),
-                (_, 8) => cell.set_char('█').set_fg(color).set_bg(theme.panel_bg),
-                (_, units) => cell.set_char(BLOCKS[8 - units]).set_fg(theme.panel_bg).set_bg(color),
-              };
-            }
-            if rows < height {
-              buf[(x, body.y)].set_char(' ').set_fg(theme.panel_bg).set_bg(theme.panel_bg);
-            }
-          }
-          SpectrumStyle::Dots | SpectrumStyle::Squares => {
-            // Squares keeps the ladder but fills the whole cell, and colors it
-            // from the gradient rather than the flat zones, which reads as a
-            // contribution graph instead of a bar chart.
-            let square = self.style == SpectrumStyle::Squares;
-            let lit = level.round() as u16;
-            let peak_row = (peak.round() as u16).checked_sub(1);
-            for row in 0..rows {
-              let cell = &mut buf[(x, bottom - 1 - row)];
-              if row < lit || peak_row == Some(row) {
-                let color = if square {
-                  spectrum_gradient(theme, row as f32 / rows.saturating_sub(1).max(1) as f32)
-                } else {
-                  Self::zone(theme, row, rows)
-                };
-                cell.set_char(if square { '█' } else { '●' }).set_fg(color);
-              } else {
-                cell.set_char('·').set_fg(theme.border);
-              }
-              cell.set_bg(theme.panel_bg);
-            }
-          }
-          _ => {
-            for row in 0..rows {
-              let (glyph, color) = self.bar_cell(theme, row, rows, level, peak);
-              buf[(x, bottom - 1 - row)].set_char(glyph).set_fg(color).set_bg(theme.panel_bg);
-            }
-          }
-        }
-      }
-    }
-  }
-
-  /// Eighths of the cell at `row` covered by a bar of `level` rows.
-  fn units(level: f32, row: u16) -> usize {
-    ((level - row as f32) * 8.0).ceil().clamp(0.0, 8.0) as usize
-  }
-
-  /// Flat color for a row, matching the gradient's three zones.
-  fn zone(theme: &Theme, row: u16, rows: u16) -> Color {
-    let position = row as f32 / rows.max(1) as f32;
-    if position < 0.55 {
-      theme.spectrum[0]
-    } else if position < 0.8 {
-      theme.spectrum[1]
-    } else {
-      theme.spectrum[2]
-    }
-  }
-
-  /// Glyph and color of one cell in a vertical bar, including the peak marker.
-  fn bar_cell(&self, theme: &Theme, row: u16, rows: u16, level: f32, peak: f32) -> (char, Color) {
-    let units = Self::units(level, row);
-    let glyph =
-      if units == 0 && peak > 0.05 && row == (peak.ceil() as u16).saturating_sub(1) { '▔' } else { BLOCKS[units] };
-    let color = match self.style {
-      SpectrumStyle::Gradient => spectrum_gradient(theme, row as f32 / rows.saturating_sub(1).max(1) as f32),
-      SpectrumStyle::Mono if glyph == '▔' => theme.fg,
-      SpectrumStyle::Mono => theme.accent,
-      _ => Self::zone(theme, row, rows),
-    };
-    (glyph, color)
+    dt
   }
 
   /// Draws octave frequency marks along the bottom row.
   ///
-  /// The bands are logarithmic, so the axis is labelled in decades too: a
-  /// linear readout of what sits where is otherwise guesswork.
+  /// The bands are logarithmic, so the axis is labelled in decades too: a linear
+  /// readout of what sits where is otherwise guesswork. Below [`AXIS_MIN_WIDTH`]
+  /// there is no room for the labels and the ends together, and the ends say more.
   fn draw_axis(&self, frame: &mut Frame, inner: Rect, body: Rect, theme: &Theme) {
     let Some(current) = self.frame.as_ref() else {
+      Self::draw_axis_ends(frame, inner, body, theme);
       return;
     };
     let low = current.low_hz.max(1.0);
     let high = current.high_hz.max(low * 2.0);
     let span = (high / low).log10();
+    if span <= 0.0 || inner.width < AXIS_MIN_WIDTH {
+      Self::draw_axis_ends(frame, inner, body, theme);
+      return;
+    }
     let y = inner.y + body.height;
-
-    // One label per decade that fits, widest first so the labels never collide.
-    for &(marker, label) in AXIS_MARKS {
+    // A range too narrow to hold a decade would leave the row blank, which reads
+    // as a broken panel rather than as "no scale to show".
+    let marks: Vec<_> = AXIS_MARKS
+      .iter()
+      .filter(|&&(marker, _)| {
+        let ratio = 10_f32.powf(marker);
+        ratio >= low && ratio <= high
+      })
+      .collect();
+    if marks.is_empty() {
+      Self::draw_axis_ends(frame, inner, body, theme);
+      return;
+    }
+    for &(marker, label) in marks {
       let ratio = 10_f32.powf(marker);
-      if ratio < low || ratio > high || span <= 0.0 {
-        continue;
-      }
       let position = ((ratio / low).log10() / span).clamp(0.0, 1.0);
       // Land the label's left edge at the mark, but keep it inside the pane.
-      let width = label.len().min(usize::from(inner.width)) as u16;
-      if width == 0 || width > inner.width {
+      let width = (label.len() as u16).min(inner.width);
+      if width == 0 {
         continue;
       }
       let x = (f32::from(inner.x) + position * f32::from(inner.width.saturating_sub(1)))
@@ -472,511 +414,98 @@ impl SpectrumView {
     }
   }
 
-  /// Braille bars: two dot columns and four dot rows per cell.
-  ///
-  /// Four times the vertical resolution of half-block glyphs and twice the
-  /// horizontal, which is what makes the interpolated curve readable. Falls back
-  /// to plain bars if the pane is too small for the extra detail to show.
-  fn draw_smooth(&self, buf: &mut Buffer, body: Rect, theme: &Theme) {
-    if body.width < 4 || body.height < 2 {
-      self.draw_bars(buf, body, theme);
-      return;
-    }
-    let dot_rows = usize::from(body.height) * BRAILLE_ROWS;
-    let dot_columns = usize::from(body.width) * BRAILLE_COLUMNS;
-    for row in 0..body.height {
-      let y = body.y + row;
-      for x in 0..body.width {
-        let mut filled = [[false; BRAILLE_ROWS]; BRAILLE_COLUMNS];
-        let mut any = false;
-        for (column, column_filled) in filled.iter_mut().enumerate() {
-          let index = usize::from(x) * BRAILLE_COLUMNS + column;
-          if index >= dot_columns {
-            continue;
-          }
-          let position = index as f32 / (dot_columns - 1).max(1) as f32;
-          let level = sample_interpolated(&self.levels, position) * dot_rows as f32;
-          // Dots fill upward from the bottom of the cell stack.
-          let base = usize::from(body.height - 1 - row) * BRAILLE_ROWS;
-          for dot_row in 0..BRAILLE_ROWS {
-            if base + dot_row < level.ceil() as usize {
-              // Glyph rows count from the top of the cell.
-              column_filled[BRAILLE_ROWS - 1 - dot_row] = true;
-              any = true;
-            }
-          }
-        }
-        let cell = &mut buf[(body.x + x, y)];
-        if any {
-          cell.set_char(braille_glyph(&filled));
-        } else {
-          cell.set_char(' ');
-        }
-        cell.set_fg(Self::zone(theme, row, body.height)).set_bg(theme.panel_bg);
-      }
-    }
-  }
-
-  /// Bars with a fading tail drawn from recent frames.
-  ///
-  /// Reuses the waterfall's frame history, so no extra state: a transient
-  /// leaves a visible streak that decays over the trail length.
-  fn draw_trail(&self, buf: &mut Buffer, body: Rect, theme: &Theme) {
-    let height = body.height;
-    if height == 0 || body.width == 0 {
-      return;
-    }
-    let count = BANDS.min(usize::from(body.width)).max(1);
-    let bottom = body.y + height;
-    let history: Vec<&[f32; BANDS]> = self.history.iter().rev().take(TRAIL_LENGTH).collect();
-
-    // Draw oldest first so newer frames land on top.
-    for (age, frame) in history.iter().enumerate() {
-      let fade = 1.0 - (age as f32 + 1.0) / (TRAIL_LENGTH + 1) as f32;
-      if fade <= 0.0 {
-        break;
-      }
-      for bar in 0..count {
-        let position = bar as f32 / (count - 1).max(1) as f32;
-        let level = sample_interpolated(frame, position) * f32::from(height);
-        let x = body.x + (bar * 2) as u16;
-        if x >= body.x + body.width {
-          break;
-        }
-        let top = (bottom - 1).saturating_sub(level.round() as u16).max(body.y);
-        let cell = &mut buf[(x, top)];
-        // Newer frames keep the bar color; older ones fade toward the border.
-        let color = if age == 0 { Self::zone(theme, top.saturating_sub(body.y), height) } else { theme.border };
-        cell.set_char('▄').set_fg(color).set_bg(theme.panel_bg);
-      }
-    }
-  }
-
-  /// Left and right channels as opposing meters.
-  ///
-  /// Reads as a single bar when the channels match and opens a V when the
-  /// stereo image is wide, which the summed display could never show.
-  fn draw_stereo(&self, buf: &mut Buffer, body: Rect, theme: &Theme) {
-    let height = body.height & !1;
-    if height < 4 || body.width < 8 {
-      self.draw_bars(buf, body, theme);
-      return;
-    }
-    let half = height / 2;
-    let count = BANDS.min(usize::from(body.width) / 2).max(1);
-    let bottom = body.y + height;
-    for bar in 0..count {
-      let position = bar as f32 / (count - 1).max(1) as f32;
-      let left = sample_interpolated(&self.levels, position) * f32::from(half);
-      let right = sample_interpolated(&self.levels_right, position) * f32::from(half);
-      let x = body.x + (bar * 2) as u16;
-      if x >= body.x + body.width {
-        break;
-      }
-      for row in 0..half {
-        // The upper half grows up from the midline, the lower grows down. The two
-        // meet between rows `bottom - half - 1` and `bottom - half`.
-        let y_up = bottom - half + row;
-        let y_down = bottom - half - 1 - row;
-        let (glyph_l, _) = self.bar_cell(theme, row, half, left, 0.0);
-        let (glyph_r, _) = self.bar_cell(theme, row, half, right, 0.0);
-        buf[(x, y_up)].set_char(glyph_l).set_fg(Self::zone(theme, row, half)).set_bg(theme.panel_bg);
-        buf[(x, y_down)].set_char(glyph_r).set_fg(Self::zone(theme, row, half)).set_bg(theme.panel_bg);
-      }
-      // A dim spine keeps the two meters visually paired.
-      buf[(x, bottom - half)].set_char('│').set_fg(theme.border).set_bg(theme.panel_bg);
-    }
-  }
-
-  /// Bands around a circle, level as radius.
-  ///
-  /// A circle needs roughly equal width and height; in a wide, short pane this
-  /// falls back to bars rather than rendering a squashed ring.
-  fn draw_radial(&self, buf: &mut Buffer, body: Rect, theme: &Theme) {
-    let diameter = body.height.min(body.width);
-    if diameter < 6 {
-      self.draw_bars(buf, body, theme);
-      return;
-    }
-    let centre_x = f32::from(body.x) + f32::from(body.width) / 2.0;
-    let centre_y = f32::from(body.y) + f32::from(body.height) / 2.0;
-    let max_radius = f32::from(diameter) / 2.0 - 0.5;
-
-    // Band 0 at the top, sweeping clockwise: high frequencies to the right.
-    let angles: Vec<f32> = (0..BANDS)
-      .map(|band| -std::f32::consts::FRAC_PI_2 + band as f32 / BANDS as f32 * std::f32::consts::TAU)
-      .collect();
-
-    for (band, angle) in angles.iter().enumerate() {
-      let level = self.levels[band] * max_radius;
-      let steps = level.max(1.0) as usize;
-      for step in 0..steps {
-        let radius = 1.0 + step as f32;
-        if radius > max_radius {
-          break;
-        }
-        let x = centre_x + radius * angle.cos();
-        let y = centre_y + radius * angle.sin();
-        if x < f32::from(body.x) || x > f32::from(body.x + body.width - 1) {
-          continue;
-        }
-        if y < f32::from(body.y) || y > f32::from(body.y + body.height - 1) {
-          continue;
-        }
-        let cell = &mut buf[(x.round() as u16, y.round() as u16)];
-        cell.set_char('•').set_fg(spectrum_gradient(theme, level / max_radius)).set_bg(theme.panel_bg);
-      }
-    }
-  }
-
-  fn draw_waterfall(&self, buf: &mut Buffer, body: Rect, theme: &Theme) {
-    let width = usize::from(body.width);
-    if width == 0 || body.height == 0 {
-      return;
-    }
-    let bottom = body.y + body.height;
-    for row in 0..body.height {
-      let y = bottom - 1 - row;
-      let levels = self.history.len().checked_sub(1 + usize::from(row)).map(|index| self.history[index]);
-      for column in 0..width {
-        // Every column shows a band, merged when narrow and repeated when wide,
-        // so the history fills the width without gaps.
-        let x = body.x + column as u16;
-        let start = column * BANDS / width;
-        let end = ((column + 1) * BANDS / width).max(start + 1);
-        let level = levels.map_or(0.0, |levels| levels[start..end].iter().copied().fold(0.0, f32::max)).clamp(0.0, 1.0);
-        let cell = &mut buf[(x, y)];
-        if level <= 0.0 {
-          cell.set_char(' ').set_fg(theme.panel_bg).set_bg(theme.panel_bg);
-        } else {
-          let glyph = if level < 0.25 {
-            '░'
-          } else if level < 0.5 {
-            '▒'
-          } else if level < 0.75 {
-            '▓'
-          } else {
-            '█'
-          };
-          cell.set_char(glyph).set_fg(spectrum_gradient(theme, level)).set_bg(theme.panel_bg);
-        }
-      }
+  /// The plain LOW/HIGH pair, used before a frame arrives and in a narrow pane.
+  fn draw_axis_ends(frame: &mut Frame, inner: Rect, body: Rect, theme: &Theme) {
+    let y = inner.y + body.height;
+    frame.render_widget(
+      Paragraph::new("LOW").style(Style::default().fg(theme.muted)),
+      Rect::new(inner.x, y, inner.width.min(3), 1),
+    );
+    if inner.width >= 9 {
+      frame.render_widget(
+        Paragraph::new("HIGH").style(Style::default().fg(theme.muted)),
+        Rect::new(inner.right() - 4, y, 4, 1),
+      );
     }
   }
 }
-
 #[cfg(test)]
 mod tests {
   use super::*;
   use crate::theme::THEMES;
-  use ratatui::{Terminal, backend::TestBackend};
+  use rand::SeedableRng;
+  use ratatui::{
+    Terminal,
+    backend::TestBackend,
+    buffer::{Buffer, Cell},
+  };
+  use std::ops::Range;
 
-  fn theme() -> Theme {
-    THEMES[0]
+  /// A typical terminal cell: twice as tall as it is wide.
+  const CELL: (u16, u16) = (10, 20);
+
+  fn styled(style: SpectrumStyle) -> SpectrumView {
+    let mut view = SpectrumView::new(style);
+    // The particle styles are random; a fixed seed keeps their tests repeatable.
+    view.rng = SmallRng::seed_from_u64(7);
+    view
   }
-
   fn backend(width: u16, height: u16) -> Terminal<TestBackend> {
-    Terminal::new(TestBackend::new(width, height)).unwrap()
+    Terminal::new(TestBackend::new(width, height)).expect("test backend")
   }
-
-  fn active(levels: [f32; BANDS], id: Option<&str>) -> SpectrumFrame {
-    SpectrumFrame { active: true, levels, current_id: id.map(str::to_owned), ..SpectrumFrame::default() }
-  }
-
   fn render(view: &mut SpectrumView, terminal: &mut Terminal<TestBackend>, playing: bool) {
-    terminal.draw(|f| view.draw(f, f.area(), &theme(), playing)).unwrap();
+    terminal.draw(|f| view.draw(f, f.area(), &THEMES[0], playing, CELL)).expect("draw");
   }
-
-  fn buffer(terminal: &Terminal<TestBackend>) -> Buffer {
-    terminal.backend().buffer().clone()
+  fn active(levels: [f32; BANDS]) -> SpectrumFrame {
+    SpectrumFrame { active: true, levels, ..SpectrumFrame::default() }
   }
-
+  /// An active frame carrying a realistic frequency range, for tests that compare
+  /// whole buffers and would otherwise differ on the axis row alone.
+  fn scaled(levels: [f32; BANDS]) -> SpectrumFrame {
+    SpectrumFrame { low_hz: 40.0, high_hz: 16_000.0, ..active(levels) }
+  }
+  /// An active frame with an independent right channel.
+  fn stereo(levels: [f32; BANDS], right: [f32; BANDS]) -> SpectrumFrame {
+    SpectrumFrame { levels_right: right, ..active(levels) }
+  }
+  /// A frame of `level` in `bands` and silence elsewhere.
+  fn bands_at(range: Range<usize>, level: f32) -> [f32; BANDS] {
+    std::array::from_fn(|band| if range.contains(&band) { level } else { 0.0 })
+  }
+  fn top_row(terminal: &Terminal<TestBackend>) -> String {
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.width).map(|x| buffer[(x, 0)].symbol().to_string()).collect()
+  }
+  fn row_symbols(terminal: &Terminal<TestBackend>, y: u16) -> String {
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.width).map(|x| buffer[(x, y)].symbol().to_string()).collect()
+  }
   fn glyph_at(terminal: &Terminal<TestBackend>, x: u16, y: u16) -> String {
     terminal.backend().buffer()[(x, y)].symbol().to_string()
   }
-
-  /// Lets the next draw see a full decay step with peak holds expired.
+  /// Cells of `y` that are not blank, which is how a shape is measured.
+  fn lit(terminal: &Terminal<TestBackend>, y: u16) -> usize {
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.width).filter(|x| buffer[(*x, y)].symbol() != " ").count()
+  }
+  /// Lets the next draw see 200 ms of decay with an expired peak hold.
   fn age(view: &mut SpectrumView) {
     view.updated = std::time::Instant::now() - std::time::Duration::from_millis(200);
-    let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
-    view.hold.fill(past);
+    view.hold.fill(std::time::Instant::now() - std::time::Duration::from_secs(1));
   }
-
-  #[test]
-  fn styles_cycle_through_every_style_and_round_trip_by_name() {
-    assert_eq!(SpectrumStyle::default(), SpectrumStyle::Gradient, "gradient is the default");
-    assert_eq!(SpectrumStyle::ALL[0], SpectrumStyle::default(), "the cycle starts at the default");
-    let mut style = SpectrumStyle::default();
-    let mut seen = vec![style];
-    for _ in 0..SpectrumStyle::ALL.len() - 1 {
-      style = style.next();
-      assert!(!seen.contains(&style), "cycle repeated {style:?}");
-      seen.push(style);
-    }
-    assert_eq!(seen.len(), SpectrumStyle::ALL.len());
-    assert_eq!(style.next(), SpectrumStyle::default(), "the cycle must wrap back to the default");
-    for style in SpectrumStyle::ALL {
-      assert_eq!(SpectrumStyle::from_id(style.id()), style);
-      assert!(!style.id().is_empty());
-    }
-    assert_eq!(SpectrumStyle::from_id("nonsense"), SpectrumStyle::Gradient, "unknown names fall back to the default");
-  }
-
-  #[test]
-  fn bars_sleep_once_they_decay_and_wake_for_new_audio() {
-    let mut view = SpectrumView::new(SpectrumStyle::Bars);
-    let mut terminal = backend(40, 12);
-    render(&mut view, &mut terminal, false);
-    assert!(!view.needs_animation(), "an empty view is idle");
-    view.accept(active([1.0; BANDS], None));
-    assert!(view.needs_animation(), "new audio must wake the display");
-    render(&mut view, &mut terminal, true);
-    for _ in 0..20 {
-      age(&mut view);
-      render(&mut view, &mut terminal, false);
-    }
-    assert!(!view.needs_animation(), "bars must settle instead of spinning forever");
-    view.accept(SpectrumFrame::default());
-    assert!(view.needs_animation(), "a pause must let bars fall");
-  }
-
-  #[test]
-  fn gradient_blends_across_every_row_of_a_full_bar() {
-    let theme = theme();
-    let mut view = SpectrumView::new(SpectrumStyle::Gradient);
-    let mut terminal = backend(40, 12);
-    view.accept(active([1.0; BANDS], None));
-    render(&mut view, &mut terminal, true);
-    // Body rows are y = 1..=9; the border occupies row 0 and the axis row 10.
-    let buf = buffer(&terminal);
-    let column: Vec<Color> = (1..=9).map(|y| buf[(1, y)].fg).collect();
-    assert!((1..=9).all(|y| buf[(1, y)].symbol() == "█"), "a full bar fills every row");
-    assert_eq!(column[8], theme.spectrum[0], "the bottom row is the low stop");
-    assert_eq!(column[0], theme.spectrum[2], "the top row is the high stop");
-    assert!(
-      column.iter().any(|c| !theme.spectrum.contains(c)),
-      "intermediate rows must blend the stops, got {column:?}"
-    );
-    let mut distinct = column.clone();
-    distinct.dedup();
-    assert_eq!(distinct.len(), column.len(), "every row needs its own color: {column:?}");
-  }
-
-  #[test]
-  fn mono_uses_the_accent_and_marks_peaks_with_text_color() {
-    let theme = theme();
-    let mut view = SpectrumView::new(SpectrumStyle::Mono);
-    let mut terminal = backend(40, 12);
-    view.accept(active([0.5; BANDS], None));
-    render(&mut view, &mut terminal, true);
-    // Spaces must be excluded: an unwritten cell is blank, not a bar.
-    let is_bar = |symbol: &str| symbol != " " && symbol.chars().all(|c| BLOCKS.contains(&c));
-    let buf = buffer(&terminal);
-    assert!(buf.content().iter().any(|c| is_bar(c.symbol())), "bars must be drawn");
-    assert!(
-      buf.content().iter().filter(|c| is_bar(c.symbol())).all(|c| c.fg == theme.accent),
-      "mono bars use the accent color"
-    );
-    assert!(!buf.content().iter().any(|c| c.symbol() == "▔"), "no peak marker yet");
-    // Drop the level so the held peak separates from the bar.
-    view.accept(active([0.05; BANDS], None));
-    age(&mut view);
-    render(&mut view, &mut terminal, true);
-    let buf = buffer(&terminal);
-    let markers: Vec<Color> = buf.content().iter().filter(|c| c.symbol() == "▔").map(|c| c.fg).collect();
-    assert!(!markers.is_empty(), "a falling level must leave a peak marker");
-    assert!(markers.iter().all(|c| *c == theme.fg), "peak markers use the text color");
-    assert!(
-      buf.content().iter().filter(|c| is_bar(c.symbol())).all(|c| c.fg == theme.accent),
-      "bars stay on the accent while the marker uses text"
-    );
-  }
-
-  #[test]
-  fn bars_keep_a_blank_column_between_them() {
-    let mut view = SpectrumView::new(SpectrumStyle::Bars);
-    let mut terminal = backend(61, 12);
-    view.accept(active([1.0; BANDS], None));
-    render(&mut view, &mut terminal, true);
-    // An odd width must still alternate bar, gap, bar...
-    for x in 1..60 {
-      let expected = if x % 2 == 1 { "█" } else { " " };
-      assert_eq!(glyph_at(&terminal, x, 9), expected, "column {x}");
+  /// Lets frames go stale and the envelope, fire, and sparks settle while paused.
+  fn settle(view: &mut SpectrumView, terminal: &mut Terminal<TestBackend>) {
+    view.received = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    for _ in 0..40 {
+      age(view);
+      render(view, terminal, false);
     }
   }
-
-  #[test]
-  fn mirror_is_symmetric_and_inverts_partial_lower_cells() {
-    let theme = theme();
-    let mut view = SpectrumView::new(SpectrumStyle::Mirror);
-    let mut terminal = backend(40, 12);
-    view.accept(active([0.6; BANDS], None));
-    render(&mut view, &mut terminal, true);
-    let buf = buffer(&terminal);
-    assert_eq!(buf[(1, 1)].symbol(), " ", "an odd top row stays blank");
-    for y in [4, 5, 6, 7] {
-      assert_eq!(buf[(1, y)].symbol(), "█", "row {y}");
-      assert_eq!(buf[(1, y)].bg, theme.panel_bg, "row {y}");
-    }
-    let upper = &buf[(1, 3)];
-    let lower = &buf[(1, 8)];
-    assert_eq!(upper.symbol(), "▄", "0.4 of a row is four eighths");
-    assert_eq!(upper.bg, theme.panel_bg);
-    assert_eq!(lower.symbol(), "▄", "the mirrored cell is painted inverted");
-    assert_eq!(lower.fg, theme.panel_bg, "inverted cells paint the canvas color");
-    assert_eq!(lower.bg, upper.fg, "inverted cells fill with the bar color");
-    assert_eq!(buf[(1, 2)].symbol(), " ");
-    assert_eq!(buf[(1, 9)].symbol(), " ");
+  fn braille_glyphs(buffer: &Buffer) -> usize {
+    buffer.content().iter().filter(|cell| cell.symbol().chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c))).count()
   }
-
-  #[test]
-  fn a_single_body_row_cannot_host_a_mirror() {
-    let mut view = SpectrumView::new(SpectrumStyle::Mirror);
-    let mut terminal = backend(40, 4);
-    view.accept(active([1.0; BANDS], None));
-    render(&mut view, &mut terminal, true);
-    assert_eq!(glyph_at(&terminal, 1, 1), " ", "nothing is drawn rather than panicking");
-  }
-
-  #[test]
-  fn dots_light_whole_segments_and_hold_a_peak_dot() {
-    let theme = theme();
-    let mut view = SpectrumView::new(SpectrumStyle::Dots);
-    let mut terminal = backend(40, 12);
-    view.accept(active([0.5; BANDS], None));
-    render(&mut view, &mut terminal, true);
-    let buf = buffer(&terminal);
-    // 0.5 × 9 rows rounds to 5 lit segments from the bottom.
-    let lit: Vec<u16> = (1..=9).filter(|y| buf[(1, *y)].symbol() == "●").collect();
-    assert_eq!(lit, vec![5, 6, 7, 8, 9]);
-    assert!((1..=4).all(|y| buf[(1, y)].symbol() == "·" && buf[(1, y)].fg == theme.border), "unlit segments are dim");
-    assert_eq!(buf[(1, 9)].fg, theme.spectrum[0], "the lowest segment is the low stop");
-    view.accept(active([0.1; BANDS], None));
-    age(&mut view);
-    render(&mut view, &mut terminal, true);
-    let buf = buffer(&terminal);
-    let lit: Vec<u16> = (1..=9).filter(|y| buf[(1, *y)].symbol() == "●").collect();
-    assert_eq!(lit.len(), 2, "one lit segment plus a held peak dot: {lit:?}");
-    assert_eq!(lit[1], 9, "the lit segment stays on the bottom row");
-    assert!(lit[0] < 8, "the peak dot floats above the bar");
-  }
-
-  #[test]
-  fn waterfall_scrolls_per_frame_and_freezes_without_them() {
-    let theme = theme();
-    let mut view = SpectrumView::new(SpectrumStyle::Waterfall);
-    let mut terminal = backend(40, 12);
-    render(&mut view, &mut terminal, true);
-    assert!(!view.needs_animation(), "an empty waterfall is idle");
-    view.accept(active([1.0; BANDS], None));
-    assert!(view.needs_animation(), "a frame requests a draw");
-    render(&mut view, &mut terminal, true);
-    assert!(!view.needs_animation(), "nothing moves until the next frame");
-    let buf = buffer(&terminal);
-    assert!((1..=38).all(|x| buf[(x, 9)].symbol() == "█"), "the newest row fills the width");
-    assert_eq!(buf[(4, 9)].fg, theme.spectrum[2], "full scale uses the top of the gradient");
-    assert_eq!(buf[(4, 8)].symbol(), " ", "the row above is still empty");
-    view.accept(active([0.3; BANDS], None));
-    view.accept(active([0.0; BANDS], None));
-    render(&mut view, &mut terminal, true);
-    let buf = buffer(&terminal);
-    assert_eq!(buf[(4, 9)].symbol(), " ", "silence leaves a blank row");
-    assert_eq!(buf[(4, 9)].fg, theme.panel_bg, "blank cells keep a constant color");
-    assert_eq!(buf[(4, 8)].symbol(), "▒");
-    assert_eq!(buf[(4, 7)].symbol(), "█");
-    for _ in 0..5 {
-      age(&mut view);
-      render(&mut view, &mut terminal, false);
-    }
-    assert_eq!(glyph_at(&terminal, 4, 7), "█", "pausing freezes the history");
-    assert!(!view.needs_animation());
-  }
-
-  #[test]
-  fn waterfall_keeps_a_bounded_history_and_fills_narrow_panes() {
-    let mut view = SpectrumView::new(SpectrumStyle::Waterfall);
-    for _ in 0..HISTORY + 10 {
-      view.accept(active([0.2; BANDS], None));
-    }
-    assert_eq!(view.history.len(), HISTORY, "history must not grow without bound");
-    view.clear();
-    assert!(view.history.is_empty());
-    view.accept(active([0.2; BANDS], None));
-    // A pane narrower than the band count merges bands instead of clipping them.
-    let mut narrow = backend(20, 12);
-    render(&mut view, &mut narrow, true);
-    let row: Vec<String> = (1..19).map(|x| glyph_at(&narrow, x, 9)).collect();
-    assert!(row.iter().all(|s| s == "░"), "every column must be filled: {row:?}");
-  }
-
-  #[test]
-  fn a_new_track_clears_the_history_but_a_resume_keeps_it() {
-    let mut view = SpectrumView::new(SpectrumStyle::Waterfall);
-    view.accept(active([0.9; BANDS], Some("first")));
-    view.accept(active([0.9; BANDS], Some("first")));
-    assert_eq!(view.history.len(), 2);
-    // A new generation on the same track is a seek: the past was heard.
-    view.accept(SpectrumFrame {
-      generation: 1,
-      active: true,
-      levels: [0.5; BANDS],
-      current_id: Some("first".into()),
-      ..SpectrumFrame::default()
-    });
-    view.accept(active([0.5; BANDS], Some("first")));
-    assert!(!view.history.is_empty(), "a seek keeps the waterfall");
-    view.accept(active([0.9; BANDS], Some("second")));
-    assert_eq!(view.history.len(), 1, "a new track starts a fresh history");
-    view.clear();
-    assert!(view.levels.iter().all(|l| *l == 0.0), "clearing drops the bars");
-  }
-
-  #[test]
-  fn switching_styles_keeps_levels_and_history() {
-    let mut view = SpectrumView::new(SpectrumStyle::Bars);
-    let mut terminal = backend(40, 12);
-    view.accept(active([0.8; BANDS], None));
-    render(&mut view, &mut terminal, true);
-    assert!(view.levels.iter().all(|v| *v > 0.0));
-    let collected = view.history.len();
-    view.set_style(SpectrumStyle::Waterfall);
-    assert_eq!(view.style, SpectrumStyle::Waterfall, "set_style must record the new style");
-    assert!(view.needs_animation(), "a style change redraws once");
-    assert_eq!(view.history.len(), collected, "history collected in bars carries over");
-    assert!(view.levels.iter().all(|v| *v > 0.0), "levels carry over");
-    render(&mut view, &mut terminal, true);
-    view.set_style(SpectrumStyle::Dots);
-    assert_eq!(view.history.len(), collected);
-    assert!(view.levels.iter().all(|v| *v > 0.0));
-  }
-
-  #[test]
-  fn narrow_and_degenerate_areas_draw_without_panicking() {
-    let mut view = SpectrumView::new(SpectrumStyle::Gradient);
-    view.accept(active([1.0; BANDS], None));
-    for (width, height) in [(1, 1), (2, 3), (10, 2), (3, 20), (80, 30)] {
-      let mut terminal = backend(width, height);
-      render(&mut view, &mut terminal, true);
-    }
-    for style in SpectrumStyle::ALL {
-      let mut view = SpectrumView::new(style);
-      view.accept(active([1.0; BANDS], None));
-      let mut terminal = backend(6, 5);
-      render(&mut view, &mut terminal, true);
-    }
-  }
-
-  #[test]
-  fn every_new_style_renders_and_animates() {
-    for style in [SpectrumStyle::Smooth, SpectrumStyle::Trail, SpectrumStyle::Stereo, SpectrumStyle::Radial] {
-      let mut view = SpectrumView::new(style);
-      let mut terminal = backend(60, 16);
-      view.accept(active([0.8; BANDS], None));
-      render(&mut view, &mut terminal, true);
-      assert!(view.needs_animation(), "{style:?} must animate while audio plays");
-      age(&mut view);
-      render(&mut view, &mut terminal, true);
-    }
+  fn is_bar(cell: &Cell) -> bool {
+    cell.symbol() != " " && cell.symbol().chars().all(|c| ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'].contains(&c))
   }
 
   #[test]
@@ -995,174 +524,556 @@ mod tests {
   }
 
   #[test]
-  fn interpolation_fills_the_gaps_between_bands() {
-    // A linear ramp: any position between bands must read between its
-    // neighbours rather than snapping to a staircase.
-    let ramp: [f32; BANDS] = std::array::from_fn(|i| i as f32 / (BANDS - 1) as f32);
-    assert_eq!(sample_interpolated(&ramp, 0.0), 0.0, "the low end is read exactly");
-    assert_eq!(sample_interpolated(&ramp, 1.0), 1.0, "the high end is read exactly");
-    for position in [0.1, 0.25, 0.5, 0.75, 0.9] {
-      let read = sample_interpolated(&ramp, position);
-      let expected = position.clamp(0.0, 1.0);
-      assert!((read - expected).abs() < 0.05, "at {position} expected about {expected}, got {read}");
-    }
-    // A lone hot band must still fall off smoothly around itself.
-    let mut spike = [0.0; BANDS];
-    spike[0] = 1.0;
-    assert_eq!(sample_interpolated(&spike, 0.0), 1.0);
-    assert_eq!(sample_interpolated(&spike, 1.0), 0.0, "far from the spike is silence");
-    assert!(sample_interpolated(&spike, 0.02) > sample_interpolated(&spike, 0.08), "must decay away from the spike");
+  fn an_unknown_style_name_falls_back_to_the_default() {
+    // A preferences file written by a newer build must not wedge the panel.
+    assert_eq!(SpectrumStyle::from_id("plasma"), SpectrumStyle::default());
+    assert_eq!(SpectrumStyle::from_id(""), SpectrumStyle::default());
   }
 
   #[test]
-  fn interpolation_clamps_out_of_range_positions() {
-    let ramp = [0.5; BANDS];
-    assert_eq!(sample_interpolated(&ramp, -1.0), 0.5);
-    assert_eq!(sample_interpolated(&ramp, 2.0), 0.5);
-  }
-
-  #[test]
-  fn braille_glyphs_use_the_documented_dot_numbering() {
-    assert_eq!(braille_glyph(&[[false; BRAILLE_ROWS]; BRAILLE_COLUMNS]), '\u{2800}', "blank cell");
-    let mut bottom_left = [[false; BRAILLE_ROWS]; BRAILLE_COLUMNS];
-    bottom_left[0][BRAILLE_ROWS - 1] = true;
-    assert_eq!(braille_glyph(&bottom_left), char::from_u32(0x2800 + 0x40).expect("valid"));
-    let mut top_right = [[false; BRAILLE_ROWS]; BRAILLE_COLUMNS];
-    top_right[1][0] = true;
-    assert_eq!(braille_glyph(&top_right), char::from_u32(0x2800 + 0x08).expect("valid"));
-    assert_eq!(braille_glyph(&[[true; BRAILLE_ROWS]; BRAILLE_COLUMNS]), char::from_u32(0x28FF).expect("valid"));
-  }
-
-  #[test]
-  fn smooth_draws_braille_and_falls_back_when_too_small() {
-    let mut view = SpectrumView::new(SpectrumStyle::Smooth);
+  fn animation_sleeps_after_decay_and_wakes_for_new_audio() {
+    let mut view = styled(SpectrumStyle::Bars);
     let mut terminal = backend(40, 12);
-    view.accept(active([0.5; BANDS], None));
+    render(&mut view, &mut terminal, false);
+    view.accept(active([1.0; BANDS]));
+    assert!(view.needs_animation());
     render(&mut view, &mut terminal, true);
-    let buf = buffer(&terminal);
-    let braille_cells = (1..=9)
-      .flat_map(|y| (1..=38).map(move |x| (x, y)))
-      .filter(|(x, y)| buf[(*x, *y)].symbol().chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)))
-      .count();
-    assert!(braille_cells > 8, "expected a lit braille region, got {braille_cells} cells");
-
-    // Too small for the detail: must degrade to bars, not garbage.
-    let mut tiny = backend(3, 2);
-    render(&mut view, &mut tiny, true);
+    settle(&mut view, &mut terminal);
+    assert!(!view.needs_animation(), "the panel must stop asking for frames");
+    view.accept(active([0.5; BANDS]));
+    assert!(view.needs_animation(), "resume wakes animation");
+    render(&mut view, &mut terminal, true);
+    assert!(view.needs_animation(), "live levels keep the panel awake");
+    // Audio that stopped arriving must not hold the panel open at full rate.
+    view.received = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    settle(&mut view, &mut terminal);
+    assert!(!view.needs_animation(), "stale audio cannot hold the panel awake");
   }
 
   #[test]
-  fn stereo_separates_the_channels() {
-    let mut view = SpectrumView::new(SpectrumStyle::Stereo);
+  fn titles_name_the_style() {
+    let mut view = styled(SpectrumStyle::Gradient);
+    let mut terminal = backend(44, 12);
+    terminal.draw(|f| view.draw(f, f.area(), &THEMES[0], false, CELL)).expect("draw");
+    assert!(top_row(&terminal).contains("SPECTRUM · gradient"), "{}", top_row(&terminal));
+  }
+
+  #[test]
+  fn gradient_runs_between_the_theme_roles() {
+    let theme = THEMES[0];
+    let mut view = styled(SpectrumStyle::Gradient);
     let mut terminal = backend(40, 12);
-    let mut frame = active([1.0; BANDS], None);
-    frame.levels_right = [0.05; BANDS];
-    view.accept(frame);
+    view.accept(active([1.0; BANDS]));
     render(&mut view, &mut terminal, true);
-    let buf = buffer(&terminal);
-    let lit = |y: u16| (1..=38).filter(|x| buf[(*x, y)].symbol() != " ").count();
-    // The upper half is the left channel, the lower the right. With 9 rows of
-    // body they occupy 5..=8 and 1..=4 respectively.
-    assert!(lit(7) > lit(2), "left meter is the loud one: {} above, {} below", lit(7), lit(2));
+    // Body rows are y = 1..=9 (title row 0, axis row 10, border row 11).
+    let buffer = terminal.backend().buffer();
+    let column: Vec<ratatui::style::Color> = (1..=9).map(|y| buffer[(1, y)].fg).collect();
+    assert!((1..=9).all(|y| buffer[(1, y)].symbol() == "█"));
+    assert_eq!(column[8], theme.spectrum[0], "bottom row is the low role");
+    assert_eq!(column[0], theme.spectrum[2], "top row is the high role");
+    assert!(column.iter().any(|c| !theme.spectrum.contains(c)), "intermediate rows blend the roles");
+    let mut distinct = column.clone();
+    distinct.dedup();
+    assert_eq!(distinct.len(), column.len(), "every row has its own color");
   }
 
   #[test]
-  fn stereo_is_symmetric_for_a_mono_signal() {
-    let mut view = SpectrumView::new(SpectrumStyle::Stereo);
+  fn mono_uses_the_accent_and_marks_peaks_with_the_text_role() {
+    let theme = THEMES[0];
+    let mut view = styled(SpectrumStyle::Mono);
     let mut terminal = backend(40, 12);
-    // A mono source decodes to the same signal on both channels.
-    let mut frame = active([0.7; BANDS], None);
-    frame.levels_right = frame.levels;
-    view.accept(frame);
+    view.accept(active([0.5; BANDS]));
     render(&mut view, &mut terminal, true);
-    let buf = buffer(&terminal);
-    let lit = |y: u16| (1..=38).filter(|x| buf[(*x, y)].symbol() != " ").count();
-    assert!(lit(7) > 0 && lit(2) > 0, "both halves must draw something: {} above, {} below", lit(7), lit(2));
-    assert_eq!(lit(7), lit(2), "identical channels must render symmetrically");
+    let buffer = terminal.backend().buffer();
+    assert!(buffer.content().iter().any(is_bar));
+    assert!(
+      buffer.content().iter().filter(|c| is_bar(c)).all(|c| c.fg == theme.accent),
+      "every bar cell is the accent role"
+    );
+    assert!(!buffer.content().iter().any(|c| c.symbol() == "▔"));
+    // Let the level fall below the held peak so the marker appears.
+    view.accept(active([0.1; BANDS]));
+    age(&mut view);
+    render(&mut view, &mut terminal, true);
+    let buffer = terminal.backend().buffer();
+    let markers: Vec<_> = buffer.content().iter().filter(|c| c.symbol() == "▔").map(|c| c.fg).collect();
+    assert!(!markers.is_empty(), "a falling level must show a peak marker");
+    assert!(markers.iter().all(|c| *c == theme.fg), "the peak marker uses the text role");
   }
 
   #[test]
-  fn the_axis_names_real_frequencies() {
-    let mut view = SpectrumView::new(SpectrumStyle::Bars);
-    let mut terminal = backend(40, 12);
-    let mut frame = active([0.5; BANDS], None);
-    frame.low_hz = 40.0;
-    frame.high_hz = 16_000.0;
-    view.accept(frame);
-    render(&mut view, &mut terminal, true);
-    let buf = terminal.backend().buffer().clone();
-    let axis: String = (0..40).map(|x| buf[(x, 10)].symbol()).collect();
-    assert!(axis.contains("100") || axis.contains("1k"), "the axis should name octave marks, got {axis:?}");
-  }
-
-  #[test]
-  fn wide_panes_fall_back_instead_of_rendering_nonsense() {
-    for style in [SpectrumStyle::Radial, SpectrumStyle::Stereo, SpectrumStyle::Smooth] {
-      let mut view = SpectrumView::new(style);
-      view.accept(active([0.9; BANDS], None));
-      for (width, height) in [(3, 2), (5, 3), (8, 4), (12, 6)] {
-        let mut terminal = backend(width, height);
-        render(&mut view, &mut terminal, true);
+  fn bars_keep_a_blank_column_between_them() {
+    let mut view = styled(SpectrumStyle::Bars);
+    view.accept(active([1.0; BANDS]));
+    // Odd inner widths are where an off-by-one in the spacing would show up.
+    for width in [41_u16, 61, 80, 121] {
+      let mut terminal = backend(width, 12);
+      render(&mut view, &mut terminal, true);
+      let buffer = terminal.backend().buffer();
+      // Group the bottom body row into runs of filled columns.
+      let filled: Vec<bool> = (1..width - 1).map(|x| buffer[(x, 9)].symbol() != " ").collect();
+      let mut runs: Vec<(usize, usize)> = Vec::new();
+      let mut previous = false;
+      for (index, on) in filled.iter().enumerate() {
+        match (*on, previous) {
+          (true, true) => {
+            if let Some(last) = runs.last_mut() {
+              last.1 += 1;
+            }
+          }
+          (true, false) => runs.push((index, 1)),
+          _ => {}
+        }
+        previous = *on;
+      }
+      assert!(runs.len() > 1, "width {width} should draw several bars");
+      let widths: Vec<usize> = runs.iter().map(|(_, length)| *length).collect();
+      assert!(widths.iter().all(|length| *length == widths[0]), "width {width} drew uneven bars: {widths:?}");
+      // Every bar must be separated from the next by at least one blank column,
+      // which is what stops the bars reading as one solid block.
+      for pair in runs.windows(2) {
+        let (start, length) = pair[0];
+        assert!(start + length < pair[1].0, "width {width} ran the bars at {start} and {} together", pair[1].0);
       }
     }
   }
 
   #[test]
-  fn squares_fill_whole_cells_and_gradient_colors_them() {
-    let mut view = SpectrumView::new(SpectrumStyle::Squares);
+  fn mirror_is_symmetric_and_inverts_partial_lower_cells() {
+    let theme = THEMES[0];
+    let mut view = styled(SpectrumStyle::Mirror);
     let mut terminal = backend(40, 12);
-    view.accept(active([0.9; BANDS], None));
+    view.accept(active([0.6; BANDS]));
     render(&mut view, &mut terminal, true);
-    let buf = buffer(&terminal);
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(1, 1)].symbol(), " ", "the odd top row stays blank");
+    for y in [4, 5, 6, 7] {
+      assert_eq!(buffer[(1, y)].symbol(), "█", "row {y}");
+    }
+    let upper = &buffer[(1, 3)];
+    let lower = &buffer[(1, 8)];
+    assert_eq!(upper.symbol(), "▄", "0.4 of a row is four eighths");
+    assert_eq!(lower.bg, upper.fg, "the lower half fills with the zone color");
+    assert_eq!(lower.fg, theme.panel_bg, "and paints over it in the canvas color");
+  }
 
-    // A lit cell must be a full block, not the round dot the sibling style uses.
+  #[test]
+  fn a_single_body_row_cannot_host_a_mirror() {
+    let mut view = styled(SpectrumStyle::Mirror);
+    view.accept(active([1.0; BANDS]));
+    let mut terminal = backend(40, 4);
+    render(&mut view, &mut terminal, true);
+    assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), " ");
+  }
+
+  #[test]
+  fn dots_light_whole_segments_and_hold_a_peak_dot() {
+    let theme = THEMES[0];
+    let mut view = styled(SpectrumStyle::Dots);
+    let mut terminal = backend(40, 12);
+    view.accept(active([0.5; BANDS]));
+    render(&mut view, &mut terminal, true);
+    let buffer = terminal.backend().buffer();
+    // Body rows y = 1..=9; 0.5 × 9 = 4.5 rounds to 5 lit segments from the bottom.
+    let lit_rows: Vec<u16> = (1..=9).filter(|y| buffer[(1, *y)].symbol() == "●").collect();
+    assert_eq!(lit_rows, vec![5, 6, 7, 8, 9]);
+    assert!((1..=4).all(|y| buffer[(1, y)].symbol() == "·" && buffer[(1, y)].fg == theme.border));
+    assert_eq!(buffer[(1, 9)].fg, theme.spectrum[0]);
+  }
+
+  #[test]
+  fn squares_fill_whole_cells_and_gradient_colors_them() {
+    let mut view = styled(SpectrumStyle::Squares);
+    let mut terminal = backend(40, 12);
+    view.accept(active([0.9; BANDS]));
+    render(&mut view, &mut terminal, true);
+    let buffer = terminal.backend().buffer();
     let mut blocks = 0;
     let mut dots = 0;
     for y in 1..=9 {
       for x in 1..=38 {
-        match glyph_at(&terminal, x, y).as_str() {
-          "\u{2588}" => blocks += 1,
-          "\u{25cf}" => dots += 1,
+        match buffer[(x, y)].symbol() {
+          "█" => blocks += 1,
+          "●" => dots += 1,
           _ => {}
         }
       }
     }
     assert!(blocks > 0, "squares must draw solid blocks, got none");
     assert_eq!(dots, 0, "squares must not draw the round dot glyph");
-
-    // The gradient must actually vary with height; a flat color would put every
-    // lit cell on the same entry of the spectrum ramp.
-    let mut colors = std::collections::HashSet::new();
-    for y in 1..=9 {
-      for x in 1..=38 {
-        if glyph_at(&terminal, x, y) == "\u{2588}" {
-          colors.insert(buf[(x, y)].fg);
-        }
-      }
-    }
+    let colors: std::collections::HashSet<_> = (1..=9)
+      .flat_map(|y| (1..=38).map(move |x| (x, y)))
+      .filter(|(x, y)| buffer[(*x, *y)].symbol() == "█")
+      .map(|(x, y)| buffer[(x, y)].fg)
+      .collect();
     assert!(colors.len() >= 2, "expected the gradient to vary, got {} colors", colors.len());
   }
 
   #[test]
-  fn squares_fall_back_to_plain_bars_in_a_sliver() {
-    // Below one usable row the ladder cannot form, so it must not panic.
-    let mut view = SpectrumView::new(SpectrumStyle::Squares);
-    view.accept(active([0.9; BANDS], None));
-    for (width, height) in [(1, 1), (2, 2), (3, 3), (6, 2)] {
+  fn smooth_draws_braille_and_falls_back_when_too_small() {
+    let mut view = styled(SpectrumStyle::Smooth);
+    let mut terminal = backend(40, 12);
+    view.accept(active([0.5; BANDS]));
+    render(&mut view, &mut terminal, true);
+    assert!(braille_glyphs(terminal.backend().buffer()) > 8, "expected a lit braille region");
+    // Too small for the detail: it must degrade to bars, not braille noise.
+    let mut tiny = backend(3, 2);
+    render(&mut view, &mut tiny, true);
+    assert_eq!(braille_glyphs(tiny.backend().buffer()), 0, "a sliver must fall back to bars");
+  }
+
+  #[test]
+  fn stereo_separates_the_channels_and_closes_for_mono() {
+    let mut view = styled(SpectrumStyle::Stereo);
+    let mut terminal = backend(40, 12);
+    view.accept(stereo([1.0; BANDS], [0.05; BANDS]));
+    render(&mut view, &mut terminal, true);
+    // The upper half is the left channel and the lower the right, meeting at a
+    // spine. Rows 6..=8 carry the loud channel, rows 2..=4 the quiet one.
+    assert!(
+      lit(&terminal, 7) > lit(&terminal, 2),
+      "left is the loud one: {} vs {}",
+      lit(&terminal, 7),
+      lit(&terminal, 2)
+    );
+    assert_eq!(glyph_at(&terminal, 1, 5), "│", "a spine pairs the meters");
+    // A mono source decodes to the same signal on both channels.
+    view.accept(stereo([0.7; BANDS], [0.7; BANDS]));
+    render(&mut view, &mut terminal, true);
+    assert!(lit(&terminal, 7) > 0 && lit(&terminal, 3) > 0, "both halves draw");
+    assert_eq!(lit(&terminal, 7), lit(&terminal, 4), "identical channels render symmetrically");
+  }
+
+  #[test]
+  fn styles_that_need_room_fall_back_instead_of_drawing_nonsense() {
+    let mut view = styled(SpectrumStyle::Stereo);
+    view.accept(stereo([0.9; BANDS], [0.9; BANDS]));
+    for (width, height) in [(3, 2), (5, 3), (8, 4), (12, 6)] {
       let mut terminal = backend(width, height);
       render(&mut view, &mut terminal, true);
     }
   }
 
   #[test]
-  fn every_style_renders_every_theme() {
+  fn trail_leaves_a_streak_of_recent_frames_and_sleeps_without_them() {
+    let theme = THEMES[0];
+    let mut view = styled(SpectrumStyle::Trail);
+    let mut terminal = backend(40, 12);
+    render(&mut view, &mut terminal, true);
+    assert!(!view.needs_animation(), "an empty trail is idle");
+    view.accept(active([0.2; BANDS]));
+    assert!(view.needs_animation(), "a frame requests one draw");
+    view.accept(active([1.0; BANDS]));
+    render(&mut view, &mut terminal, false);
+    // The newest frame sits at the top and the quieter older one trails below it.
+    assert_eq!(glyph_at(&terminal, 1, 1), "▄", "the newest frame");
+    assert_eq!(glyph_at(&terminal, 1, 7), "▄", "the older frame trails");
+    assert_eq!(glyph_at(&terminal, 1, 4), " ", "nothing between them");
+    assert_ne!(terminal.backend().buffer()[(1, 1)].fg, theme.border, "the newest frame keeps a zone color");
+    assert_eq!(terminal.backend().buffer()[(1, 7)].fg, theme.border, "older frames fade toward the border role");
+    assert!(!view.needs_animation(), "the trail persists until another frame arrives");
+  }
+
+  #[test]
+  fn waterfall_scrolls_per_frame_freezes_without_them_and_survives_generations() {
+    let mut view = styled(SpectrumStyle::Waterfall);
+    let mut terminal = backend(40, 12);
+    render(&mut view, &mut terminal, true);
+    assert!(!view.needs_animation(), "an empty waterfall is idle");
+    view.accept(active([1.0; BANDS]));
+    assert!(view.needs_animation(), "a frame requests one draw");
+    render(&mut view, &mut terminal, true);
+    assert!(!view.needs_animation(), "nothing moves until the next frame");
+    let buffer = terminal.backend().buffer();
+    assert!((1..=38).all(|x| buffer[(x, 9)].symbol() == "█"));
+    assert_eq!(buffer[(4, 8)].symbol(), " ", "one frame is one row");
+    view.accept(active([0.3; BANDS]));
+    view.accept(active([0.0; BANDS]));
+    render(&mut view, &mut terminal, true);
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(4, 9)].symbol(), " ", "silence is a blank row");
+    assert_ne!(buffer[(4, 7)].symbol(), " ", "the older loud frame is still there");
+    // A new generation keeps the past; a new track starts over.
+    view.accept(SpectrumFrame { generation: 1, ..SpectrumFrame::default() });
+    assert_eq!(view.history.len(), 3, "a new generation keeps the past");
+    view.accept(SpectrumFrame { generation: 1, current_id: Some("next".into()), ..SpectrumFrame::default() });
+    assert!(view.history.is_empty(), "a new track starts a fresh history");
+    for _ in 0..(HISTORY + 10) {
+      view.accept(active([0.2; BANDS]));
+    }
+    assert_eq!(view.history.len(), HISTORY, "the history is bounded");
+    // Narrow panes merge bands instead of clipping them.
+    let mut terminal = backend(20, 12);
+    render(&mut view, &mut terminal, true);
+    assert!((1..=18).all(|x| glyph_at(&terminal, x, 9) == "░"));
+  }
+
+  #[test]
+  fn ridge_draws_lines_and_keeps_history_like_the_waterfall() {
+    let mut view = styled(SpectrumStyle::Ridge);
+    let mut terminal = backend(40, 12);
+    render(&mut view, &mut terminal, true);
+    assert!(!view.needs_animation(), "an empty ridge is idle");
+    view.accept(active([0.6; BANDS]));
+    assert!(view.needs_animation(), "a frame requests one draw");
+    render(&mut view, &mut terminal, true);
+    assert!(braille_glyphs(terminal.backend().buffer()) > 0, "ridge lines are braille");
+    assert!(!view.needs_animation(), "nothing moves until the next frame");
+    let drawn = terminal.backend().buffer().clone();
+    for _ in 0..3 {
+      age(&mut view);
+      render(&mut view, &mut terminal, false);
+    }
+    assert_eq!(terminal.backend().buffer(), &drawn, "pause freezes the lines");
+    view.accept(SpectrumFrame { generation: 1, ..SpectrumFrame::default() });
+    assert_eq!(view.history.len(), 1, "a new generation keeps the past");
+    assert_eq!(view.pushed, 1);
+    view.accept(SpectrumFrame { generation: 1, current_id: Some("next".into()), ..SpectrumFrame::default() });
+    assert!(view.history.is_empty(), "a new track starts over");
+    assert_eq!(view.pushed, 0);
+  }
+
+  #[test]
+  fn radial_settles_to_its_resting_ring_and_reacts_to_onsets() {
+    let theme = THEMES[0];
+    let mut view = styled(SpectrumStyle::Radial);
+    let mut terminal = backend(60, 18);
+    render(&mut view, &mut terminal, false);
+    assert!(!view.needs_animation(), "an idle ring is not animating");
+    let resting = terminal.backend().buffer().clone();
+    view.accept(scaled([0.2; BANDS]));
+    render(&mut view, &mut terminal, true);
+    assert!(!view.radial.is_active(), "one frame has nothing to compare");
+    view.accept(scaled([0.9; BANDS]));
+    assert!(view.needs_animation(), "a jump between frames is an onset");
+    render(&mut view, &mut terminal, true);
+    assert!(view.radial.is_active());
+    assert_ne!(terminal.backend().buffer(), &resting, "an onset must change the figure");
+    settle(&mut view, &mut terminal);
+    assert!(!view.radial.is_active(), "the pulse decays");
+    assert!(!view.needs_animation());
+    // Only the figure is compared: the axis row differs between the two
+    // snapshots because the first was taken before any frame had arrived.
+    // Only the body is compared. The title and the axis legitimately differ:
+    // the first snapshot was taken before any frame arrived, so its axis shows
+    // the LOW/HIGH fallback rather than decade marks.
+    let body = |buffer: &Buffer| {
+      (1..buffer.area.height.saturating_sub(2))
+        .map(|y| {
+          (0..buffer.area.width)
+            .map(|x| (buffer[(x, y)].symbol().to_string(), buffer[(x, y)].fg, buffer[(x, y)].bg))
+            .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(
+      body(terminal.backend().buffer()),
+      body(&resting),
+      "the pulse and its waves must decay back to the resting ring"
+    );
+    // The idle ring is drawn in the border role alone.
+    assert!((1..=15).all(|y| (1..=58).all(|x| {
+      let cell = &terminal.backend().buffer()[(x, y)];
+      (cell.symbol() == " " || cell.fg == theme.border) && cell.bg == theme.panel_bg
+    })));
+    // A seek, pause, or resume is not an onset.
+    view.accept(SpectrumFrame { generation: 1, ..scaled([0.2; BANDS]) });
+    view.accept(SpectrumFrame { generation: 1, ..scaled([0.9; BANDS]) });
+    age(&mut view);
+    render(&mut view, &mut terminal, true);
+    assert!(view.radial.is_active());
+    view.accept(SpectrumFrame { generation: 2, ..SpectrumFrame::default() });
+    assert!(!view.radial.is_active(), "a new generation stops the pulse at once");
+  }
+
+  #[test]
+  fn fire_burns_while_heat_remains_and_resets_with_the_stream() {
+    let theme = THEMES[0];
+    let mut view = styled(SpectrumStyle::Fire);
+    let mut terminal = backend(40, 12);
+    render(&mut view, &mut terminal, false);
+    assert!(!view.needs_animation(), "a cold fire is idle");
+    view.accept(SpectrumFrame { generation: 1, ..active(bands_at(0..8, 1.0)) });
+    for _ in 0..4 {
+      age(&mut view);
+      render(&mut view, &mut terminal, true);
+    }
+    assert!(view.fire.is_hot());
+    let buffer = terminal.backend().buffer();
+    assert!(buffer.content().iter().any(|cell| cell.symbol() == "▀"), "fire burns on half blocks");
+    assert!((1..=9).all(|y| (30..=38).all(|x| buffer[(x, y)].symbol() == " ")), "the treble columns stay cold");
+    settle(&mut view, &mut terminal);
+    assert!(!view.fire.is_hot(), "the fire burns out once the levels are gone");
+    assert!(!view.needs_animation());
+    assert!(
+      (1..=9).all(|y| (1..=38).all(|x| {
+        let cell = &terminal.backend().buffer()[(x, y)];
+        cell.symbol() == " " && cell.fg == theme.panel_bg && cell.bg == theme.panel_bg
+      })),
+      "a burnt-out fire leaves nothing behind"
+    );
+    view.accept(SpectrumFrame { generation: 2, ..active([1.0; BANDS]) });
+    age(&mut view);
+    render(&mut view, &mut terminal, true);
+    assert!(view.fire.is_hot());
+    view.accept(SpectrumFrame { generation: 3, ..SpectrumFrame::default() });
+    assert!(!view.fire.is_hot(), "a new generation puts the fire out at once");
+  }
+
+  #[test]
+  fn sparks_follow_rises_between_consecutive_frames_only() {
+    let mut view = styled(SpectrumStyle::Sparks);
+    let mut bars = styled(SpectrumStyle::Bars);
+    let (mut terminal, mut plain) = (backend(64, 14), backend(64, 14));
+    let quiet = bands_at(0..BANDS, 0.3);
+    let mut loud = quiet;
+    loud[20] = 0.8;
+    // The first frame after a reset has nothing to compare with.
+    for target in [&mut view, &mut bars] {
+      target.accept(active(loud));
+    }
+    render(&mut view, &mut terminal, true);
+    assert!(!view.sparks.is_active(), "one frame throws nothing");
+    for levels in [quiet, loud] {
+      for target in [&mut view, &mut bars] {
+        target.accept(active(levels));
+      }
+    }
+    // Freeze time so both views draw identical bars to compare against.
+    let now = std::time::Instant::now();
+    for target in [&mut view, &mut bars] {
+      target.updated = now;
+    }
+    render(&mut view, &mut terminal, true);
+    bars.updated = view.updated;
+    render(&mut bars, &mut plain, true);
+    assert!(view.sparks.is_active(), "a rise between frames throws sparks");
+    let (sparked, plain) = (terminal.backend().buffer(), plain.backend().buffer());
+    let mut sparks = 0;
+    // Body rows y = 1..=11, between the title and the axis.
+    for (x, y) in (1..=11).flat_map(|y| (1..=62).map(move |x| (x, y))) {
+      if sparked[(x, y)].symbol().chars().all(|c| ('\u{2801}'..='\u{28FF}').contains(&c)) {
+        sparks += 1;
+        assert_eq!(plain[(x, y)].symbol(), " ", "sparks only use cells the bars leave blank");
+      } else {
+        assert_eq!(sparked[(x, y)], plain[(x, y)], "cell {x},{y}");
+      }
+    }
+    assert!(sparks > 0, "expected sparks above the bars");
+    view.accept(SpectrumFrame { generation: 1, ..active(quiet) });
+    assert!(!view.sparks.is_active(), "a rise across a generation change compares nothing");
+    view.accept(SpectrumFrame { generation: 1, ..active(loud) });
+    age(&mut view);
+    render(&mut view, &mut terminal, true);
+    assert!(view.sparks.is_active(), "consecutive frames of the new stream count");
+    settle(&mut view, &mut terminal);
+    assert!(!view.sparks.is_active(), "sparks cool and fade");
+    assert!(!view.needs_animation());
+  }
+
+  #[test]
+  fn switching_styles_keeps_levels_and_history_but_clears_particles() {
+    let mut view = styled(SpectrumStyle::Bars);
+    let mut terminal = backend(40, 12);
+    view.accept(active([0.8; BANDS]));
+    render(&mut view, &mut terminal, true);
+    assert!(view.levels.iter().all(|value| *value > 0.0));
+    view.set_style(SpectrumStyle::Waterfall);
+    assert_eq!(view.style, SpectrumStyle::Waterfall);
+    assert!(view.needs_animation(), "a style change redraws once");
+    assert_eq!(view.history.len(), 1, "history was collected while in bars");
+    assert!(view.levels.iter().all(|value| *value > 0.0));
+    // Fire heat and sparks are drawing state, not audio: a switch starts them over.
+    view.set_style(SpectrumStyle::Fire);
+    age(&mut view);
+    render(&mut view, &mut terminal, true);
+    assert!(view.fire.is_hot());
+    view.set_style(SpectrumStyle::Sparks);
+    assert!(!view.fire.is_hot(), "leaving fire puts it out");
+    assert!(view.levels.iter().all(|value| *value > 0.0), "the audio levels carry over");
+    assert_eq!(view.history.len(), 1);
+  }
+
+  #[test]
+  fn clearing_the_stream_puts_out_the_particles() {
+    let mut view = styled(SpectrumStyle::Fire);
+    let mut terminal = backend(40, 12);
+    view.accept(SpectrumFrame { generation: 1, ..active(bands_at(0..8, 1.0)) });
+    for _ in 0..4 {
+      age(&mut view);
+      render(&mut view, &mut terminal, true);
+    }
+    assert!(view.fire.is_hot());
+    view.clear();
+    assert!(!view.fire.is_hot(), "stopping playback must not leave a burning pane");
+    assert!(view.history.is_empty());
+  }
+
+  #[test]
+  fn the_axis_names_real_frequencies_and_falls_back_to_ends_when_narrow() {
+    let mut view = styled(SpectrumStyle::Bars);
+    let mut frame = active([0.5; BANDS]);
+    frame.low_hz = 40.0;
+    frame.high_hz = 16_000.0;
+    view.accept(frame);
+    let mut terminal = backend(40, 12);
+    render(&mut view, &mut terminal, true);
+    // Body rows y = 1..=9, so the axis is row 10.
+    let axis = row_symbols(&terminal, 10);
+    assert!(axis.contains("100"), "{axis:?}");
+    assert!(axis.contains("1k"), "{axis:?}");
+    assert!(!axis.contains("LOW"), "{axis:?}");
+    // Too narrow for decade labels: the plain ends keep the row meaningful.
+    let mut narrow = backend(10, 12);
+    render(&mut view, &mut narrow, true);
+    let axis = row_symbols(&narrow, 10);
+    assert!(axis.contains("LOW"), "{axis:?}");
+    assert!(!axis.contains("1k"), "{axis:?}");
+    // Without any frame there is no scale to name yet.
+    view.clear();
+    render(&mut view, &mut terminal, true);
+    assert!(row_symbols(&terminal, 10).contains("LOW"));
+  }
+
+  #[test]
+  fn every_style_draws_every_size_and_cell_size_and_then_settles() {
+    let ramp: [f32; BANDS] = std::array::from_fn(|band| band as f32 / (BANDS - 1) as f32);
+    let sizes = [(1, 1), (40, 3), (40, 4), (40, 6), (40, 12), (61, 12), (120, 40)];
+    // Terminals disagree about the cell size, and some report none at all.
+    let cells = [CELL, (0, 0), (7, 15)];
+    for style in SpectrumStyle::ALL {
+      for (width, height) in sizes {
+        for cell in cells {
+          let mut view = styled(style);
+          let mut terminal = backend(width, height);
+          let mut draw = |view: &mut SpectrumView, playing: bool| {
+            terminal.draw(|f| view.draw(f, f.area(), &THEMES[0], playing, cell)).expect("draw");
+          };
+          for step in 0..6 {
+            view.accept(active(if step % 2 == 0 { ramp } else { [0.2; BANDS] }));
+            age(&mut view);
+            draw(&mut view, true);
+          }
+          // Pausing must bring every style to a halt, or yp keeps drawing at
+          // full rate over a stopped track.
+          settle(&mut view, &mut terminal);
+          assert!(!view.needs_animation(), "{} at {width}x{height} cell {cell:?} must settle", style.id());
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn every_style_draws_every_theme() {
     // A theme with an odd palette must not break blending or glyph choice.
     for theme in THEMES {
       for style in SpectrumStyle::ALL {
-        let mut view = SpectrumView::new(style);
-        view.accept(active([0.7; BANDS], None));
-        let mut terminal = backend(40, 12);
-        terminal.draw(|f| view.draw(f, f.area(), theme, true)).unwrap();
+        let mut view = styled(style);
+        view.accept(active([0.7; BANDS]));
+        for (width, height) in [(61, 12), (6, 5), (3, 20), (80, 30)] {
+          let mut terminal = backend(width, height);
+          terminal.draw(|f| view.draw(f, f.area(), theme, true, CELL)).expect("draw");
+        }
       }
     }
   }

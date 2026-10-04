@@ -330,7 +330,7 @@ pub const THEMES: &[Theme] = &[
 ];
 
 /// Spectrum colors are authored as RGB, so every stop blends without a match arm.
-fn channels(color: Color) -> Option<[u8; 3]> {
+pub fn channels(color: Color) -> Option<[u8; 3]> {
   match color {
     Color::Rgb(r, g, b) => Some([r, g, b]),
     _ => None,
@@ -347,6 +347,41 @@ pub fn blend(a: Color, b: Color, t: f32) -> Color {
   };
   let mix = |i: usize| (f32::from(a[i]) + (f32::from(b[i]) - f32::from(a[i])) * t).round() as u8;
   Color::Rgb(mix(0), mix(1), mix(2))
+}
+
+/// The same color as an explicit RGB triple.
+///
+/// Several themes use the ANSI names for their text and borders, and [`blend`]
+/// leaves a non-RGB endpoint alone. Anything that blends *toward* a role — the
+/// fire ramp reaching white, say — would otherwise stop short and never arrive.
+/// The four names yp uses map to their usual terminal values; `Reset` has no
+/// knowable value, so mid-gray keeps a blend from going dark.
+pub fn rgb(color: Color) -> Color {
+  match color {
+    Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    Color::Black => Color::Rgb(0, 0, 0),
+    Color::DarkGray => Color::Rgb(0x55, 0x55, 0x55),
+    Color::White => Color::Rgb(0xff, 0xff, 0xff),
+    _ => Color::Rgb(0x80, 0x80, 0x80),
+  }
+}
+
+/// Perceived brightness of a theme color, 0 to 255.
+///
+/// A named color read as black would call every dark theme light, so the names
+/// are resolved first.
+fn luma(color: Color) -> f32 {
+  let Color::Rgb(r, g, b) = rgb(color) else { unreachable!("rgb always returns an RGB color") };
+  let [r, g, b] = [r, g, b].map(f32::from);
+  0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+/// Whether the theme paints light text on a dark ground, or the reverse.
+///
+/// The fire style inverts its ramp by theme: a dark theme wants a hot
+/// red-to-white flame, a light theme wants the strongest ink.
+pub fn is_light(theme: &Theme) -> bool {
+  luma(theme.panel_bg) > luma(theme.fg)
 }
 
 /// Continuous spectrum gradient: the low stop at 0, the middle stop at
@@ -366,6 +401,39 @@ pub fn spectrum_gradient(theme: &Theme, t: f32) -> Color {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn is_light_agrees_with_the_theme_names() {
+    // The fire style inverts its ramp on this answer, so a theme classified the
+    // wrong way burns with the wrong end of the spectrum at full heat.
+    for theme in THEMES {
+      let named_light = theme.name.ends_with("Light");
+      assert_eq!(is_light(theme), named_light, "{} was classified wrongly", theme.name);
+    }
+  }
+
+  #[test]
+  fn rgb_resolves_the_named_colors_yp_uses() {
+    // A role blended toward must be reachable, which needs an RGB value.
+    for theme in THEMES {
+      assert!(matches!(rgb(theme.fg), Color::Rgb(..)), "{}", theme.name);
+      assert_eq!(rgb(Color::Rgb(1, 2, 3)), Color::Rgb(1, 2, 3));
+    }
+    assert_eq!(rgb(Color::White), Color::Rgb(255, 255, 255));
+    assert_eq!(rgb(Color::Black), Color::Rgb(0, 0, 0));
+    assert_eq!(blend(Color::Rgb(255, 0, 0), rgb(Color::White), 1.0), Color::Rgb(255, 255, 255));
+  }
+
+  #[test]
+  fn named_colors_are_not_read_as_black() {
+    // Themes use the ANSI names for text and borders; treating them as black
+    // would call every dark theme light.
+    let theme = THEMES[0];
+    assert_eq!(theme.fg, Color::White);
+    assert!(luma(Color::White) > luma(Color::DarkGray));
+    assert!(luma(Color::DarkGray) > luma(Color::Black));
+    assert!(!is_light(&theme), "a dark panel with white text is a dark theme");
+  }
 
   #[test]
   fn every_theme_has_three_spectrum_stops() {

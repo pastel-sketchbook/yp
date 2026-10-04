@@ -61,6 +61,26 @@ impl FrameMode {
   }
 }
 
+/// Cell size in pixels, used to keep the radial spectrum round.
+///
+/// Terminals report the window in pixels and the frame in cells, so the ratio is
+/// the cell. Anything that cannot be measured falls back to the common 1:2 cell,
+/// which is what makes a character twice as tall as it is wide.
+fn cell_pixels(area: ratatui::layout::Rect) -> (u16, u16) {
+  const FALLBACK: (u16, u16) = (10, 20);
+  if area.width == 0 || area.height == 0 {
+    return FALLBACK;
+  }
+  let Ok(size) = ratatui::crossterm::terminal::window_size() else {
+    return FALLBACK;
+  };
+  let (width, height) = (size.width / area.width, size.height / area.height);
+  if width == 0 || height == 0 {
+    return FALLBACK;
+  }
+  (width, height)
+}
+
 /// Tracks the state of a channel listing for on-demand pagination.
 #[derive(Debug, Clone)]
 pub struct ChannelSource {
@@ -412,7 +432,7 @@ impl App {
       return;
     }
     let playing = self.player.is_playing() && !self.player.paused;
-    self.spectrum_view.draw(frame, area, self.theme(), playing);
+    self.spectrum_view.draw(frame, area, self.theme(), playing, cell_pixels(frame.area()));
   }
 
   /// Restarts playback at `target` seconds, clearing the bars in between.

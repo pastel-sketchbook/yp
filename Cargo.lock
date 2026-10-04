@@ -5322,7 +5322,7 @@ dependencies = [
 
 [[package]]
 name = "yp"
-version = "0.11.2"
+version = "0.11.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5335,6 +5335,7 @@ dependencies = [
  "futures",
  "image",
  "libc",
+ "rand 0.10.3",
  "ratatui",
  "reqwest 0.13.5",
  "rodio",
