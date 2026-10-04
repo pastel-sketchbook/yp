@@ -1107,12 +1107,18 @@ impl App {
     self.tasks.enrich_rx = None;
   }
 
-  /// Spawn background enrichment for all unenriched entries in `search_results`.
+  /// Spawn background enrichment for unenriched entries in `search_results`.
+  ///
+  /// Capped: each video needs its own yt-dlp request, and a channel can return
+  /// hundreds of results. Enriching all of them is what trips YouTube's rate
+  /// limit, and the tail beyond the cap is rarely scrolled to anyway.
   /// Existing enrichment tasks are cancelled first.
   fn trigger_enrich(&mut self) {
     self.cancel_enrich();
 
-    let ids: Vec<String> = self.search_results.iter().filter(|e| !e.enriched).map(|e| e.video_id.clone()).collect();
+    let limit = constants().enrich_limit;
+    let ids: Vec<String> =
+      self.search_results.iter().filter(|e| !e.enriched).take(limit).map(|e| e.video_id.clone()).collect();
     if ids.is_empty() {
       return;
     }

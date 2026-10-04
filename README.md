@@ -95,9 +95,11 @@ Logs are written daily to the same directory under `logs/`.
 
 ### YouTube bot check
 
-YouTube sometimes answers `yt-dlp` with "Sign in to confirm you're not a bot". yp detects that specific response and retries it with a backoff, which clears most cases.
+YouTube sometimes answers `yt-dlp` with "Sign in to confirm you're not a bot". This is IP rate limiting, not a broken install. yp detects that response and explains the fix rather than retrying, because retrying adds load to an already-throttled IP.
 
-If it persists, your IP is being throttled and cookies are the actual fix. yp does **not** enable this by default, because reading browser cookies on macOS triggers an interactive Keychain prompt. Opt in per-session:
+To reduce the chance of hitting it, metadata enrichment is deliberately capped: at most 3 concurrent requests and 40 per page load, both in `constants.ron`. A channel can list hundreds of videos, and enriching all of them is what gets an IP flagged. Search and channel listing use different endpoints and keep working even when per-video metadata is throttled.
+
+If it persists, cookies are the actual fix. yp does **not** enable this by default, because reading browser cookies on macOS triggers an interactive Keychain prompt. Opt in per-session:
 
 ```bash
 export YP_YTDLP_COOKIES_FROM_BROWSER=chrome   # or firefox, brave, edge, safari

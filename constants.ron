@@ -35,7 +35,12 @@
   // Width of extracted video frames (height auto-scales to preserve aspect ratio).
   frame_extract_width: 640,
   // Maximum concurrent yt-dlp enrichment processes.
-  enrich_concurrency: 8,
+  // Low on purpose: each video is a separate request, and YouTube
+  // rate-limits bursts far below what raw throughput would suggest.
+  enrich_concurrency: 3,
+  // Ceiling on requests per page load. A channel can list hundreds of
+  // videos; enriching every one is what gets an IP throttled.
+  enrich_limit: 40,
   // yt-dlp print template for listing commands (7 tab-separated fields).
   // Fields: title, id, upload_date, tags, duration, view_count, uploader.
   // In --flat-playlist mode, tags will be "NA" (only available via per-video enrichment).

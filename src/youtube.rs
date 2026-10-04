@@ -18,12 +18,13 @@ fn opt_field(s: Option<&str>) -> Option<String> {
   s.map(str::trim).filter(|s| !s.is_empty() && *s != "NA").map(std::string::ToString::to_string)
 }
 
-/// How many times a yt-dlp call is retried. YouTube's bot check is transient,
-/// so a short backoff usually clears it without the user noticing.
-const YT_DLP_ATTEMPTS: u32 = 3;
-
 /// True for YouTube's "confirm you're not a bot" response, which is rate
 /// limiting rather than a hard failure.
+///
+/// Deliberately not retried. A rate limit does not clear in milliseconds, so
+/// retrying adds load to an already-throttled IP and makes it worse. An earlier
+/// revision retried three times and made this worse; detection plus actionable
+/// advice is the honest response.
 fn is_bot_check(stderr: &str) -> bool {
   let lower = stderr.to_lowercase();
   lower.contains("not a bot") || lower.contains("sign in to confirm")
@@ -74,49 +75,35 @@ fn bot_check_advice() -> &'static str {
 /// Spawns a yt-dlp command and waits for it to finish.
 ///
 /// Provides a consistent "yt-dlp not found" error across all call sites, and
-/// retries the transient bot check with a backoff.
+/// turns YouTube's rate-limit response into actionable advice.
 async fn run_yt_dlp(args: &[&str], context: &str) -> Result<Output> {
   let args = with_cookies(args, cookies_from_browser().as_deref(), cookies_file().as_deref());
-  let mut throttled = false;
 
-  for attempt in 1..=YT_DLP_ATTEMPTS {
-    let output = Command::new("yt-dlp")
-      .args(&args)
-      .stdin(Stdio::null())
-      .stdout(Stdio::piped())
-      .stderr(Stdio::piped())
-      .output()
-      .await
-      .map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-          anyhow!("yt-dlp not found. Install it with: brew install yt-dlp (macOS) or pip install yt-dlp")
-        } else {
-          anyhow!(e).context(format!("Failed to execute yt-dlp for {context}"))
-        }
-      })?;
-
-    if output.status.success() {
-      return Ok(output);
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if is_bot_check(&stderr) {
-      throttled = true;
-      if attempt < YT_DLP_ATTEMPTS {
-        // Linear backoff: long enough for the limit window to roll over,
-        // short enough that the UI does not feel wedged.
-        tokio::time::sleep(std::time::Duration::from_millis(750 * u64::from(attempt))).await;
-        continue;
+  let output = Command::new("yt-dlp")
+    .args(&args)
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .output()
+    .await
+    .map_err(|e| {
+      if e.kind() == std::io::ErrorKind::NotFound {
+        anyhow!("yt-dlp not found. Install it with: brew install yt-dlp (macOS) or pip install yt-dlp")
+      } else {
+        anyhow!(e).context(format!("Failed to execute yt-dlp for {context}"))
       }
-    }
-    let mut error = anyhow!("yt-dlp failed during {context}: {stderr}");
-    if throttled {
-      error = error.context(bot_check_advice());
-    }
-    return Err(error);
+    })?;
+
+  if output.status.success() {
+    return Ok(output);
   }
 
-  Err(anyhow!("yt-dlp failed during {context}").context(bot_check_advice()))
+  let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+  let mut error = anyhow!("yt-dlp failed during {context}: {stderr}");
+  if is_bot_check(&stderr) {
+    error = error.context(bot_check_advice());
+  }
+  Err(error)
 }
 
 // --- Frame Sources ---
