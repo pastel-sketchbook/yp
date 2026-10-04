@@ -31,9 +31,12 @@ pub type LoadResult = (String, VideoDetails, Option<DynamicImage>);
 pub enum FrameMode {
   /// Static thumbnail only (no extra work).
   Thumbnail,
-  /// `YouTube` storyboard sprite sheets (low-res 320x180, fast, no ffmpeg).
+  /// `YouTube` storyboard sprite sheets. Fast and ffmpeg-free, but the frames
+  /// are only 320x180, so a large pane looks visibly soft. Use `Video` for
+  /// sharpness.
   Storyboard,
-  /// ffmpeg frame extraction (640x360, progressive, requires ffmpeg).
+  /// ffmpeg frame extraction at `frame_extract_width`, progressive, requires
+  /// ffmpeg.
   Video,
 }
 

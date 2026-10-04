@@ -33,7 +33,10 @@
   // Frame rate for ffmpeg video frame extraction (frames per second).
   frame_extract_fps: 0.5,
   // Width of extracted video frames (height auto-scales to preserve aspect ratio).
-  frame_extract_width: 640,
+  // 1280 matches the largest YouTube thumbnail and looks sharp in a large
+  // Kitty/Sixel pane. Raise it if you have ffmpeg to spare and a big display;
+  // cost is CPU, disk, and a slower first extraction.
+  frame_extract_width: 1280,
   // Maximum concurrent yt-dlp enrichment processes.
   // Low on purpose: each video is a separate request, and YouTube
   // rate-limits bursts far below what raw throughput would suggest.

@@ -1,3 +1,4 @@
+use image::DynamicImage;
 use image::imageops::FilterType;
 use ratatui::{
   Frame,
@@ -303,6 +304,31 @@ const MIN_SPECTRUM_HEIGHT: u16 = 7;
 /// text that identifies the track.
 const MAX_SPECTRUM_SHARE_PERCENT: u16 = 45;
 
+/// Height in cells that renders an image without distorting it.
+///
+/// Only meaningful for the buffer modes, which blit pixels into cells. Kitty
+/// and Sixel let the terminal do the scaling, so they use the whole pane
+/// instead.
+///
+/// Terminal cells are roughly twice as tall as they are wide, so a cell count
+/// is about half the visual height: an image with a 16:9 *visual* aspect needs
+/// a rect about 32:9 in *cells*. Direct mode uses half-block glyphs, which map
+/// one pixel row per half row, so it needs the same compensation.
+fn ideal_thumb_height(display_mode: DisplayMode, image: &DynamicImage, width: u16) -> u16 {
+  let image_width = image.width();
+  if image_width == 0 {
+    return u16::MAX;
+  }
+  let scale = width as f32 * image.height() as f32 / image_width as f32 / CELL_TALLNESS;
+  // Ignore the mode beyond documentation: both buffer modes share the same
+  // cell geometry. Taking it as a parameter keeps the intent explicit.
+  let _ = display_mode;
+  scale.round().max(1.0) as u16
+}
+
+/// A terminal cell is about twice as tall as it is wide.
+const CELL_TALLNESS: f32 = 2.0;
+
 /// Splits the Now Playing pane into metadata and spectrum.
 ///
 /// The spectrum is reserved first, with a floor, because metadata grows with
@@ -341,33 +367,41 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
     height: thumb_layout_area.height.saturating_sub(2),
   };
 
-  // Center vertically to maintain 16:9 aspect ratio
-  let ideal_h = (f32::from(thumb_area.width) * 9.0 / 32.0).round() as u16;
-  if ideal_h < thumb_area.height {
-    let diff = thumb_area.height.saturating_sub(ideal_h);
-    thumb_area.y = thumb_area.y.saturating_add(diff / 2);
-    thumb_area.height = ideal_h;
-  }
-
   if let Some((ref video_id, ref image)) = app.player.cached_thumbnail {
-    if matches!(app.player.display_mode, DisplayMode::Kitty | DisplayMode::Sixel) {
-      // Kitty/Sixel: rendering is handled outside ratatui (in run loop).
-      // Just record the area — skip the expensive resize and widget render
-      // that are only used by Direct/Ascii modes.
-      let _ = (video_id, image); // suppress unused warnings
+    // Kitty and Sixel take the whole pane: the terminal scales the image into
+    // the given cells using its own pixel metrics and letterboxes the result.
+    // Computing a cell height here instead is guesswork about cell aspect, and
+    // getting it wrong pushes the image outside its frame.
+    //
+    // Buffer modes blit pixels ourselves, so they must letterbox by hand. A
+    // cell is about twice as tall as it is wide, so a 16:9 image needs a rect
+    // about 32:9 in cells to look 16:9 on screen.
+    let protocol_mode = matches!(app.player.display_mode, DisplayMode::Kitty | DisplayMode::Sixel);
+    if !protocol_mode {
+      let ideal_h = ideal_thumb_height(app.player.display_mode, image, thumb_area.width);
+      if ideal_h < thumb_area.height {
+        let diff = thumb_area.height.saturating_sub(ideal_h);
+        thumb_area.y = thumb_area.y.saturating_add(diff / 2);
+        thumb_area.height = ideal_h;
+      }
+    }
+    if protocol_mode {
+      // Kitty/Sixel: rendering is handled outside ratatui (in the run loop).
+      // Record the full pane and skip the expensive resize and widget render
+      // that only the buffer modes use.
       app.gfx.thumb_area = Some(thumb_area);
     } else {
-      // Direct/Ascii: resize and render via ThumbnailWidget into the ratatui buffer.
+      // Direct/Ascii: resize and render via ThumbnailWidget into the buffer.
       let needs_resize = match &app.gfx.resized_thumb {
         Some((id, w, h, _)) => id != video_id || *w != thumb_area.width || *h != thumb_area.height,
         None => true,
       };
       if needs_resize {
         let target_w = u32::from(thumb_area.width);
-        let target_h = match app.player.display_mode {
-          DisplayMode::Direct => (target_w as f32 * 9.0 / 16.0) as u32,
-          _ => (target_w as f32 * 9.0 / 32.0) as u32,
-        };
+        // Half-block glyphs render two pixel rows per cell, so one cell of
+        // height is two pixel rows. Matching the placement rect keeps the
+        // blitted pixels the same shape as the area they land in.
+        let target_h = u32::from(thumb_area.height) * 2;
         let resized = image.resize_to_fill(target_w, target_h.max(1), FilterType::Lanczos3);
         app.gfx.resized_thumb = Some((video_id.clone(), thumb_area.width, thumb_area.height, resized));
       }
@@ -1089,6 +1123,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 mod tests {
   use super::*;
   use crate::{app::App, display::DisplayMode, player::VideoDetails};
+  use image::DynamicImage;
   use ratatui::{Terminal, backend::TestBackend, style::Color};
 
   /// Renders just the Now Playing pane and returns its rows of text.
@@ -1212,6 +1247,51 @@ mod tests {
     assert!(!app.spectrum_visible(), "an idle app must not reserve spectrum rows");
     let text = render_now_playing(&mut app, 100, 24);
     assert!(!text.contains("SPECTRUM"), "an idle app must not draw a spectrum:\n{text}");
+  }
+
+  #[test]
+  fn buffer_modes_halve_the_rows_because_cells_are_twice_as_tall() {
+    let image = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1920, 1080, image::Rgb([0, 0, 0])));
+    // A 16:9 image in a 32-column pane is 9 rows of cells: 32 * 9/32.
+    assert_eq!(ideal_thumb_height(DisplayMode::Direct, &image, 32), 9);
+    assert_eq!(ideal_thumb_height(DisplayMode::Ascii, &image, 32), 9);
+  }
+
+  #[test]
+  fn a_non_wide_image_gets_a_taller_rect() {
+    let square = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(500, 500, image::Rgb([0, 0, 0])));
+    assert_eq!(ideal_thumb_height(DisplayMode::Direct, &square, 20), 10, "a square looks square on screen");
+    let portrait = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(400, 800, image::Rgb([0, 0, 0])));
+    assert_eq!(ideal_thumb_height(DisplayMode::Direct, &portrait, 20), 20, "a 1:2 image is twice as tall");
+  }
+
+  #[test]
+  fn a_degenerate_image_never_panics() {
+    let empty = DynamicImage::ImageRgb8(image::RgbImage::new(0, 0));
+    let height = ideal_thumb_height(DisplayMode::Direct, &empty, 16);
+    assert!(height >= 1, "must yield a usable height, got {height}");
+  }
+
+  #[test]
+  fn the_protocol_modes_use_the_whole_pane() {
+    // Kitty and Sixel let the terminal letterbox, so no cell arithmetic and
+    // therefore no vertical jitter as the pane resizes.
+    let mut app = playing_app(0);
+    app.player.set_playing_for_test(true);
+    app.player.display_mode = DisplayMode::Kitty;
+    app.player.cached_thumbnail = Some((
+      "abc".to_string(),
+      DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1920, 1080, image::Rgb([0, 0, 0]))),
+    ));
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test backend");
+    let area = Rect { x: 0, y: 0, width: 120, height: 40 };
+    terminal.draw(|f| render_player(f, &mut app, area)).expect("draw");
+    let placed = app.gfx.thumb_area.expect("kitty records the pane");
+    // The full inner pane, top-aligned at the inset: no aspect-derived height,
+    // so the placement cannot drift as the pane or image changes shape.
+    assert_eq!(placed.y, 1, "inset by the border");
+    assert_eq!(placed.height, 38, "the whole pane height, not an aspect slice");
+    assert_eq!(placed.height, area.height - 2);
   }
 
   fn normal() -> Style {
