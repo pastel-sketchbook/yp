@@ -3,6 +3,8 @@ use ratatui::style::Color;
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
   pub name: &'static str,
+  /// Gradient stops for the spectrum: low, middle, high band.
+  pub spectrum: [Color; 3],
   pub bg: Color,
   pub fg: Color,
   pub accent: Color,
@@ -23,6 +25,7 @@ pub const THEMES: &[Theme] = &[
   // Default — dark, cyan accent
   Theme {
     name: "Default",
+    spectrum: [Color::Rgb(0, 200, 80), Color::Rgb(0, 217, 255), Color::Rgb(255, 80, 80)],
     bg: Color::Reset,
     fg: Color::White,
     accent: Color::Rgb(0, 217, 255),
@@ -41,6 +44,7 @@ pub const THEMES: &[Theme] = &[
   // Gruvbox Dark
   Theme {
     name: "Gruvbox",
+    spectrum: [Color::Rgb(184, 187, 38), Color::Rgb(250, 189, 47), Color::Rgb(251, 73, 52)],
     bg: Color::Rgb(29, 32, 33),
     fg: Color::Rgb(235, 219, 178),
     accent: Color::Rgb(215, 153, 33),
@@ -59,6 +63,7 @@ pub const THEMES: &[Theme] = &[
   // Solarized Dark
   Theme {
     name: "Solarized",
+    spectrum: [Color::Rgb(133, 153, 0), Color::Rgb(181, 137, 0), Color::Rgb(220, 50, 47)],
     bg: Color::Rgb(0, 43, 54),
     fg: Color::Rgb(253, 246, 227),
     accent: Color::Rgb(42, 161, 152),
@@ -77,6 +82,7 @@ pub const THEMES: &[Theme] = &[
   // Ayu Dark
   Theme {
     name: "Ayu",
+    spectrum: [Color::Rgb(125, 210, 80), Color::Rgb(255, 180, 84), Color::Rgb(240, 113, 113)],
     bg: Color::Rgb(10, 14, 20),
     fg: Color::Rgb(191, 191, 191),
     accent: Color::Rgb(255, 153, 64),
@@ -95,6 +101,7 @@ pub const THEMES: &[Theme] = &[
   // Flexoki Dark
   Theme {
     name: "Flexoki",
+    spectrum: [Color::Rgb(208, 162, 21), Color::Rgb(36, 131, 123), Color::Rgb(209, 77, 65)],
     bg: Color::Rgb(16, 15, 15),
     fg: Color::Rgb(206, 205, 195),
     accent: Color::Rgb(36, 131, 123),
@@ -113,6 +120,7 @@ pub const THEMES: &[Theme] = &[
   // Zoegi Dark
   Theme {
     name: "Zoegi",
+    spectrum: [Color::Rgb(92, 168, 112), Color::Rgb(128, 200, 160), Color::Rgb(204, 92, 92)],
     bg: Color::Rgb(20, 20, 20),
     fg: Color::Rgb(204, 204, 204),
     accent: Color::Rgb(64, 128, 104),
@@ -131,6 +139,7 @@ pub const THEMES: &[Theme] = &[
   // FFE Dark (Fuzzy Find Everything)
   Theme {
     name: "FFE Dark",
+    spectrum: [Color::Rgb(161, 239, 211), Color::Rgb(240, 169, 136), Color::Rgb(255, 117, 127)],
     bg: Color::Rgb(30, 35, 43),
     fg: Color::Rgb(216, 222, 233),
     accent: Color::Rgb(79, 214, 190),
@@ -149,6 +158,7 @@ pub const THEMES: &[Theme] = &[
   // Postrboard Dark
   Theme {
     name: "Postrboard",
+    spectrum: [Color::Rgb(132, 204, 22), Color::Rgb(251, 138, 77), Color::Rgb(248, 113, 113)],
     bg: Color::Rgb(26, 27, 38),
     fg: Color::Rgb(226, 232, 240),
     accent: Color::Rgb(79, 182, 232),
@@ -168,6 +178,7 @@ pub const THEMES: &[Theme] = &[
   // Default Light
   Theme {
     name: "Default Light",
+    spectrum: [Color::Rgb(0, 140, 50), Color::Rgb(0, 140, 180), Color::Rgb(200, 40, 40)],
     bg: Color::Reset,
     fg: Color::Rgb(40, 40, 50),
     accent: Color::Rgb(0, 140, 180),
@@ -186,6 +197,7 @@ pub const THEMES: &[Theme] = &[
   // Gruvbox Light
   Theme {
     name: "Gruvbox Light",
+    spectrum: [Color::Rgb(121, 116, 14), Color::Rgb(215, 153, 33), Color::Rgb(204, 36, 29)],
     bg: Color::Rgb(251, 241, 199),
     fg: Color::Rgb(60, 56, 54),
     accent: Color::Rgb(215, 153, 33),
@@ -204,6 +216,7 @@ pub const THEMES: &[Theme] = &[
   // Solarized Light
   Theme {
     name: "Solarized Light",
+    spectrum: [Color::Rgb(133, 153, 0), Color::Rgb(181, 137, 0), Color::Rgb(220, 50, 47)],
     bg: Color::Rgb(253, 246, 227),
     fg: Color::Rgb(88, 110, 117),
     accent: Color::Rgb(42, 161, 152),
@@ -222,6 +235,7 @@ pub const THEMES: &[Theme] = &[
   // Flexoki Light
   Theme {
     name: "Flexoki Light",
+    spectrum: [Color::Rgb(102, 128, 11), Color::Rgb(36, 131, 123), Color::Rgb(209, 77, 65)],
     bg: Color::Rgb(255, 252, 240),
     fg: Color::Rgb(16, 15, 15),
     accent: Color::Rgb(36, 131, 123),
@@ -240,6 +254,7 @@ pub const THEMES: &[Theme] = &[
   // Ayu Light
   Theme {
     name: "Ayu Light",
+    spectrum: [Color::Rgb(133, 179, 4), Color::Rgb(255, 153, 64), Color::Rgb(240, 113, 113)],
     bg: Color::Rgb(252, 252, 252),
     fg: Color::Rgb(92, 97, 102),
     accent: Color::Rgb(255, 153, 64),
@@ -258,6 +273,7 @@ pub const THEMES: &[Theme] = &[
   // Zoegi Light
   Theme {
     name: "Zoegi Light",
+    spectrum: [Color::Rgb(55, 121, 97), Color::Rgb(80, 120, 160), Color::Rgb(204, 92, 92)],
     bg: Color::Rgb(255, 255, 255),
     fg: Color::Rgb(51, 51, 51),
     accent: Color::Rgb(55, 121, 97),
@@ -276,6 +292,7 @@ pub const THEMES: &[Theme] = &[
   // FFE Light (Fuzzy Find Everything)
   Theme {
     name: "FFE Light",
+    spectrum: [Color::Rgb(26, 138, 110), Color::Rgb(192, 121, 32), Color::Rgb(201, 67, 78)],
     bg: Color::Rgb(232, 236, 240),
     fg: Color::Rgb(30, 35, 43),
     accent: Color::Rgb(42, 157, 132),
@@ -294,6 +311,7 @@ pub const THEMES: &[Theme] = &[
   // Postrboard Light
   Theme {
     name: "Postrboard Light",
+    spectrum: [Color::Rgb(77, 124, 15), Color::Rgb(194, 65, 12), Color::Rgb(220, 38, 38)],
     bg: Color::Rgb(250, 250, 250),
     fg: Color::Rgb(17, 24, 39),
     accent: Color::Rgb(2, 132, 199),
@@ -310,3 +328,89 @@ pub const THEMES: &[Theme] = &[
     panel_bg: Color::Rgb(241, 245, 249),
   },
 ];
+
+/// Spectrum colors are authored as RGB, so every stop blends without a match arm.
+fn channels(color: Color) -> Option<[u8; 3]> {
+  match color {
+    Color::Rgb(r, g, b) => Some([r, g, b]),
+    _ => None,
+  }
+}
+
+/// Linear sRGB interpolation between two colors; `t` is clamped to 0..1.
+/// Non-RGB endpoints (Reset, White, DarkGray) fall back to `a` so blending
+/// degrades to a flat color instead of panicking mid-draw.
+pub fn blend(a: Color, b: Color, t: f32) -> Color {
+  let t = if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) };
+  let (Some(a), Some(b)) = (channels(a), channels(b)) else {
+    return a;
+  };
+  let mix = |i: usize| (f32::from(a[i]) + (f32::from(b[i]) - f32::from(a[i])) * t).round() as u8;
+  Color::Rgb(mix(0), mix(1), mix(2))
+}
+
+/// Continuous spectrum gradient: the low stop at 0, the middle stop at
+/// [`MIDDLE`], the high stop at 1. Mid sits above the halfway point so the
+/// low half of the ramp spans the full bar, matching the height zones.
+const MIDDLE: f32 = 0.675;
+
+pub fn spectrum_gradient(theme: &Theme, t: f32) -> Color {
+  let t = if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) };
+  if t <= MIDDLE {
+    blend(theme.spectrum[0], theme.spectrum[1], t / MIDDLE)
+  } else {
+    blend(theme.spectrum[1], theme.spectrum[2], (t - MIDDLE) / (1.0 - MIDDLE))
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn every_theme_has_three_spectrum_stops() {
+    assert_eq!(THEMES.len(), 16);
+    for theme in THEMES {
+      assert!(
+        theme.spectrum.iter().all(|c| matches!(c, Color::Rgb(..))),
+        "{} has a non-RGB spectrum stop: {:?}",
+        theme.name,
+        theme.spectrum
+      );
+    }
+  }
+
+  #[test]
+  fn blend_hits_its_endpoints_and_clamps() {
+    let (a, b) = (Color::Rgb(0, 100, 200), Color::Rgb(200, 100, 0));
+    assert_eq!(blend(a, b, 0.0), a);
+    assert_eq!(blend(a, b, 1.0), b);
+    assert_eq!(blend(a, b, -1.0), a);
+    assert_eq!(blend(a, b, 2.0), b);
+    assert_eq!(blend(a, b, f32::NAN), a, "NaN cannot produce an out-of-range mix");
+    assert_eq!(blend(a, b, 0.5), Color::Rgb(100, 100, 100));
+  }
+
+  #[test]
+  fn blend_survives_non_rgb_theme_colors() {
+    // bg is Reset and muted is DarkGray in the Default theme.
+    assert_eq!(blend(Color::Reset, Color::White, 0.5), Color::Reset);
+    assert_eq!(blend(Color::White, Color::Reset, 0.5), Color::White);
+    assert_eq!(blend(Color::DarkGray, Color::Reset, 0.5), Color::DarkGray);
+  }
+
+  #[test]
+  fn gradient_runs_through_the_theme_stops() {
+    for theme in THEMES {
+      assert_eq!(spectrum_gradient(theme, 0.0), theme.spectrum[0], "{}", theme.name);
+      assert_eq!(spectrum_gradient(theme, MIDDLE), theme.spectrum[1], "{}", theme.name);
+      assert_eq!(spectrum_gradient(theme, 1.0), theme.spectrum[2], "{}", theme.name);
+      // Between stops the gradient must produce genuine in-between colors,
+      // otherwise every band would render as a flat stop color.
+      let mid = spectrum_gradient(theme, 0.3);
+      assert_ne!(mid, theme.spectrum[0], "{}", theme.name);
+      assert_ne!(mid, theme.spectrum[1], "{}", theme.name);
+      assert_eq!(spectrum_gradient(theme, f32::NAN), theme.spectrum[0], "{}", theme.name);
+    }
+  }
+}

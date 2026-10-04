@@ -9,6 +9,9 @@ use crate::window;
 
 // --- Helpers ---
 
+/// Seconds moved by a single left/right press while playing.
+const SEEK_STEP_SECS: f64 = 10.0;
+
 /// Convert a char index to a byte offset within the string.
 pub fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
   s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
@@ -30,6 +33,11 @@ pub async fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()>
 
   if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
     app.next_frame_mode();
+    return Ok(());
+  }
+
+  if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('v') {
+    app.cycle_spectrum_style();
     return Ok(());
   }
 
@@ -134,12 +142,58 @@ pub async fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()>
     return Ok(());
   }
 
+  // Playback keys are handled before mode dispatch, so a focused search box
+  // cannot swallow Space or the arrows while a track is playing.
+  if let Some(action) = playback_key(key, app.player.is_playing()) {
+    apply_playback_key(app, action).await;
+    return Ok(());
+  }
+
   match app.mode {
     AppMode::Input => handle_input_key(app, key),
     AppMode::Results => handle_results_key(app, key).await.context("Failed to handle results key event")?,
     AppMode::Filter => handle_filter_key(app, key).context("Failed to handle filter key event")?,
   }
   Ok(())
+}
+
+/// What a key requests of the player while a track is playing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackKey {
+  TogglePause,
+  SeekForward,
+  SeekBackward,
+}
+
+/// Decides whether a key acts on playback rather than on the search box.
+///
+/// Playback wins over text editing, otherwise a search that is still focused
+/// swallows Space and the arrows, leaving a playing track with no keyboard
+/// control. Typing a query still works: only these three keys are claimed.
+#[must_use]
+pub fn playback_key(key: event::KeyEvent, playing: bool) -> Option<PlaybackKey> {
+  if !playing {
+    return None;
+  }
+  match key.code {
+    KeyCode::Char(' ') => Some(PlaybackKey::TogglePause),
+    KeyCode::Right if key.modifiers.is_empty() => Some(PlaybackKey::SeekForward),
+    KeyCode::Left if key.modifiers.is_empty() => Some(PlaybackKey::SeekBackward),
+    _ => None,
+  }
+}
+
+/// Runs a playback action, reporting failures through the status line.
+pub async fn apply_playback_key(app: &mut App, action: PlaybackKey) {
+  match action {
+    PlaybackKey::TogglePause => {
+      if let Err(e) = app.player.toggle_pause().await {
+        app.set_error(format!("Pause error: {e}"));
+      }
+    }
+    PlaybackKey::SeekForward => app.seek_relative(SEEK_STEP_SECS).await,
+    PlaybackKey::SeekBackward => app.seek_relative(-SEEK_STEP_SECS).await,
+  }
 }
 
 fn handle_input_key(app: &mut App, key: event::KeyEvent) {
@@ -193,16 +247,13 @@ fn handle_input_key(app: &mut App, key: event::KeyEvent) {
 }
 
 async fn handle_results_key(app: &mut App, key: event::KeyEvent) -> Result<()> {
+  if let Some(action) = playback_key(key, app.player.is_playing()) {
+    apply_playback_key(app, action).await;
+    return Ok(());
+  }
   match key.code {
     KeyCode::Enter => {
       app.trigger_load();
-    }
-    KeyCode::Char(' ') => {
-      if app.player.is_playing()
-        && let Err(e) = app.player.toggle_pause().await
-      {
-        app.set_error(format!("Pause error: {e}"));
-      }
     }
     KeyCode::Char('/') => {
       app.mode = AppMode::Filter;
@@ -367,6 +418,45 @@ pub fn handle_mouse_event(app: &mut App, m: MouseEvent) {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  // --- playback_key ---
+
+  fn key(code: KeyCode) -> event::KeyEvent {
+    event::KeyEvent::new(code, KeyModifiers::NONE)
+  }
+
+  #[test]
+  fn playback_keys_work_while_a_track_plays() {
+    // The regression: a focused search box used to swallow these, leaving a
+    // playing track with no keyboard control.
+    assert_eq!(playback_key(key(KeyCode::Char(' ')), true), Some(PlaybackKey::TogglePause));
+    assert_eq!(playback_key(key(KeyCode::Right), true), Some(PlaybackKey::SeekForward));
+    assert_eq!(playback_key(key(KeyCode::Left), true), Some(PlaybackKey::SeekBackward));
+  }
+
+  #[test]
+  fn nothing_is_claimed_when_nothing_is_playing() {
+    // Otherwise Space would be unusable as a space in a search query.
+    assert_eq!(playback_key(key(KeyCode::Char(' ')), false), None);
+    assert_eq!(playback_key(key(KeyCode::Right), false), None);
+    assert_eq!(playback_key(key(KeyCode::Left), false), None);
+  }
+
+  #[test]
+  fn typing_and_search_keys_are_never_claimed() {
+    for code in
+      [KeyCode::Char('a'), KeyCode::Enter, KeyCode::Backspace, KeyCode::Up, KeyCode::Down, KeyCode::Esc, KeyCode::Tab]
+    {
+      assert_eq!(playback_key(key(code), true), None, "{code:?} must stay with text entry");
+    }
+  }
+
+  #[test]
+  fn modified_arrows_are_left_to_text_entry() {
+    // Ctrl+Left and friends are not seeks.
+    let modified = event::KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL);
+    assert_eq!(playback_key(modified, true), None);
+  }
 
   // --- char_to_byte_index ---
 

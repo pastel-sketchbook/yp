@@ -1,4 +1,5 @@
 mod app;
+mod audio;
 mod cache;
 mod cli;
 mod config;
@@ -7,6 +8,8 @@ mod display;
 mod graphics;
 mod input;
 mod player;
+mod spectrum;
+mod spectrum_view;
 mod summarize;
 mod theme;
 mod transcript;
@@ -119,27 +122,81 @@ enum Command {
 
 // --- Helpers ---
 
-/// Parse the time position (in seconds) from an mpv status string.
+/// Parse a duration string into seconds.
 ///
-/// Expects format: `Time: MM:SS / ... ` or `Time: H:MM:SS / ...`
+/// `yt-dlp` reports durations as `MM:SS`, `H:MM:SS`, or with a `h`/`m`/`s`
+/// suffix, and occasionally as a bare number of seconds. Returns `None` for
+/// anything unrecognizable rather than guessing.
 #[must_use]
-pub fn parse_mpv_time_secs(status: &str) -> Option<f64> {
-  let time_part = status.strip_prefix("Time: ")?.split(" / ").next()?.trim();
-  let parts: Vec<&str> = time_part.split(':').collect();
-  match parts.len() {
-    2 => {
-      let m: f64 = parts[0].parse().ok()?;
-      let s: f64 = parts[1].parse().ok()?;
-      Some(m * 60.0 + s)
+pub fn parse_duration_secs(duration: &str) -> Option<f64> {
+  let trimmed = duration.trim();
+  if let Ok(secs) = trimmed.parse::<f64>() {
+    return Some(secs);
+  }
+  // Long form: sum every "<number> <unit>" pair, so "3 minutes, 45 seconds" works.
+  let mut total = 0.0;
+  let mut matched = false;
+  for (number, unit) in trimmed.split(',').filter_map(|part| part.trim().split_once(char::is_whitespace)) {
+    let Ok(value) = number.trim().parse::<f64>() else {
+      continue;
+    };
+    let factor = match unit.trim() {
+      "h" | "hr" | "hrs" | "hour" | "hours" => 3600.0,
+      "m" | "min" | "mins" | "minute" | "minutes" => 60.0,
+      "s" | "sec" | "secs" | "second" | "seconds" => 1.0,
+      _ => continue,
+    };
+    total += value * factor;
+    matched = true;
+  }
+  if matched {
+    return Some(total);
+  }
+
+  // ISO-8601 form: "PT3M45S" or "PT1H2M3S".
+  if let Some(iso) = trimmed.strip_prefix("PT") {
+    let mut total = 0.0;
+    let mut digits = String::new();
+    for c in iso.chars() {
+      if c.is_ascii_digit() || c == '.' {
+        digits.push(c);
+      } else {
+        let Ok(value) = digits.parse::<f64>() else {
+          return None;
+        };
+        digits.clear();
+        total += match c.to_ascii_uppercase() {
+          'H' => value * 3600.0,
+          'M' => value * 60.0,
+          'S' => value,
+          _ => return None,
+        };
+      }
     }
-    3 => {
-      let h: f64 = parts[0].parse().ok()?;
-      let m: f64 = parts[1].parse().ok()?;
-      let s: f64 = parts[2].parse().ok()?;
-      Some(h * 3600.0 + m * 60.0 + s)
-    }
+    return Some(total + digits.parse::<f64>().unwrap_or(0.0));
+  }
+
+  // Clock form: "3:45", "1:02:03", optionally with a trailing "s". A bare "45s"
+  // has no colon, so treat a trailing unit as seconds.
+  let compact = trimmed.trim_end_matches(|c: char| c.is_ascii_alphabetic()).trim();
+  if !compact.contains(':') && compact.len() != trimmed.trim().len() {
+    return compact.parse::<f64>().ok();
+  }
+  let clock = compact;
+  let parts: Vec<f64> = clock.split(':').map(|part| part.parse::<f64>()).collect::<Result<_, _>>().ok()?;
+  match parts.as_slice() {
+    [m, s] => Some(m * 60.0 + s),
+    [h, m, s] => Some(h * 3600.0 + m * 60.0 + s),
     _ => None,
   }
+}
+
+/// Format seconds as `M:SS`, or `H:MM:SS` past an hour.
+#[must_use]
+pub fn format_time(secs: f64) -> String {
+  let total = if secs.is_finite() && secs > 0.0 { secs as u64 } else { 0 };
+  let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+  if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
 }
 
 // --- Main ---
@@ -244,13 +301,14 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
 
   loop {
     app.check_pending().await.context("Failed to check pending async tasks")?;
-    app.player.check_mpv_status();
+    app.check_playback().await;
+    app.poll_spectrum();
+    app.refresh_spectrum();
     app.expire_error();
 
     // Update frame source image if available and time position changed
     if let Some(frame_source) = app.frame_source()
-      && let Some(status) = app.player.get_last_mpv_status()
-      && let Some(time_secs) = parse_mpv_time_secs(&status)
+      && let Some(time_secs) = app.player.position_secs()
     {
       let idx = frame_source.frame_index_at(time_secs);
       if app.frame_idx() != Some(idx)
@@ -300,7 +358,11 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
       stdout.flush().context("Failed to flush EndSynchronizedUpdate")?;
     }
 
-    if event::poll(Duration::from_millis(100)).context("Failed to poll for terminal events")? {
+    // Poll faster while bars are still settling, otherwise the decay and peak
+    // hold animate in visible 100 ms steps.
+    let frame_delay =
+      if app.spectrum_needs_animation() { Duration::from_millis(16) } else { Duration::from_millis(100) };
+    if event::poll(frame_delay).context("Failed to poll for terminal events")? {
       match event::read().context("Failed to read terminal event")? {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
           input::handle_key_event(&mut app, key).await.context("Failed to handle key event")?;
@@ -329,33 +391,73 @@ async fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
 mod tests {
   use super::*;
 
-  // --- parse_mpv_time_secs ---
+  // --- format_time ---
 
   #[test]
-  fn parse_mpv_time_mm_ss() {
-    let status = "Time: 01:30 / 04:00 | Title: Song | no 37%";
-    assert_eq!(parse_mpv_time_secs(status), Some(90.0));
+  fn format_time_mm_ss() {
+    assert_eq!(format_time(90.0), "1:30");
+    assert_eq!(format_time(225.0), "3:45");
   }
 
   #[test]
-  fn parse_mpv_time_h_mm_ss() {
-    let status = "Time: 1:02:03 / 2:00:00 | Title: Song | no 51%";
-    assert_eq!(parse_mpv_time_secs(status), Some(3723.0));
+  fn format_time_h_mm_ss() {
+    assert_eq!(format_time(3723.0), "1:02:03");
   }
 
   #[test]
-  fn parse_mpv_time_zero() {
-    let status = "Time: 00:00 / 03:45 | Title: Song | no 0%";
-    assert_eq!(parse_mpv_time_secs(status), Some(0.0));
+  fn format_time_zero() {
+    assert_eq!(format_time(0.0), "0:00");
   }
 
   #[test]
-  fn parse_mpv_time_no_prefix() {
-    assert_eq!(parse_mpv_time_secs("Something else"), None);
+  fn format_time_clamps_negative_and_non_finite() {
+    // The clock can briefly read backwards across a seek or a slow device.
+    assert_eq!(format_time(-1.0), "0:00");
+    assert_eq!(format_time(f64::NAN), "0:00");
+    assert_eq!(format_time(f64::INFINITY), "0:00");
+  }
+
+  // --- parse_duration_secs ---
+
+  #[test]
+  fn parse_duration_colon_forms() {
+    assert_eq!(parse_duration_secs("3:45"), Some(225.0));
+    assert_eq!(parse_duration_secs("1:02:03"), Some(3723.0));
+    assert_eq!(parse_duration_secs("  2:30  "), Some(150.0));
   }
 
   #[test]
-  fn parse_mpv_time_garbage() {
-    assert_eq!(parse_mpv_time_secs("Time: abc / def"), None);
+  fn parse_duration_yt_dlp_suffix_forms() {
+    assert_eq!(parse_duration_secs("3 minutes, 45 seconds"), Some(225.0));
+    assert_eq!(parse_duration_secs("PT3M45S"), Some(225.0));
+    assert_eq!(parse_duration_secs("45s"), Some(45.0));
+  }
+
+  #[test]
+  fn parse_duration_accepts_bare_seconds() {
+    assert_eq!(parse_duration_secs("225"), Some(225.0));
+    assert_eq!(parse_duration_secs("225.5"), Some(225.5));
+  }
+
+  #[test]
+  fn parse_duration_rejects_nonsense() {
+    assert_eq!(parse_duration_secs(""), None);
+    assert_eq!(parse_duration_secs("unknown"), None);
+    assert_eq!(parse_duration_secs("1:2:3:4"), None);
+  }
+
+  #[test]
+  fn duration_round_trips_through_the_formatter() {
+    for secs in [0.0, 45.0, 225.0, 3723.0] {
+      let formatted = format_time(secs);
+      assert_eq!(parse_duration_secs(&formatted), Some(secs), "round trip of {secs}");
+    }
+  }
+
+  #[test]
+  fn format_time_truncates_rather_than_rounds_up() {
+    // 59.9 must stay under a minute so the progress bar does not jump early.
+    assert_eq!(format_time(59.9), "0:59");
+    assert_eq!(format_time(3599.9), "59:59");
   }
 }

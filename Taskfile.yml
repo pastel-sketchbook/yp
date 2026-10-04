@@ -3,14 +3,17 @@ env:
   PGM_NAME: yp
 tasks:
   build:
+    desc: Format and build the release binary
     cmds:
       - cargo fmt
       - cargo build --release
   run:
+    desc: Build, then run the release binary
     deps: [build]
     cmds:
       - target/release/$PGM_NAME
   install:
+    desc: Build the release binary, then copy it to ~/bin
     deps: [build]
     cmds:
       - cp target/release/$PGM_NAME ~/bin

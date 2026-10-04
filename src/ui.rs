@@ -295,6 +295,30 @@ fn render_welcome(frame: &mut Frame, theme: &Theme, area: Rect) {
 }
 
 #[allow(clippy::too_many_lines, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+/// Rows the metadata needs to stay legible: border, title, uploader, and URL.
+const MIN_METADATA_HEIGHT: u16 = 8;
+/// Smallest spectrum pane worth drawing: border, axis labels, and bar rows.
+const MIN_SPECTRUM_HEIGHT: u16 = 7;
+/// The spectrum never takes more than this share, so it cannot crowd out the
+/// text that identifies the track.
+const MAX_SPECTRUM_SHARE_PERCENT: u16 = 45;
+
+/// Splits the Now Playing pane into metadata and spectrum.
+///
+/// The spectrum is reserved first, with a floor, because metadata grows with
+/// tags: giving the spectrum only the leftover rows meant it was never drawn in
+/// a normal terminal. Metadata takes the remainder and clips, which is the
+/// graceful direction to lose rows.
+fn split_now_playing(area: Rect, want_spectrum: bool) -> (Rect, Option<Rect>) {
+  if !want_spectrum || area.height < MIN_METADATA_HEIGHT + MIN_SPECTRUM_HEIGHT {
+    return (area, None);
+  }
+  let share = area.height * MAX_SPECTRUM_SHARE_PERCENT / 100;
+  let spectrum_height = share.max(MIN_SPECTRUM_HEIGHT).min(area.height - MIN_METADATA_HEIGHT);
+  let [metadata, spectrum] = Layout::vertical([Constraint::Min(0), Constraint::Length(spectrum_height)]).areas(area);
+  (metadata, Some(spectrum))
+}
+
 fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
   let theme = app.theme();
   let left_pct = (app.split * 100.0).round().clamp(20.0, 80.0) as u16;
@@ -437,7 +461,11 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let paragraph = Paragraph::new(lines).block(info_block);
-    frame.render_widget(paragraph, np_area);
+    let (metadata_area, spectrum_area) = split_now_playing(np_area, app.spectrum_visible());
+    frame.render_widget(paragraph, metadata_area);
+    if let Some(spectrum_area) = spectrum_area {
+      app.draw_spectrum(frame, spectrum_area);
+    }
   } else {
     frame.render_widget(info_block, np_area);
   }
@@ -533,8 +561,7 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
   block = block.title(title);
 
   // Determine current playback time for highlighting
-  let current_time_cs: Option<i64> =
-    app.player.get_last_mpv_status().and_then(|s| crate::parse_mpv_time_secs(&s)).map(|secs| (secs * 100.0) as i64); // Convert seconds to centiseconds
+  let current_time_cs: Option<i64> = app.player.position_secs().map(|secs| (secs * 100.0) as i64); // Convert seconds to centiseconds
 
   // Find the active utterance index
   let active_idx: Option<usize> =
@@ -882,15 +909,20 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
   } else if let Some(msg) = &app.info_message {
     (format!(" ℹ  {msg}"), Style::default().fg(theme.muted))
   } else {
-    let mpv_status = app.player.get_last_mpv_status();
-    match mpv_status {
-      Some(status) => {
-        // mpv's ${pause} emits "yes"/"no" — replace with icons.
-        let status = status.replace("| yes ", "| ⏸ ").replace("| no ", "| ▶ ");
-        (format!(" ♪ {status}"), Style::default().fg(theme.status))
+    // The clock comes from the device, not mpv, so the position shown is the
+    // audio actually heard.
+    match app.player.position_secs() {
+      Some(secs) if app.player.is_playing() => {
+        let icon = if app.player.paused { "⏸" } else { "▶" };
+        let elapsed = crate::format_time(secs);
+        let status = match app.player.current_details.as_ref().and_then(|d| d.duration.as_deref()) {
+          Some(duration) => format!("{elapsed} / {duration}"),
+          None => elapsed,
+        };
+        (format!(" ♪ {status} {icon}"), Style::default().fg(theme.status))
       }
-      None if app.player.is_playing() => (" ♪ Buffering...".to_string(), Style::default().fg(theme.muted)),
-      None => (" Ready".to_string(), Style::default().fg(theme.muted)),
+      _ if app.player.is_playing() => (" ♪ Buffering...".to_string(), Style::default().fg(theme.muted)),
+      _ => (" Ready".to_string(), Style::default().fg(theme.muted)),
     }
   };
   frame.render_widget(Paragraph::new(text).style(style), area);
@@ -969,6 +1001,11 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     AppMode::Input => {
       let mut k = vec![("Enter", "Search"), ("^t", "Theme"), ("^f", "Frame")];
       if is_playing {
+        // Playback keys work from here even though the search box has focus.
+        let pause_label = if app.player.paused { "Resume" } else { "Pause" };
+        k.push(("Space", pause_label));
+        k.push(("←/→", "Seek"));
+        k.push(("^v", "Spectrum"));
         k.push(transcript_hint);
         k.push(wiki_hint);
         if crate::window::pip_supported() {
@@ -992,6 +1029,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         k.push(wiki_hint);
         let pause_label = if app.player.paused { "Resume" } else { "Pause" };
         k.push(("Space", pause_label));
+        k.push(("←/→", "Seek"));
         if crate::window::pip_supported() {
           k.push(("^m", "PiP"));
         }
@@ -1000,6 +1038,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
       }
       k.push(("^t", "Theme"));
       k.push(("^f", "Frame"));
+      k.push(("^v", "Spectrum"));
       k.push(("Esc", "Back"));
       k
     }
@@ -1010,6 +1049,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         k.push(wiki_hint);
         let pause_label = if app.player.paused { "Resume" } else { "Pause" };
         k.push(("Space", pause_label));
+        k.push(("←/→", "Seek"));
+        k.push(("^v", "Spectrum"));
         if crate::window::pip_supported() {
           k.push(("^m", "PiP"));
         }
@@ -1047,7 +1088,121 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use ratatui::style::Color;
+  use crate::{app::App, display::DisplayMode, player::VideoDetails};
+  use ratatui::{Terminal, backend::TestBackend, style::Color};
+
+  /// Renders just the Now Playing pane and returns its rows of text.
+  ///
+  /// `render_player` is called directly because `render_main` gates on
+  /// `player.is_playing()`, which needs a live mpv decoder.
+  fn render_now_playing(app: &mut App, width: u16, height: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test backend");
+    let area = Rect { x: 0, y: 0, width, height };
+    terminal.draw(|f| render_player(f, app, area)).expect("draw");
+    let buffer = terminal.backend().buffer();
+    (0..height).map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n")
+  }
+
+  /// A Now Playing pane with a full set of metadata, as a real track produces.
+  fn playing_app(tags: usize) -> App {
+    let mut app = App::new(DisplayMode::Ascii);
+    app.player.current_details = Some(VideoDetails {
+      url: "https://youtube.com/watch?v=abc".into(),
+      title: "Relaxing Rock Ambient Guitar".into(),
+      uploader: Some("Play&Enjoy".into()),
+      duration: Some("1:57:50".into()),
+      upload_date: Some("20261003".into()),
+      view_count: Some("1.2M".into()),
+      tags: (0..tags).map(|i| format!("tag{i}")).collect(),
+    });
+    app.poll_spectrum();
+    app
+  }
+
+  #[test]
+  fn the_spectrum_is_reserved_whenever_the_pane_is_tall_enough() {
+    let area = Rect { x: 0, y: 0, width: 40, height: 18 };
+    let (metadata, spectrum) = split_now_playing(area, true);
+    let spectrum = spectrum.expect("spectrum reserved");
+    assert_eq!(metadata.height + spectrum.height, area.height, "the split must consume the pane");
+    assert!(spectrum.height >= MIN_SPECTRUM_HEIGHT, "got {}", spectrum.height);
+    assert!(metadata.height >= MIN_METADATA_HEIGHT, "metadata got {}", metadata.height);
+  }
+
+  #[test]
+  fn the_spectrum_never_takes_more_than_its_share() {
+    // A very tall pane must not hand most of its rows to the display.
+    let area = Rect { x: 0, y: 0, width: 40, height: 100 };
+    let (_, spectrum) = split_now_playing(area, true);
+    let spectrum = spectrum.expect("spectrum reserved");
+    assert!(spectrum.height <= 45, "spectrum took {} of 100 rows", spectrum.height);
+  }
+
+  #[test]
+  fn the_spectrum_yields_when_the_pane_is_too_short() {
+    let area = Rect { x: 0, y: 0, width: 40, height: MIN_METADATA_HEIGHT + MIN_SPECTRUM_HEIGHT - 1 };
+    let (metadata, spectrum) = split_now_playing(area, true);
+    assert!(spectrum.is_none(), "must not split a pane this short");
+    assert_eq!(metadata.height, area.height);
+  }
+
+  #[test]
+  fn no_spectrum_is_reserved_when_none_is_requested() {
+    let area = Rect { x: 0, y: 0, width: 40, height: 40 };
+    let (metadata, spectrum) = split_now_playing(area, false);
+    assert!(spectrum.is_none());
+    assert_eq!(metadata.height, area.height);
+  }
+
+  #[test]
+  fn the_spectrum_is_drawn_even_with_a_full_set_of_metadata() {
+    // The regression: metadata with tags used to consume the entire pane,
+    // leaving the spectrum zero rows at any realistic terminal size.
+    for (width, height) in [(100, 24), (80, 24), (120, 40)] {
+      let text = render_now_playing(&mut playing_app(7), width, height);
+      assert!(text.contains("SPECTRUM"), "no spectrum at {width}x{height}:\n{text}");
+    }
+  }
+
+  #[test]
+  fn the_spectrum_is_drawn_without_tags() {
+    let text = render_now_playing(&mut playing_app(0), 100, 24);
+    assert!(text.contains("SPECTRUM"), "no spectrum:\n{text}");
+  }
+
+  #[test]
+  fn the_spectrum_is_dropped_rather_than_crowding_out_the_metadata() {
+    // One row shorter than both panes need: the text must survive.
+    let text = render_now_playing(&mut playing_app(0), 80, 14);
+    assert!(text.contains("Now Playing"), "metadata must remain:\n{text}");
+    assert!(!text.contains("SPECTRUM"), "the spectrum must yield when space is short:\n{text}");
+  }
+
+  #[test]
+  fn the_footer_advertises_the_spectrum_shortcut_while_playing() {
+    // The shortcut is only discoverable if the footer names it in the mode the
+    // user is actually in.
+    let mut app = playing_app(0);
+    app.player.paused = false;
+    let text = render_now_playing(&mut app, 100, 24);
+    // render_now_playing covers the pane only, so assert via the real footer.
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test backend");
+    terminal.draw(|f| render_footer(f, &app, Rect { x: 0, y: 23, width: 120, height: 1 })).expect("draw");
+    let buffer = terminal.backend().buffer();
+    let row: String = (0..120).map(|x| buffer[(x, 0)].symbol()).collect();
+    assert!(row.contains("Spectrum"), "footer must offer the spectrum shortcut: {row}");
+    assert!(row.contains("Seek"), "footer must offer seeking: {row}");
+    assert!(text.contains("Now Playing"));
+  }
+
+  #[test]
+  fn no_spectrum_without_a_loaded_track() {
+    let mut app = App::new(DisplayMode::Ascii);
+    app.poll_spectrum();
+    assert!(!app.spectrum_visible(), "an idle app must not reserve spectrum rows");
+    let text = render_now_playing(&mut app, 100, 24);
+    assert!(!text.contains("SPECTRUM"), "an idle app must not draw a spectrum:\n{text}");
+  }
 
   fn normal() -> Style {
     Style::default().fg(Color::White)

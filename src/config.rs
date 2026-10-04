@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
   pub theme_name: Option<String>,
   pub frame_mode: Option<String>,
+  /// Spectrum rendering, e.g. `"waterfall"`. Unknown names fall back to the default.
+  pub spectrum_style: Option<String>,
 }
 
 impl Config {

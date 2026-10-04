@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::constants::constants;
 use crate::display::DisplayMode;
 use crate::player::{MusicPlayer, VideoDetails};
+use crate::spectrum_view::{SpectrumStyle, SpectrumView};
 use crate::theme::THEMES;
 use crate::transcript::{self, TranscriptEvent, TranscriptState};
 use crate::wiki::{self, WikiDetail};
@@ -180,6 +181,12 @@ pub struct App {
   pub wiki_raw: Option<String>,
   /// Thumbnail/info horizontal split ratio (0.0–1.0, left panel share). Persisted.
   pub split: f64,
+  /// Rendering chosen with Ctrl+V, persisted in `prefs.toml`.
+  pub spectrum_style: SpectrumStyle,
+  /// Subscription to the analyzer, kept while playback is active.
+  spectrum_frames: Option<crate::spectrum::Subscription>,
+  /// Bar decay, peak hold, and waterfall history.
+  spectrum_view: SpectrumView,
   /// True while the user holds the left mouse button on the divider.
   pub dragging: bool,
   /// The wiki/info pane area from the last render, used for mouse scroll targeting.
@@ -193,6 +200,7 @@ impl App {
       if let Some(ref name) = config.theme_name { THEMES.iter().position(|t| t.name == name).unwrap_or(0) } else { 0 };
     let frame_mode =
       if let Some(ref mode) = config.frame_mode { FrameMode::from_config(mode) } else { FrameMode::Thumbnail };
+    let spectrum_style = config.spectrum_style.as_deref().map_or(SpectrumStyle::default(), SpectrumStyle::from_id);
 
     let default_input = constants().pastel_sketchbook_channel.clone();
     let default_cursor = default_input.chars().count();
@@ -222,6 +230,9 @@ impl App {
       transcript_state: TranscriptState::default(),
       transcript_rx: None,
       utterances: Vec::new(),
+      spectrum_frames: None,
+      spectrum_view: SpectrumView::new(spectrum_style),
+      spectrum_style,
       transcript_visible: true,
       download_progress: None,
       whisper_cache: Arc::new(StdMutex::new(None)),
@@ -328,6 +339,114 @@ impl App {
     self.error_time = None;
   }
 
+  /// Subscribes to the analyzer while playback is active.
+  ///
+  /// Failure is non-fatal: without a subscription the Now Playing pane simply
+  /// omits the display rather than refusing to play.
+  pub fn poll_spectrum(&mut self) {
+    if self.spectrum_frames.is_some() {
+      return;
+    }
+    let Ok(Some(spectrum)) = self.player.spectrum() else {
+      warn!("spectrum analyzer unavailable; continuing without it");
+      return;
+    };
+    self.spectrum_frames = Some(spectrum.subscribe());
+    self.spectrum_view.clear();
+  }
+
+  /// True while the display has bars or peaks still settling.
+  pub fn spectrum_needs_animation(&self) -> bool {
+    self.spectrum_view.needs_animation()
+  }
+
+  /// True when the spectrum should occupy part of the Now Playing pane.
+  ///
+  /// Tied to the same condition that makes the pane render at all, so the
+  /// spectrum appears automatically while a track is loaded and disappears once
+  /// playback stops.
+  pub fn spectrum_visible(&self) -> bool {
+    self.spectrum_frames.is_some() && self.player.current_details.is_some()
+  }
+
+  /// Draws the spectrum into `area`, if a subscription is active.
+  pub fn draw_spectrum(&mut self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    if self.spectrum_frames.is_none() {
+      return;
+    }
+    let playing = self.player.is_playing() && !self.player.paused;
+    self.spectrum_view.draw(frame, area, self.theme(), playing);
+  }
+
+  /// Restarts playback at `target` seconds, clearing the bars in between.
+  pub async fn seek_to(&mut self, target: f64) {
+    if !self.player.is_playing() {
+      return;
+    }
+    if let Err(error) = self.player.seek(target).await {
+      warn!(%error, "seek failed");
+      self.set_error(format!("Seek failed: {error}"));
+      return;
+    }
+    self.spectrum_view.clear();
+  }
+
+  /// Seeks by `delta` seconds, clamped to the track.
+  pub async fn seek_relative(&mut self, delta: f64) {
+    if !self.player.is_playing() {
+      return;
+    }
+    // mpv reports no duration of its own once it decodes to a FIFO, so the
+    // seek target comes from yt-dlp metadata and the device's own position.
+    let Some(position) = self.player.position_secs() else {
+      return;
+    };
+    let target = match self.player.current_details.as_ref().and_then(|d| d.duration.as_deref()) {
+      Some(duration) => (position + delta).clamp(0.0, crate::parse_duration_secs(duration).unwrap_or(position)),
+      None => (position + delta).max(0.0),
+    };
+    self.seek_to(target).await;
+  }
+
+  /// Drops the subscription and the bars, used when playback ends.
+  pub fn clear_spectrum(&mut self) {
+    self.spectrum_frames = None;
+    self.spectrum_view.clear();
+  }
+
+  /// Adopts the newest analyzer frame, if one arrived.
+  pub fn refresh_spectrum(&mut self) {
+    if let Some(subscription) = &mut self.spectrum_frames
+      && subscription.frames.has_changed().unwrap_or(false)
+    {
+      let frame = subscription.frames.borrow_and_update().clone();
+      self.spectrum_view.accept(frame);
+    }
+  }
+
+  /// Advances to the next spectrum rendering, persisted with the other prefs.
+  pub fn cycle_spectrum_style(&mut self) {
+    let style = self.spectrum_style.next();
+    self.spectrum_style = style;
+    self.spectrum_view.set_style(style);
+    self.save_config();
+    self.info_message = Some(format!("Spectrum: {}", style.id()));
+  }
+
+  /// End-of-track handling.
+  ///
+  /// Once the device has drained everything mpv decoded the track is over.
+  /// Stopping clears the Now Playing pane, which is the same thing that already
+  /// happened when mpv exited and its status line went quiet.
+  pub async fn check_playback(&mut self) {
+    if self.player.is_playing() && self.player.finished() {
+      if let Err(error) = self.player.stop().await {
+        warn!(%error, "failed to stop playback at end of track");
+      }
+      self.clear_spectrum();
+    }
+  }
+
   /// Clear stale error messages after 5 seconds.
   pub fn expire_error(&mut self) {
     if let Some(t) = self.error_time
@@ -339,8 +458,11 @@ impl App {
   }
 
   fn save_config(&self) {
-    let config =
-      Config { theme_name: Some(self.theme().name.to_string()), frame_mode: Some(self.frame_mode.label().to_string()) };
+    let config = Config {
+      theme_name: Some(self.theme().name.to_string()),
+      frame_mode: Some(self.frame_mode.label().to_string()),
+      spectrum_style: Some(self.spectrum_style.id().to_string()),
+    };
     config.save();
   }
 
@@ -491,7 +613,7 @@ impl App {
 
     let url = url.to_string();
     let whisper_cache = Arc::clone(&self.whisper_cache);
-    let ipc_socket = self.player.ipc_socket_path().map(std::string::ToString::to_string);
+    let ipc_socket = self.player.ipc_socket_path();
 
     info!(url = %url, "transcript: starting chunked transcription pipeline");
 

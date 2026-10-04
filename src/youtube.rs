@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::{Output, Stdio};
 use tokio::process::{Child as TokioChild, Command};
 use tokio::sync::mpsc;
+use tracing::warn;
 
 use crate::constants::constants;
 use crate::player::VideoDetails;
@@ -17,23 +18,105 @@ fn opt_field(s: Option<&str>) -> Option<String> {
   s.map(str::trim).filter(|s| !s.is_empty() && *s != "NA").map(std::string::ToString::to_string)
 }
 
-/// Spawn a yt-dlp command with the given arguments and wait for it to finish.
-/// Provides a consistent "yt-dlp not found" error message across all call sites.
+/// How many times a yt-dlp call is retried. YouTube's bot check is transient,
+/// so a short backoff usually clears it without the user noticing.
+const YT_DLP_ATTEMPTS: u32 = 3;
+
+/// True for YouTube's "confirm you're not a bot" response, which is rate
+/// limiting rather than a hard failure.
+fn is_bot_check(stderr: &str) -> bool {
+  let lower = stderr.to_lowercase();
+  lower.contains("not a bot") || lower.contains("sign in to confirm")
+}
+
+/// Optional `--cookies-from-browser` value, e.g. `chrome`.
+///
+/// Off by default: on macOS reading browser cookies needs an interactive
+/// Keychain grant, which must never be triggered as a surprise.
+fn cookies_from_browser() -> Option<String> {
+  std::env::var("YP_YTDLP_COOKIES_FROM_BROWSER").ok().filter(|value| !value.trim().is_empty())
+}
+
+/// Optional path to a Netscape `cookies.txt`, which avoids the Keychain prompt
+/// entirely.
+fn cookies_file() -> Option<String> {
+  std::env::var("YP_YTDLP_COOKIES").ok().filter(|value| !value.trim().is_empty())
+}
+
+/// Inserts cookie arguments before the `--` separator, which yt-dlp requires to
+/// stay last.
+fn with_cookies(args: &[&str], browser: Option<&str>, file: Option<&str>) -> Vec<String> {
+  let mut out: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+  let mut flags: Vec<String> = Vec::new();
+  if let Some(browser) = browser.filter(|b| !b.trim().is_empty()) {
+    flags.push("--cookies-from-browser".to_string());
+    flags.push(browser.to_string());
+  }
+  if let Some(file) = file.filter(|f| !f.trim().is_empty()) {
+    flags.push("--cookies".to_string());
+    flags.push(file.to_string());
+  }
+  let at = out.iter().position(|a| a == "--").unwrap_or(out.len());
+  for (offset, flag) in flags.into_iter().enumerate() {
+    out.insert(at + offset, flag);
+  }
+  out
+}
+
+/// The advice that actually resolves the bot check, since retrying alone is
+/// not enough once an IP is throttled.
+fn bot_check_advice() -> &'static str {
+  "YouTube is rate-limiting yt-dlp. Retry, or export cookies to a cookies.txt and set \
+   YP_YTDLP_COOKIES=/path/to/cookies.txt. To reuse a signed-in browser instead, set \
+   YP_YTDLP_COOKIES_FROM_BROWSER=chrome (macOS will ask for Keychain access)."
+}
+
+/// Spawns a yt-dlp command and waits for it to finish.
+///
+/// Provides a consistent "yt-dlp not found" error across all call sites, and
+/// retries the transient bot check with a backoff.
 async fn run_yt_dlp(args: &[&str], context: &str) -> Result<Output> {
-  Command::new("yt-dlp")
-    .args(args)
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .output()
-    .await
-    .map_err(|e| {
-      if e.kind() == std::io::ErrorKind::NotFound {
-        anyhow!("yt-dlp not found. Install it with: brew install yt-dlp (macOS) or pip install yt-dlp")
-      } else {
-        anyhow!(e).context(format!("Failed to execute yt-dlp for {context}"))
+  let args = with_cookies(args, cookies_from_browser().as_deref(), cookies_file().as_deref());
+  let mut throttled = false;
+
+  for attempt in 1..=YT_DLP_ATTEMPTS {
+    let output = Command::new("yt-dlp")
+      .args(&args)
+      .stdin(Stdio::null())
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped())
+      .output()
+      .await
+      .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+          anyhow!("yt-dlp not found. Install it with: brew install yt-dlp (macOS) or pip install yt-dlp")
+        } else {
+          anyhow!(e).context(format!("Failed to execute yt-dlp for {context}"))
+        }
+      })?;
+
+    if output.status.success() {
+      return Ok(output);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if is_bot_check(&stderr) {
+      throttled = true;
+      if attempt < YT_DLP_ATTEMPTS {
+        // Linear backoff: long enough for the limit window to roll over,
+        // short enough that the UI does not feel wedged.
+        tokio::time::sleep(std::time::Duration::from_millis(750 * u64::from(attempt))).await;
+        continue;
       }
-    })
+    }
+    let mut error = anyhow!("yt-dlp failed during {context}: {stderr}");
+    if throttled {
+      error = error.context(bot_check_advice());
+    }
+    return Err(error);
+  }
+
+  Err(anyhow!("yt-dlp failed during {context}").context(bot_check_advice()))
 }
 
 // --- Frame Sources ---
@@ -502,28 +585,39 @@ pub async fn enrich_video_metadata(video_ids: Vec<String>, tx: mpsc::Sender<Vide
         let result =
           run_yt_dlp(&["--skip-download", "--print", enrich_format, "--no-warnings", "--", &url], "enrichment").await;
 
-        if let Ok(output) = result
-          && output.status.success()
-          && let Ok(stdout) = String::from_utf8(output.stdout)
-        {
-          let line = stdout.trim();
-          let parts: Vec<&str> = line.split('\t').collect();
-          if !parts.is_empty() && !parts[0].is_empty() {
-            let upload_date = opt_field(parts.get(1).copied());
-            let tags = opt_field(parts.get(2).copied()).map(|s| clean_tags(&s)).filter(|s| !s.is_empty());
-            let duration = opt_field(parts.get(3).copied());
-            let view_count = opt_field(parts.get(4).copied()).map(|s| format_view_count(&s));
-            let uploader = opt_field(parts.get(5).copied());
-            let _ = tx
-              .send(VideoMeta {
-                video_id: parts[0].trim().to_string(),
-                upload_date,
-                tags,
-                duration,
-                view_count,
-                uploader,
-              })
-              .await;
+        // Missing metadata must not break the list, but a silent drop is
+        // indistinguishable from a bug. Log it so throttling is visible.
+        match result {
+          Err(error) => {
+            warn!(%video_id, %error, "yt-dlp: metadata lookup failed");
+          }
+          Ok(output) if !output.status.success() => {
+            warn!(%video_id, stderr = %String::from_utf8_lossy(&output.stderr), "yt-dlp: metadata lookup failed");
+          }
+          Ok(output) => {
+            if let Ok(stdout) = String::from_utf8(output.stdout) {
+              let line = stdout.trim();
+              let parts: Vec<&str> = line.split('\t').collect();
+              if !parts.is_empty() && !parts[0].is_empty() {
+                let upload_date = opt_field(parts.get(1).copied());
+                let tags = opt_field(parts.get(2).copied()).map(|s| clean_tags(&s)).filter(|s| !s.is_empty());
+                let duration = opt_field(parts.get(3).copied());
+                let view_count = opt_field(parts.get(4).copied()).map(|s| format_view_count(&s));
+                let uploader = opt_field(parts.get(5).copied());
+                let _ = tx
+                  .send(VideoMeta {
+                    video_id: parts[0].trim().to_string(),
+                    upload_date,
+                    tags,
+                    duration,
+                    view_count,
+                    uploader,
+                  })
+                  .await;
+              } else {
+                warn!(%video_id, "yt-dlp: empty metadata response");
+              }
+            }
           }
         }
       }
@@ -667,6 +761,77 @@ pub async fn fetch_thumbnail(client: &Client, video_id: &str) -> Result<DynamicI
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  // --- bot check detection and cookie args ---
+
+  #[test]
+  fn detects_youtubes_bot_check_wording() {
+    assert!(is_bot_check("ERROR: Sign in to confirm you're not a bot. Use --cookies-from-browser"));
+    assert!(is_bot_check("error: confirm you are not a bot"));
+    assert!(is_bot_check("Sign In To Confirm You're Not A Bot"));
+  }
+
+  #[test]
+  fn ordinary_failures_are_not_mistaken_for_throttling() {
+    // Retrying these would just waste three times the wall clock.
+    assert!(!is_bot_check("ERROR: Video unavailable"));
+    assert!(!is_bot_check("ERROR: Private video. Sign in if you've been granted access"));
+    assert!(!is_bot_check("ERROR: [youtube] nsig extraction failed"));
+    assert!(!is_bot_check(""));
+  }
+
+  #[test]
+  fn cookies_are_off_unless_the_user_opts_in() {
+    // Reading browser cookies needs a Keychain grant on macOS, so it must
+    // never switch itself on.
+    if std::env::var_os("YP_YTDLP_COOKIES_FROM_BROWSER").is_none() {
+      assert_eq!(cookies_from_browser(), None);
+    }
+    assert_eq!(
+      with_cookies(&["--print", "id", "--", "url"], None, None),
+      ["--print", "id", "--", "url"],
+      "no cookies means unchanged arguments"
+    );
+    assert_eq!(
+      with_cookies(&["--print", "id", "--", "url"], Some("  "), None),
+      ["--print", "id", "--", "url"],
+      "a blank value must not enable cookies"
+    );
+    if std::env::var_os("YP_YTDLP_COOKIES").is_none() {
+      assert_eq!(cookies_file(), None);
+    }
+  }
+
+  #[test]
+  fn cookie_flags_land_before_the_argument_separator() {
+    // yt-dlp treats everything after `--` as a URL, so appending would break
+    // the call.
+    let with = with_cookies(&["--skip-download", "--", "https://youtube.com/watch?v=abc"], Some("chrome"), None);
+    let separator = with.iter().position(|a| a == "--").expect("separator kept");
+    let flag = with.iter().position(|a| a == "--cookies-from-browser").expect("flag added");
+    assert!(flag < separator, "cookie flag must precede `--`: {with:?}");
+    assert_eq!(with[separator..], ["--", "https://youtube.com/watch?v=abc"], "the URL stays last");
+  }
+
+  #[test]
+  fn both_cookie_sources_can_be_combined() {
+    let with = with_cookies(&["--", "url"], Some("chrome"), Some("/tmp/cookies.txt"));
+    assert_eq!(with, ["--cookies-from-browser", "chrome", "--cookies", "/tmp/cookies.txt", "--", "url"]);
+  }
+
+  #[test]
+  fn cookie_flags_are_appended_when_no_separator_is_present() {
+    let with = with_cookies(&["--skip-download"], Some("firefox"), None);
+    assert_eq!(with, ["--skip-download", "--cookies-from-browser", "firefox"]);
+  }
+
+  #[test]
+  fn advice_names_the_actual_cures() {
+    let advice = bot_check_advice();
+    assert!(advice.contains("cookies"), "must mention cookies: {advice}");
+    assert!(advice.contains("YP_YTDLP_COOKIES_FROM_BROWSER"), "must name the opt-in: {advice}");
+    assert!(advice.contains("YP_YTDLP_COOKIES"), "must offer the Keychain-free path: {advice}");
+  }
 
   // --- clean_tags ---
 

@@ -1,15 +1,13 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use image::DynamicImage;
 use reqwest::Client;
-use std::process::Stdio;
-use tokio::{
-  io::{AsyncBufReadExt, BufReader as TokioBufReader},
-  process::{Child as TokioChild, Command},
-  sync::mpsc,
-  task::JoinHandle,
-};
+use std::sync::Arc;
 
-use crate::display::DisplayMode;
+use crate::{
+  audio::{self, AudioOutput, Decoder},
+  display::DisplayMode,
+  spectrum::Spectrum,
+};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct VideoDetails {
@@ -24,14 +22,15 @@ pub struct VideoDetails {
 
 pub struct MusicPlayer {
   pub http_client: Client,
-  pub(crate) current_process: Option<TokioChild>,
   pub display_mode: DisplayMode,
   pub current_details: Option<VideoDetails>,
   pub cached_thumbnail: Option<(String, DynamicImage)>,
-  mpv_monitor_handle: Option<JoinHandle<()>>,
-  mpv_status_rx: Option<mpsc::Receiver<String>>,
-  last_mpv_status: Option<String>,
-  ipc_socket_path: Option<String>,
+  /// mpv decoding into the FIFO. `None` when nothing is playing.
+  decoder: Option<Decoder>,
+  /// Device playback, owned by the player rather than by mpv.
+  audio: Option<AudioOutput>,
+  /// Shared with the analyzer thread; kept alive for the player's lifetime.
+  spectrum: Option<Arc<Spectrum>>,
   pub paused: bool,
 }
 
@@ -39,36 +38,42 @@ impl MusicPlayer {
   pub fn new(display_mode: DisplayMode) -> Self {
     Self {
       http_client: Client::new(),
-      current_process: None,
       display_mode,
       current_details: None,
       cached_thumbnail: None,
-      mpv_monitor_handle: None,
-      mpv_status_rx: None,
-      last_mpv_status: None,
-      ipc_socket_path: None,
+      decoder: None,
+      audio: None,
+      spectrum: None,
       paused: false,
     }
   }
 
   pub fn is_playing(&self) -> bool {
-    self.current_process.is_some()
+    self.decoder.is_some()
   }
 
-  pub fn check_mpv_status(&mut self) {
-    if let Some(rx) = &mut self.mpv_status_rx {
-      while let Ok(status) = rx.try_recv() {
-        self.last_mpv_status = Some(status);
-      }
+  /// The spectrum source, created on first playback.
+  pub fn spectrum(&mut self) -> Result<Option<Arc<Spectrum>>> {
+    if self.spectrum.is_none() {
+      self.spectrum = Some(Spectrum::start(audio::SAMPLE_RATE).context("Starting the spectrum analyzer")?);
     }
+    Ok(self.spectrum.clone())
   }
 
-  pub fn get_last_mpv_status(&self) -> Option<String> {
-    self.last_mpv_status.clone()
+  /// Playback position in seconds, from the samples the device has consumed.
+  pub fn position_secs(&self) -> Option<f64> {
+    self.audio.as_ref().map(AudioOutput::position_secs)
   }
 
-  pub fn ipc_socket_path(&self) -> Option<&str> {
-    self.ipc_socket_path.as_deref()
+  /// True once the device has drained everything mpv decoded.
+  pub fn finished(&self) -> bool {
+    self.audio.as_ref().is_some_and(AudioOutput::finished)
+  }
+
+  /// mpv's IPC socket, used by the transcription pipeline to discover the
+  /// stream URL without a second `yt-dlp` call.
+  pub fn ipc_socket_path(&self) -> Option<String> {
+    self.decoder.as_ref().map(|decoder| decoder.socket_path().display().to_string())
   }
 
   pub async fn play(&mut self, details: VideoDetails) -> Result<()> {
@@ -76,86 +81,82 @@ impl MusicPlayer {
     self.current_details = Some(details.clone());
     self.paused = false;
 
-    let socket_path = std::env::temp_dir().join(format!("yp-mpv-{}.sock", std::process::id()));
-    let socket_path_str = socket_path.to_str().context("Temp dir path is not valid UTF-8")?.to_string();
-    // Remove stale socket if it exists from a previous crash.
-    let _ = std::fs::remove_file(&socket_path);
+    let spectrum = self.spectrum()?.context("Spectrum unavailable")?;
 
-    let mut cmd = Command::new("mpv");
-    cmd.args([
-      "--no-video",
-      "--term-status-msg=Time: ${time-pos/full} / ${duration/full} | Title: ${media-title} | ${pause} ${percent-pos}%",
-      &format!("--input-ipc-server={socket_path_str}"),
-      &details.url,
-    ]);
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    // Send stderr to null — if piped but never drained, the pipe buffer
-    // fills and mpv blocks.
-    cmd.stderr(Stdio::null());
+    // Open the device before spawning mpv: if no device exists, failing here
+    // leaves nothing to clean up, whereas failing afterwards would orphan a
+    // decoding process.
+    let (player, sink) = AudioOutput::open()?;
 
-    let mut child = cmd.spawn().map_err(|e| {
-      if e.kind() == std::io::ErrorKind::NotFound {
-        anyhow!("mpv not found. Install it with: brew install mpv (macOS) or apt install mpv (Linux)")
-      } else {
-        anyhow!(e).context("Failed to spawn mpv process")
-      }
-    })?;
+    let mut decoder = Decoder::spawn(&details.url, None, std::process::id()).await?;
+    let reader = decoder.take_reader().context("mpv did not open the PCM FIFO")?;
+    spectrum.context(Some(&details.url));
 
-    let stdout = child.stdout.take().context("Failed to get mpv stdout")?;
-    let (tx, rx) = mpsc::channel::<String>(10);
-    self.mpv_status_rx = Some(rx);
+    let audio = AudioOutput::start(reader, player, sink, spectrum.clone())?;
+    spectrum.set_playing(true);
 
-    let monitor_handle = tokio::spawn(async move {
-      let reader = TokioBufReader::new(stdout);
-      let mut lines = reader.lines();
-      while let Ok(Some(line)) = lines.next_line().await {
-        if tx.send(line).await.is_err() {
-          break;
-        }
-      }
-    });
+    self.decoder = Some(decoder);
+    self.audio = Some(audio);
+    Ok(())
+  }
 
-    self.current_process = Some(child);
-    self.mpv_monitor_handle = Some(monitor_handle);
-    self.ipc_socket_path = Some(socket_path_str);
+  /// Restarts playback at `secs`. A FIFO cannot be rewound, so seeking means
+  /// respawning mpv against the same URL.
+  pub async fn seek(&mut self, secs: f64) -> Result<()> {
+    let Some(details) = self.current_details.clone() else {
+      return Ok(());
+    };
+    let spectrum = self.spectrum()?.context("Spectrum unavailable")?;
+    let was_paused = self.paused;
+
+    self.teardown().await;
+    let (player, sink) = AudioOutput::open()?;
+    let mut decoder = Decoder::spawn(&details.url, Some(secs.max(0.0)), std::process::id()).await?;
+    let reader = decoder.take_reader().context("mpv did not open the PCM FIFO")?;
+    let audio = AudioOutput::start(reader, player, sink, spectrum.clone())?;
+    // Drop anything the previous device had queued but not yet played, or it
+    // would bleed the old position's audio into the new one.
+    audio.clear_queue();
+    audio.set_paused(was_paused);
+    spectrum.set_playing(!was_paused);
+
+    self.decoder = Some(decoder);
+    self.audio = Some(audio);
     Ok(())
   }
 
   pub async fn toggle_pause(&mut self) -> Result<()> {
-    let Some(ref socket_path) = self.ipc_socket_path else {
+    let Some(audio) = &self.audio else {
       return Ok(());
     };
-    let stream = tokio::net::UnixStream::connect(socket_path).await.context("Failed to connect to mpv IPC socket")?;
-    stream.writable().await.context("mpv IPC socket not writable")?;
-    let cmd = b"{\"command\":[\"cycle\",\"pause\"]}\n";
-    let written = stream.try_write(cmd).context("Failed to send pause command to mpv")?;
-    if written < cmd.len() {
-      return Err(anyhow!("Partial write to mpv IPC socket: wrote {} of {} bytes", written, cmd.len()));
-    }
+    audio.set_paused(!self.paused);
     self.paused = !self.paused;
+    if let Some(spectrum) = &self.spectrum {
+      spectrum.set_playing(!self.paused);
+    }
     Ok(())
   }
+
   pub async fn stop(&mut self) -> Result<()> {
-    if let Some(handle) = self.mpv_monitor_handle.take() {
-      handle.abort();
-      let _ = handle.await;
-    }
-    self.mpv_status_rx = None;
-    self.last_mpv_status = None;
-
-    if let Some(mut child) = self.current_process.take() {
-      child.kill().await.context("Failed to kill mpv process")?;
-      let _ = child.wait().await;
-    }
-
+    self.teardown().await;
     self.current_details = None;
     self.cached_thumbnail = None;
-    self.paused = false;
-
-    if let Some(path) = self.ipc_socket_path.take() {
-      let _ = std::fs::remove_file(&path);
-    }
     Ok(())
+  }
+
+  /// Drops playback without clearing metadata, so a seek can rebuild on top.
+  async fn teardown(&mut self) {
+    if let Some(spectrum) = &self.spectrum {
+      spectrum.set_playing(false);
+      spectrum.context(None);
+    }
+    // Kill the decoder before dropping the device, otherwise mpv can block
+    // writing into a FIFO nobody is draining.
+    if let Some(mut decoder) = self.decoder.take() {
+      let _ = decoder.child.kill().await;
+      let _ = decoder.child.wait().await;
+    }
+    self.audio = None;
+    self.paused = false;
   }
 }

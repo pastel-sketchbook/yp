@@ -5,6 +5,7 @@ A TUI YouTube player with image thumbnails, live transcription, channel browsing
 ## Features
 
 - **Search & play** -- search YouTube or browse channels, play audio via mpv
+- **Spectrum** -- live FFT of the playing audio in the Now Playing pane, gradient by default, six styles via `Ctrl+V`
 - **Thumbnails** -- Kitty, Sixel, half-block, or ASCII art (auto-detected)
 - **Frame modes** -- static thumbnail, storyboard animation, or live video frames
 - **Transcription** -- automatic speech-to-text via whisper.cpp, time-synced to playback
@@ -62,9 +63,11 @@ cargo run -- -d ascii
 | `j` / `k` | Navigate results |
 | `/` | Filter results by title or tags |
 | `Space` | Pause / resume |
+| `←` / `→` | Seek back / forward 10s |
 | `Ctrl+A` | Toggle transcript / cancel transcription |
 | `Ctrl+T` | Cycle theme |
 | `Ctrl+F` | Cycle frame mode (thumbnail / storyboard / video) |
+| `Ctrl+V` | Cycle spectrum style |
 | `Ctrl+S` | Stop playback |
 | `Ctrl+O` | Open video in browser |
 | `Esc` | Back / clear / quit |
@@ -72,6 +75,14 @@ cargo run -- -d ascii
 ### Channel browsing
 
 Type a `@handle`, channel URL, or `/channel <name>` in the search bar to browse a channel's videos. Results load in pages as you scroll.
+
+### Spectrum
+
+The Now Playing pane shows a live spectrum of the audio you are hearing, with no setup — it appears as soon as a track is playing. `Ctrl+V` cycles six styles: `gradient` (default), `bars`, `mono`, `mirror`, `dots`, `waterfall`. The choice is saved to `prefs.toml`.
+
+The bars are a real FFT of the samples reaching the sound device, not a decoration. `mpv` decodes to a FIFO instead of the sound card and runs ahead as fast as it can; yp drains that FIFO at exactly device rate, which paces `mpv` to real time and makes the position readout the audio actually heard. Seeking therefore restarts `mpv` with `--start`, since a FIFO cannot be rewound.
+
+Audio must run at 48 kHz to match what `mpv` is told to emit. A device that cannot do so is refused rather than resampled, because resampling would pitch-shift the audio and make the clock wrong.
 
 ## Config
 
@@ -81,6 +92,19 @@ Preferences are stored at:
 - **Linux**: `~/.config/yp/prefs.toml`
 
 Logs are written daily to the same directory under `logs/`.
+
+### YouTube bot check
+
+YouTube sometimes answers `yt-dlp` with "Sign in to confirm you're not a bot". yp detects that specific response and retries it with a backoff, which clears most cases.
+
+If it persists, your IP is being throttled and cookies are the actual fix. yp does **not** enable this by default, because reading browser cookies on macOS triggers an interactive Keychain prompt. Opt in per-session:
+
+```bash
+export YP_YTDLP_COOKIES_FROM_BROWSER=chrome   # or firefox, brave, edge, safari
+yp
+```
+
+The flag is inserted before yt-dlp's `--` separator, so your URLs stay intact. You can also point yt-dlp at an exported `cookies.txt` via the `YP_YTDLP_COOKIES` variable if you prefer not to grant Keychain access.
 
 ## CLI
 
