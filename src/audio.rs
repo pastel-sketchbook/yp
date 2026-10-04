@@ -33,6 +33,8 @@ fn sample_rate() -> rodio::SampleRate {
 }
 /// Bytes per sample: two channels of 32-bit float.
 const BYTES_PER_FRAME: usize = 2 * 4;
+/// How long to wait for mpv to open the FIFO's write end before giving up.
+const FIFO_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Samples the reader may run ahead of the device before it blocks.
 ///
 /// The reader **must** wait here rather than discard audio: blocking fills the
@@ -379,14 +381,36 @@ impl Decoder {
     })?;
 
     // Opening for reading blocks until mpv opens the write end, so this must
-    // not run on the async runtime's worker threads.
+    // not run on the async runtime's worker threads. The wait is bounded: if
+    // mpv exits without opening the FIFO — missing binary, unreadable URL, an
+    // early failure — an unbounded join here would hang yp forever instead of
+    // surfacing an error.
     let fifo_clone = fifo.clone();
-    let reader = std::thread::Builder::new()
+    let (opened, result) = std::sync::mpsc::channel();
+    let _opener = std::thread::Builder::new()
       .name("yp-fifo-open".into())
-      .spawn(move || File::open(&fifo_clone).context("Opening the PCM FIFO"))
-      .context("Starting the FIFO reader thread")?
-      .join()
-      .map_err(|_| anyhow!("FIFO reader thread panicked while opening {}", fifo.display()))??;
+      .spawn(move || {
+        let _ = opened.send(File::open(&fifo_clone).context("Opening the PCM FIFO"));
+      })
+      .context("Starting the FIFO reader thread")?;
+
+    let reader = match result.recv_timeout(FIFO_HANDSHAKE_TIMEOUT) {
+      Ok(Ok(reader)) => reader,
+      Ok(Err(error)) => {
+        return Err(error.context(format!("Opening the PCM FIFO at {}", fifo.display())));
+      }
+      Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+        anyhow::bail!(
+          "mpv did not open {} within {}s. Check that mpv is installed and can play the URL.",
+          fifo.display(),
+          FIFO_HANDSHAKE_TIMEOUT.as_secs()
+        )
+      }
+      // The opener panicked; there is nothing useful to wait for.
+      Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+        return Err(anyhow!("The FIFO opener thread failed while opening {}", fifo.display()));
+      }
+    };
 
     Ok(Self { fifo, socket, child, reader: Some(reader) })
   }
@@ -538,7 +562,9 @@ mod tests {
     let played = Arc::new(AtomicU64::new(0));
     queue.push(&[0.1, 0.2, 0.3, 0.4]);
     let mut source = test_source(Arc::clone(&queue), Arc::clone(&played));
-    assert_eq!(source.by_ref().collect::<Vec<_>>(), vec![0.1, 0.2, 0.3, 0.4]);
+    // `take(4)` rather than `collect`: an underrun yields silence forever until
+    // the stream ends, which is right for a live player but never terminates.
+    assert_eq!(source.by_ref().take(4).collect::<Vec<_>>(), vec![0.1, 0.2, 0.3, 0.4]);
     // Four samples make two stereo frames.
     assert_eq!(played.load(Ordering::Acquire), 2);
     assert_eq!(source.channels().get(), 2);
@@ -711,8 +737,8 @@ mod tests {
     assert!(!fifo.exists(), "dropping the decoder must remove the FIFO, or seeks leak one per press");
     // mpv blocks writing to the FIFO, so a dropped decoder must not leave it
     // running; that would strand a process on every failed playback setup.
-    for _ in 0..50 {
-      if !process_alive(child_id) {
+    for _ in 0..100 {
+      if !process_running(child_id) {
         return;
       }
       std::thread::sleep(std::time::Duration::from_millis(20));
@@ -720,10 +746,17 @@ mod tests {
     panic!("mpv pid {child_id} outlived its decoder");
   }
 
-  /// Whether `pid` is still running, via signal 0 which performs no delivery.
-  fn process_alive(pid: u32) -> bool {
-    // SAFETY: `kill` with signal 0 only performs error checking.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+  /// Whether `pid` is still doing work.
+  ///
+  /// A killed child lingers as a zombie until the parent reaps it, and
+  /// `kill(pid, 0)` reports zombies as present. So the process state is read
+  /// instead: `Z` means killed and merely awaiting reaping.
+  fn process_running(pid: u32) -> bool {
+    let Ok(output) = std::process::Command::new("ps").args(["-o", "state=", "-p", &pid.to_string()]).output() else {
+      return false;
+    };
+    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    !state.is_empty() && !state.starts_with('Z')
   }
 
   #[test]

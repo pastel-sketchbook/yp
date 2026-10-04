@@ -1181,18 +1181,28 @@ mod tests {
   #[test]
   fn the_footer_advertises_the_spectrum_shortcut_while_playing() {
     // The shortcut is only discoverable if the footer names it in the mode the
-    // user is actually in.
+    // user is actually in, which is Input when a channel track is playing.
     let mut app = playing_app(0);
+    app.player.set_playing_for_test(true);
     app.player.paused = false;
-    let text = render_now_playing(&mut app, 100, 24);
-    // render_now_playing covers the pane only, so assert via the real footer.
     let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test backend");
-    terminal.draw(|f| render_footer(f, &app, Rect { x: 0, y: 23, width: 120, height: 1 })).expect("draw");
+    terminal.draw(|f| render_footer(f, &app, Rect { x: 0, y: 0, width: 120, height: 1 })).expect("draw");
     let buffer = terminal.backend().buffer();
     let row: String = (0..120).map(|x| buffer[(x, 0)].symbol()).collect();
     assert!(row.contains("Spectrum"), "footer must offer the spectrum shortcut: {row}");
     assert!(row.contains("Seek"), "footer must offer seeking: {row}");
-    assert!(text.contains("Now Playing"));
+    assert!(row.contains("Space"), "footer must offer pause: {row}");
+  }
+
+  #[test]
+  fn the_footer_omits_playback_keys_when_idle() {
+    let mut app = playing_app(0);
+    app.player.set_playing_for_test(false);
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test backend");
+    terminal.draw(|f| render_footer(f, &app, Rect { x: 0, y: 0, width: 120, height: 1 })).expect("draw");
+    let buffer = terminal.backend().buffer();
+    let row: String = (0..120).map(|x| buffer[(x, 0)].symbol()).collect();
+    assert!(!row.contains("Spectrum"), "an idle app has no spectrum to configure: {row}");
   }
 
   #[test]

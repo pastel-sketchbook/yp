@@ -32,6 +32,10 @@ pub struct MusicPlayer {
   /// Shared with the analyzer thread; kept alive for the player's lifetime.
   spectrum: Option<Arc<Spectrum>>,
   pub paused: bool,
+  /// Test-only override so UI code paths that depend on playback can be
+  /// exercised without a live mpv decoder and audio device.
+  #[cfg(test)]
+  playing_override: bool,
 }
 
 impl MusicPlayer {
@@ -45,11 +49,24 @@ impl MusicPlayer {
       audio: None,
       spectrum: None,
       paused: false,
+      #[cfg(test)]
+      playing_override: false,
     }
   }
 
   pub fn is_playing(&self) -> bool {
+    #[cfg(test)]
+    if self.playing_override {
+      return true;
+    }
     self.decoder.is_some()
+  }
+
+  /// Pretends a track is playing. Test-only: the playback paths need a live
+  /// decoder and an audio device, neither of which belongs in a unit test.
+  #[cfg(test)]
+  pub fn set_playing_for_test(&mut self, playing: bool) {
+    self.playing_override = playing;
   }
 
   /// The spectrum source, created on first playback.
