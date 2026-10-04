@@ -13,9 +13,15 @@
   ghostty_process_name: "Ghostty",
 
   // --- PiP window ---
-  pip_width: 550,
-  pip_height: 350,
-  pip_margin: 30,
+  // Pixels, not cells. Chosen to clear the PiP minimum of 40x8 at typical
+  // terminal font sizes: 720px is 60 columns at a 12px cell, so the default
+  // renders without the user widening the window first.
+  pip_width: 720,
+  pip_height: 400,
+  // Gap kept between the PiP window and the bottom-right screen edge. Small by
+  // design: it only exists to keep the window off the bezel and the Dock, not
+  // to leave visible padding.
+  pip_margin: 8,
 
   // --- UI ---
   // Maximum number of tags shown in the Now Playing pane.

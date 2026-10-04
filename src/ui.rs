@@ -115,15 +115,27 @@ pub fn highlight_text(text: &str, needle: &str, normal_style: Style, match_style
 pub const MIN_TERM_WIDTH: u16 = 60;
 pub const MIN_TERM_HEIGHT: u16 = 12;
 
+/// PiP minimums, in cells.
+///
+/// Much smaller than the full layout because PiP draws only a status row, the
+/// thumbnail, and a hint. The PiP window is sized in *pixels*, so at a large
+/// font 550px is well under 60 columns; enforcing the full-size minimum here
+/// made PiP unusable at exactly the sizes it is meant for.
+pub const MIN_PIP_WIDTH: u16 = 40;
+pub const MIN_PIP_HEIGHT: u16 = 8;
+
 /// Render a "terminal too small" message and return `true` if the terminal is too small.
-fn render_size_guard(frame: &mut Frame, theme: &Theme) -> bool {
+///
+/// The minimums are passed in because PiP needs far fewer cells than the full
+/// layout, and its window is sized in pixels rather than columns.
+fn render_size_guard(frame: &mut Frame, theme: &Theme, min_width: u16, min_height: u16) -> bool {
   let area = frame.area();
-  if area.width >= MIN_TERM_WIDTH && area.height >= MIN_TERM_HEIGHT {
+  if area.width >= min_width && area.height >= min_height {
     return false;
   }
   frame.render_widget(Clear, area);
   let msg = format!(
-    "Terminal too small ({}\u{00d7}{}). Need at least {MIN_TERM_WIDTH}\u{00d7}{MIN_TERM_HEIGHT}.",
+    "Terminal too small ({}\u{00d7}{}). Need at least {min_width}\u{00d7}{min_height}.",
     area.width, area.height,
   );
   let p = Paragraph::new(msg).style(Style::default().fg(theme.error)).block(
@@ -142,7 +154,12 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
   app.gfx.thumb_area = None;
   app.info_pane_area = None;
 
-  if render_size_guard(frame, theme) {
+  // PiP is judged against its own minimums. Its window is sized in pixels, so at
+  // a large font the default falls under the full-layout width and PiP would
+  // refuse to render its own contents.
+  let (min_width, min_height) =
+    if app.pip_mode { (MIN_PIP_WIDTH, MIN_PIP_HEIGHT) } else { (MIN_TERM_WIDTH, MIN_TERM_HEIGHT) };
+  if render_size_guard(frame, theme, min_width, min_height) {
     return;
   }
 
@@ -230,22 +247,19 @@ fn render_thumbnail_pane(frame: &mut Frame, app: &mut App, area: Rect, theme: &T
     return;
   };
 
-  // Kitty and Sixel take the whole pane: the terminal scales the image into the
-  // given cells using its own pixel metrics and letterboxes the result.
-  // Deriving a cell height instead is guesswork about cell aspect, and getting
-  // it wrong pushes the image outside its frame.
-  //
-  // Buffer modes blit pixels themselves, so they must letterbox by hand.
-  let protocol_mode = matches!(app.player.display_mode, DisplayMode::Kitty | DisplayMode::Sixel);
-  if !protocol_mode {
-    let ideal_h = ideal_thumb_height(app.player.display_mode, image, thumb_area.width);
-    if ideal_h < thumb_area.height {
-      let diff = thumb_area.height.saturating_sub(ideal_h);
-      thumb_area.y = thumb_area.y.saturating_add(diff / 2);
-      thumb_area.height = ideal_h;
-    }
+  // Match the box to the image's aspect for every display mode, including the
+  // protocol ones. Kitty and Sixel scale the image into the given cells and
+  // anchor it top-left, so handing them the whole pane does not center
+  // anything: the leftover height all collects at the bottom. Sizing the box to
+  // the aspect means there is little leftover to distribute.
+  let ideal_h = ideal_thumb_height(app.player.display_mode, image, thumb_area.width);
+  if ideal_h < thumb_area.height {
+    let diff = thumb_area.height.saturating_sub(ideal_h);
+    thumb_area.y = thumb_area.y.saturating_add(diff / 2);
+    thumb_area.height = ideal_h;
   }
 
+  let protocol_mode = matches!(app.player.display_mode, DisplayMode::Kitty | DisplayMode::Sixel);
   if protocol_mode {
     // Kitty/Sixel: rendering is handled outside ratatui, in the run loop.
     // Record the pane and skip the resize and widget render that only the
@@ -1317,25 +1331,90 @@ mod tests {
   }
 
   #[test]
-  fn the_protocol_modes_use_the_whole_pane() {
-    // Kitty and Sixel let the terminal letterbox, so no cell arithmetic and
-    // therefore no vertical jitter as the pane resizes.
+  fn the_size_guard_uses_pip_minimums_in_pip_mode() {
+    // A PiP window sized in pixels can fall under the full-layout width at a
+    // large font; the guard must not then refuse PiP's own contents.
+    let mut app = playing_app(0);
+    app.pip_mode = true;
+    let mut terminal = Terminal::new(TestBackend::new(MIN_PIP_WIDTH, MIN_PIP_HEIGHT)).expect("backend");
+    terminal.draw(|f| ui(f, &mut app)).expect("draw");
+    let buffer = terminal.backend().buffer();
+    let text: String = (0..MIN_PIP_HEIGHT)
+      .map(|y| (0..MIN_PIP_WIDTH).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+      .collect::<Vec<_>>()
+      .join("\n");
+    assert!(!text.contains("too small"), "PiP must render at its own minimum:\n{text}");
+
+    // The same size is still too small for the full layout, which must not
+    // render Now Playing at all.
+    let mut full = playing_app(0);
+    full.pip_mode = false;
+    let mut terminal = Terminal::new(TestBackend::new(MIN_PIP_WIDTH, MIN_PIP_HEIGHT)).expect("backend");
+    terminal.draw(|f| ui(f, &mut full)).expect("draw");
+    let buffer = terminal.backend().buffer();
+    let text: String = (0..MIN_PIP_HEIGHT)
+      .map(|y| (0..MIN_PIP_WIDTH).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+      .collect::<Vec<_>>()
+      .join("\n");
+    assert!(!text.contains("Now Playing"), "the full layout must still guard:\n{text}");
+  }
+
+  #[test]
+  fn the_protocol_modes_get_an_aspect_matched_box() {
+    // Kitty and Sixel anchor the image at the top-left of the box they are
+    // given, so handing them the whole pane leaves all the slack at the bottom.
+    // An aspect-matched box keeps the framing even.
+    let image = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1920, 1080, image::Rgb([0, 0, 0])));
     let mut app = playing_app(0);
     app.player.set_playing_for_test(true);
     app.player.display_mode = DisplayMode::Kitty;
-    app.player.cached_thumbnail = Some((
-      "abc".to_string(),
-      DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1920, 1080, image::Rgb([0, 0, 0]))),
-    ));
-    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test backend");
+    app.player.cached_thumbnail = Some(("abc".to_string(), image.clone()));
+
     let area = Rect { x: 0, y: 0, width: 120, height: 40 };
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test backend");
     terminal.draw(|f| render_player(f, &mut app, area)).expect("draw");
+
     let placed = app.gfx.thumb_area.expect("kitty records the pane");
-    // The full inner pane, top-aligned at the inset: no aspect-derived height,
-    // so the placement cannot drift as the pane or image changes shape.
-    assert_eq!(placed.y, 1, "inset by the border");
-    assert_eq!(placed.height, 38, "the whole pane height, not an aspect slice");
-    assert_eq!(placed.height, area.height - 2);
+    let pane_height = area.height - 2;
+    let expected = ideal_thumb_height(DisplayMode::Kitty, &image, placed.width);
+    assert_eq!(placed.height, expected, "the box must match the image aspect");
+    assert!(placed.height < pane_height, "must not simply take the whole pane");
+    // Centered: equal slack above and below.
+    let above = placed.y - 1;
+    let below = (area.height - 1) - (placed.y + placed.height);
+    assert!(above.abs_diff(below) <= 1, "uneven margins: {above} above, {below} below");
+  }
+
+  #[test]
+  fn pip_and_the_split_layout_frame_identically() {
+    // They share one renderer, so a 16:9 frame must be sized by the same rule in
+    // both. This is the check that stops the two copies drifting apart again.
+    let image = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1920, 1080, image::Rgb([0, 0, 0])));
+    let image_for_frame = image.clone();
+    let mut app = playing_app(0);
+    app.player.set_playing_for_test(true);
+    app.player.display_mode = DisplayMode::Kitty;
+    app.player.cached_thumbnail = Some(("abc".to_string(), image));
+
+    let mut split = Terminal::new(TestBackend::new(120, 40)).expect("backend");
+    split.draw(|f| render_player(f, &mut app, Rect { x: 0, y: 0, width: 120, height: 40 })).expect("draw");
+    let split_area = app.gfx.thumb_area.expect("split records the pane");
+
+    let mut pip_app = playing_app(0);
+    pip_app.player.set_playing_for_test(true);
+    pip_app.player.display_mode = DisplayMode::Kitty;
+    pip_app.player.cached_thumbnail = app.player.cached_thumbnail.clone();
+    let mut pip = Terminal::new(TestBackend::new(120, 40)).expect("backend");
+    pip.draw(|f| render_pip(f, &mut pip_app)).expect("draw");
+    let pip_area = pip_app.gfx.thumb_area.expect("pip records the pane");
+
+    // The panes are different widths by design: the split layout gives half the
+    // row to artwork, PiP uses the whole window. What must match is the rule,
+    // so each is compared against the shared formula at its own width.
+    for (label, area) in [("split", split_area), ("pip", pip_area)] {
+      let expected = ideal_thumb_height(DisplayMode::Kitty, &image_for_frame, area.width);
+      assert_eq!(area.height, expected, "{label} must use the shared aspect formula");
+    }
   }
 
   fn normal() -> Style {

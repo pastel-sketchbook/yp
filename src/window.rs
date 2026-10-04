@@ -408,25 +408,69 @@ pub async fn get_screen_size() -> Result<ScreenSize> {
 }
 
 /// Compute the `PiP` window geometry: small window at the bottom-right of the screen.
+///
+/// Split from [`pip_geometry`] so the placement math is testable without
+/// shelling out to the window server.
 #[allow(clippy::cast_possible_wrap)]
-pub async fn pip_geometry() -> Result<WindowGeometry> {
+pub fn pip_geometry_for(screen: ScreenSize) -> WindowGeometry {
   let c = constants();
+  // `saturating_sub` keeps the window on screen when the display is smaller
+  // than the requested size, pinning it to the corner instead of flipping it
+  // off the opposite edge.
+  let x = screen.width.saturating_sub(c.pip_width + c.pip_margin);
+  let y = screen.height.saturating_sub(c.pip_height + c.pip_margin);
+  // Never larger than the screen itself, so the margin is honoured rather than
+  // pushing the window past the edge it is being kept away from.
+  let width = c.pip_width.min(screen.width);
+  let height = c.pip_height.min(screen.height);
+  WindowGeometry { x: x as i32, y: y as i32, width, height }
+}
+
+/// Compute the `PiP` window geometry: small window at the bottom-right of the screen.
+pub async fn pip_geometry() -> Result<WindowGeometry> {
   let screen = get_screen_size().await.unwrap_or_else(|e| {
     warn!(err = %e, "pip: failed to get screen size, using 2560x1440 default");
     ScreenSize { width: 2560, height: 1440 }
   });
-
-  Ok(WindowGeometry {
-    x: (screen.width.saturating_sub(c.pip_width + c.pip_margin)) as i32,
-    y: (screen.height.saturating_sub(c.pip_height + c.pip_margin)) as i32,
-    width: c.pip_width,
-    height: c.pip_height,
-  })
+  Ok(pip_geometry_for(screen))
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn pip_sits_in_the_bottom_right_with_the_requested_margin() {
+    let screen = ScreenSize { width: 2560, height: 1440 };
+    let geom = pip_geometry_for(screen);
+    let c = constants();
+    assert_eq!(geom.width, c.pip_width);
+    assert_eq!(geom.height, c.pip_height);
+    assert_eq!(u32::try_from(geom.x).unwrap() + c.pip_width + c.pip_margin, screen.width, "right margin");
+    assert_eq!(u32::try_from(geom.y).unwrap() + c.pip_height + c.pip_margin, screen.height, "bottom margin");
+    assert!(geom.x > 0 && geom.y > 0, "must be in the bottom-right quadrant, got {geom:?}");
+  }
+
+  #[test]
+  fn the_pip_margin_stays_small() {
+    // The margin is a bezel gap, not padding. It grew to 30px before, which
+    // read as the window floating away from the corner.
+    let margin = constants().pip_margin;
+    assert!(margin <= 16, "pip_margin of {margin}px leaves visible padding");
+  }
+
+  #[test]
+  fn pip_is_clamped_rather_than_pushed_off_a_small_screen() {
+    // A display smaller than the requested size must still show the window.
+    let screen = ScreenSize { width: 500, height: 300 };
+    let geom = pip_geometry_for(screen);
+    assert!(u32::try_from(geom.x).is_ok(), "x must not go negative");
+    assert!(u32::try_from(geom.y).is_ok(), "y must not go negative");
+    assert!(geom.width <= screen.width, "width must fit the screen");
+    assert!(geom.height <= screen.height, "height must fit the screen");
+    assert_eq!(geom.x, 0, "a clamped window pins to the corner");
+    assert_eq!(geom.y, 0);
+  }
 
   #[test]
   fn parse_bounds_valid() {
