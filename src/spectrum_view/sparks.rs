@@ -1,3 +1,5 @@
+// Derived from vtamp (MIT, (c) 2026 Jang-Ho Hwang and vtamp contributors).
+// See NOTICE at the repository root for the full licence text.
 //! Sparks thrown from the bar tops when a band jumps between two frames. They fly on
 //! braille dots under gravity, cool from the text role toward the canvas, and only use
 //! cells the bars leave blank.

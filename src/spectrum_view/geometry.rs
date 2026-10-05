@@ -9,8 +9,6 @@ use std::ops::Range;
 
 /// Dot rows per braille cell.
 pub(super) const BRAILLE_ROWS: usize = 4;
-/// Dot columns per braille cell.
-pub(super) const BRAILLE_COLUMNS: usize = 2;
 
 /// The bands covered by column `index` of `count`.
 pub(super) fn bands(index: usize, count: usize) -> Range<usize> {
@@ -24,6 +22,7 @@ pub(super) fn merged(values: &[f32; BANDS], bands: Range<usize>) -> f32 {
 }
 
 /// One bar: the bands it merges and its body columns.
+#[derive(Debug)]
 pub(super) struct Bar {
   pub(super) bands: Range<usize>,
   pub(super) columns: Range<u16>,
@@ -43,51 +42,22 @@ pub(super) fn bar_layout(width: u16) -> impl Iterator<Item = Bar> {
   })
 }
 
-/// Reads a band value at a fractional position, interpolating between bands.
+/// The band value under dot column `x` of `width`, joined by straight segments
+/// between band centers and flat beyond the outer ones.
 ///
-/// [`BANDS`] values spread across a pane far wider than the band count leave
-/// visible steps. Interpolating fills them in, which is what makes bars read as
-/// a curve rather than a staircase.
-pub(super) fn sample_interpolated(levels: &[f32; BANDS], position: f32) -> f32 {
-  if BANDS == 1 {
-    return levels[0];
+/// Fewer columns than bands merges them instead, so a narrow pane shows every
+/// band rather than clipping the top. Reading column by column rather than by a
+/// normalized position is what lets the curve styles, the bars, and the
+/// frequency axis all agree on which band a given column means.
+pub(super) fn sample_at(levels: &[f32; BANDS], x: usize, width: usize) -> f32 {
+  if width < BANDS {
+    return merged(levels, bands(x, width)).clamp(0.0, 1.0);
   }
-  let position = position.clamp(0.0, 1.0) * (BANDS - 1) as f32;
-  let low = position.floor() as usize;
-  let high = (low + 1).min(BANDS - 1);
-  let t = position - low as f32;
-  levels[low] * (1.0 - t) + levels[high] * t
-}
-
-/// Braille bit for a dot, addressed by column and row counted from the top.
-const fn braille_bit(column: usize, row: usize) -> u16 {
-  match (column, row) {
-    (0, 0) => 0x0001,
-    (0, 1) => 0x0002,
-    (0, 2) => 0x0004,
-    (0, 3) => 0x0040,
-    (1, 0) => 0x0008,
-    (1, 1) => 0x0010,
-    (1, 2) => 0x0020,
-    (1, 3) => 0x0080,
-    _ => 0,
-  }
-}
-
-/// Builds a braille glyph from a per-dot occupancy grid.
-///
-/// `filled[column][row]` with row 0 at the top, matching the glyph's own
-/// numbering rather than the bar's bottom-up sense.
-pub(super) fn braille_glyph(filled: &[[bool; BRAILLE_ROWS]; BRAILLE_COLUMNS]) -> char {
-  let mut bits = 0_u16;
-  for (column, rows) in filled.iter().enumerate() {
-    for (row, on) in rows.iter().enumerate() {
-      if *on {
-        bits |= braille_bit(column, row);
-      }
-    }
-  }
-  char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ')
+  let position = ((x as f32 + 0.5) * BANDS as f32 / width as f32 - 0.5).max(0.0);
+  let band = (position as usize).min(BANDS - 1);
+  let next = (band + 1).min(BANDS - 1);
+  let t = (position - band as f32).min(1.0);
+  (levels[band] + (levels[next] - levels[band]) * t).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -95,36 +65,36 @@ mod tests {
   use super::*;
 
   #[test]
-  fn braille_glyphs_use_the_documented_dot_numbering() {
-    assert_eq!(braille_glyph(&[[false; BRAILLE_ROWS]; BRAILLE_COLUMNS]), '\u{2800}', "blank cell");
-    let mut bottom_left = [[false; BRAILLE_ROWS]; BRAILLE_COLUMNS];
-    bottom_left[0][BRAILLE_ROWS - 1] = true;
-    assert_eq!(braille_glyph(&bottom_left), char::from_u32(0x2800 + 0x40).expect("valid"));
-    let mut top_right = [[false; BRAILLE_ROWS]; BRAILLE_COLUMNS];
-    top_right[1][0] = true;
-    assert_eq!(braille_glyph(&top_right), char::from_u32(0x2800 + 0x08).expect("valid"));
-    assert_eq!(braille_glyph(&[[true; BRAILLE_ROWS]; BRAILLE_COLUMNS]), char::from_u32(0x28FF).expect("valid"));
+  fn sampling_a_column_reads_between_its_neighbours() {
+    // A linear ramp: every column must read near its own position.
+    let ramp: [f32; BANDS] = std::array::from_fn(|i| i as f32 / (BANDS - 1) as f32);
+    for width in [64_usize, 128, 512] {
+      for x in 0..width {
+        let read = sample_at(&ramp, x, width);
+        let expected = x as f32 / (width - 1) as f32;
+        assert!((read - expected).abs() < 0.06, "width {width} column {x}: read {read}, expected {expected}");
+      }
+    }
   }
 
   #[test]
-  fn interpolation_fills_the_gaps_between_bands() {
-    // A linear ramp: any position between bands must read between its neighbours
-    // rather than snapping to a staircase.
-    let ramp: [f32; BANDS] = std::array::from_fn(|i| i as f32 / (BANDS - 1) as f32);
-    assert_eq!(sample_interpolated(&ramp, 0.0), 0.0, "the low end is read");
-    assert_eq!(sample_interpolated(&ramp, 1.0), 1.0, "the high end is read");
-    for position in [0.1, 0.25, 0.5, 0.75, 0.9] {
-      let read = sample_interpolated(&ramp, position);
-      assert!((read - position).abs() < 0.05, "at {position} expected about {position}, got {read}");
-    }
-    // A lone hot band must still fall off smoothly around itself.
+  fn a_lone_hot_band_falls_off_around_itself() {
     let mut spike = [0.0; BANDS];
     spike[0] = 1.0;
-    assert_eq!(sample_interpolated(&spike, 0.0), 1.0);
-    assert_eq!(sample_interpolated(&spike, 1.0), 0.0, "far from the spike is silence");
-    assert!(sample_interpolated(&spike, 0.02) > sample_interpolated(&spike, 0.08));
-    assert_eq!(sample_interpolated(&spike, -1.0), 1.0, "out of range is clamped");
-    assert_eq!(sample_interpolated(&spike, 2.0), 0.0);
+    assert_eq!(sample_at(&spike, 0, 64), 1.0);
+    assert_eq!(sample_at(&spike, 63, 64), 0.0, "far from the spike is silence");
+    assert!(sample_at(&spike, 1, 64) < sample_at(&spike, 0, 64), "it must decay away from the spike");
+  }
+
+  #[test]
+  fn a_narrow_row_merges_bands_rather_than_skipping_them() {
+    let mut spike = [0.0; BANDS];
+    spike[20] = 1.0;
+    // With fewer columns than bands every band still reaches the display.
+    for width in [1_usize, 4, 16, 31] {
+      let peak = (0..width).map(|x| sample_at(&spike, x, width)).fold(0.0, f32::max);
+      assert_eq!(peak, 1.0, "width {width} lost the hot band");
+    }
   }
 
   #[test]

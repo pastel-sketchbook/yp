@@ -3,9 +3,13 @@
 //! Each style lives in its own file under `spectrum_view/`; this module owns the
 //! style list, the shared animation state, and the dispatch that picks a
 //! renderer. Anything two styles agree on — bar geometry, band merging, band
-//! interpolation — is in `geometry.rs`; anything that draws dots at braille
+//! sampling — is in `geometry.rs`; anything that draws dots at braille
 //! resolution is in `braille.rs`.
+//!
+//! Most of the styles, and the per-channel analyzer split behind them, are
+//! derived from vtamp. See `NOTICE` at the repository root.
 
+mod axis;
 mod bars;
 mod braille;
 mod fire;
@@ -14,6 +18,7 @@ mod radial;
 mod ridge;
 mod smooth;
 mod sparks;
+mod squares;
 mod stereo;
 mod trail;
 mod waterfall;
@@ -29,16 +34,13 @@ use ratatui::{
   layout::Rect,
   style::Style,
   text::Line,
-  widgets::{Block, Borders, Paragraph},
+  widgets::{Block, Borders},
 };
 use sparks::Sparks;
+use stereo::Stereo;
 
 /// Rows the waterfall and ridge remember; more than any pane shows, bounded for memory.
 const HISTORY: usize = 256;
-/// Decade markers for the frequency axis: (power of ten, label).
-const AXIS_MARKS: &[(f32, &str)] = &[(1.0, "10"), (2.0, "100"), (3.0, "1k"), (4.0, "10k")];
-/// Narrowest pane that carries decade labels; below it the ends read better.
-const AXIS_MIN_WIDTH: u16 = 12;
 const DECAY: f32 = 1.8;
 const PEAK_DECAY: f32 = 0.8;
 const PEAK_HOLD: std::time::Duration = std::time::Duration::from_millis(180);
@@ -155,9 +157,6 @@ pub struct SpectrumView {
   levels: [f32; BANDS],
   peaks: [f32; BANDS],
   hold: [std::time::Instant; BANDS],
-  /// Right channel, tracked separately so the stereo display can show width.
-  levels_right: [f32; BANDS],
-  peaks_right: [f32; BANDS],
   /// Levels of recent active frames, oldest first; waterfall and ridge draw these.
   history: std::collections::VecDeque<[f32; BANDS]>,
   /// Frames ever pushed, so ridge can keep its depth stable as old rows drop.
@@ -167,6 +166,8 @@ pub struct SpectrumView {
   fire: Fire,
   radial: Radial,
   sparks: Sparks,
+  /// The two channel envelopes, which fall on their own clock.
+  stereo: Stereo,
   rng: SmallRng,
 }
 
@@ -181,14 +182,13 @@ impl SpectrumView {
       levels: [0.0; BANDS],
       peaks: [0.0; BANDS],
       hold: [now; BANDS],
-      levels_right: [0.0; BANDS],
-      peaks_right: [0.0; BANDS],
       history: std::collections::VecDeque::with_capacity(HISTORY),
       pushed: 0,
       redraw: true,
       fire: Fire::default(),
       radial: Radial::default(),
       sparks: Sparks::default(),
+      stereo: Stereo::default(),
       rng: SmallRng::seed_from_u64(0x5EED),
     }
   }
@@ -218,8 +218,7 @@ impl SpectrumView {
   fn reset_levels(&mut self) {
     self.levels.fill(0.0);
     self.peaks.fill(0.0);
-    self.levels_right.fill(0.0);
-    self.peaks_right.fill(0.0);
+    self.stereo.reset();
     self.redraw = true;
   }
 
@@ -236,13 +235,8 @@ impl SpectrumView {
       || self.fire.is_hot()
       || self.radial.is_active()
       || self.sparks.is_active()
-      || self
-        .levels
-        .iter()
-        .chain(&self.peaks)
-        .chain(&self.levels_right)
-        .chain(&self.peaks_right)
-        .any(|value| *value > 0.0)
+      || self.stereo.is_active()
+      || self.levels.iter().chain(&self.peaks).any(|value| *value > 0.0)
   }
 
   /// Adopts a new analyzer frame, resetting state when the track changes.
@@ -301,12 +295,22 @@ impl SpectrumView {
     // History styles have nothing to decay between frames, and advancing them
     // would let peaks fall out from under a line that is already drawn.
     let dt = if self.style.follows_frames() { 0.0 } else { self.advance(playing) };
+    // The channel envelopes ride their own decay, which only the stereo style
+    // reads, so they step even when the bars are not advancing.
+    if self.style == SpectrumStyle::Stereo && !self.style.follows_frames() {
+      let live = playing && self.received.elapsed() < LIVENESS;
+      let channels = self.frame.as_ref().filter(|f| live && f.active).map(|f| &f.channels);
+      self.stereo.advance(channels, dt);
+    }
     let buf = frame.buffer_mut();
     match self.style {
-      SpectrumStyle::Smooth => self.draw_smooth(buf, body, theme),
-      SpectrumStyle::Trail => self.draw_trail(buf, body, theme),
-      SpectrumStyle::Stereo => self.draw_stereo(buf, body, theme),
-      SpectrumStyle::Waterfall => self.draw_waterfall(buf, body, theme),
+      SpectrumStyle::Smooth if smooth::fits(body) => smooth::draw(buf, body, theme, &self.levels),
+      SpectrumStyle::Smooth => bars::draw(self, buf, body, theme, BarKind::Zoned),
+      SpectrumStyle::Squares => squares::draw(buf, body, theme, &self.levels, &self.peaks),
+      SpectrumStyle::Stereo if stereo::fits(body) => self.stereo.draw(buf, body, theme),
+      SpectrumStyle::Stereo => self.draw_bars(buf, body, theme, BarKind::Zoned),
+      SpectrumStyle::Trail => trail::draw(buf, body, theme, &self.history),
+      SpectrumStyle::Waterfall => waterfall::draw(self, buf, body, theme),
       SpectrumStyle::Radial => {
         self.radial.advance(dt);
         self.radial.draw(buf, body, theme, &self.levels, &self.peaks, cell);
@@ -320,7 +324,17 @@ impl SpectrumView {
       // The rest are bar variants and share one renderer.
       _ => self.draw_bars(buf, body, theme, self.style.bar_kind().unwrap_or(BarKind::Zoned)),
     }
-    self.draw_axis(frame, inner, body, theme);
+    // The axis has to line up with what was actually drawn, which is not always
+    // the whole pane: stereo insets a gutter for its channel labels, and the
+    // styles that wrap or stack the bands have no meaningful horizontal scale.
+    let (graph, mapping) = match self.style {
+      SpectrumStyle::Radial => (body, axis::Mapping::Ends),
+      SpectrumStyle::Stereo if stereo::fits(body) => (stereo::graph(body), axis::Mapping::Bars),
+      SpectrumStyle::Smooth if smooth::fits(body) => (body, axis::Mapping::Continuous),
+      SpectrumStyle::Waterfall | SpectrumStyle::Fire | SpectrumStyle::Ridge => (body, axis::Mapping::Continuous),
+      _ => (body, axis::Mapping::Bars),
+    };
+    axis::draw(buf, graph, body.bottom(), theme, mapping, self.frame.as_ref());
   }
 
   fn header(&self, frame: &mut Frame, area: Rect, theme: &Theme) -> Rect {
@@ -355,83 +369,15 @@ impl SpectrumView {
       } else if now >= self.hold[i] {
         self.peaks[i] = self.levels[i].max(self.peaks[i] - dt * PEAK_DECAY);
       }
-      // The right channel rides the same decay so both meters stay comparable.
-      let target_right = frame.map_or(0.0, |f| f.levels_right[i].clamp(0.0, 1.0));
-      self.levels_right[i] = target_right.max(self.levels_right[i] - dt * DECAY);
-      if self.levels_right[i] >= self.peaks_right[i] {
-        self.peaks_right[i] = self.levels_right[i];
-        self.hold[i] = now + PEAK_HOLD;
-      } else if now >= self.hold[i] {
-        self.peaks_right[i] = self.levels_right[i].max(self.peaks_right[i] - dt * PEAK_DECAY);
-      }
     }
     dt
   }
-
-  /// Draws octave frequency marks along the bottom row.
-  ///
-  /// The bands are logarithmic, so the axis is labelled in decades too: a linear
-  /// readout of what sits where is otherwise guesswork. Below [`AXIS_MIN_WIDTH`]
-  /// there is no room for the labels and the ends together, and the ends say more.
-  fn draw_axis(&self, frame: &mut Frame, inner: Rect, body: Rect, theme: &Theme) {
-    let Some(current) = self.frame.as_ref() else {
-      Self::draw_axis_ends(frame, inner, body, theme);
-      return;
-    };
-    let low = current.low_hz.max(1.0);
-    let high = current.high_hz.max(low * 2.0);
-    let span = (high / low).log10();
-    if span <= 0.0 || inner.width < AXIS_MIN_WIDTH {
-      Self::draw_axis_ends(frame, inner, body, theme);
-      return;
-    }
-    let y = inner.y + body.height;
-    // A range too narrow to hold a decade would leave the row blank, which reads
-    // as a broken panel rather than as "no scale to show".
-    let marks: Vec<_> = AXIS_MARKS
-      .iter()
-      .filter(|&&(marker, _)| {
-        let ratio = 10_f32.powf(marker);
-        ratio >= low && ratio <= high
-      })
-      .collect();
-    if marks.is_empty() {
-      Self::draw_axis_ends(frame, inner, body, theme);
-      return;
-    }
-    for &(marker, label) in marks {
-      let ratio = 10_f32.powf(marker);
-      let position = ((ratio / low).log10() / span).clamp(0.0, 1.0);
-      // Land the label's left edge at the mark, but keep it inside the pane.
-      let width = (label.len() as u16).min(inner.width);
-      if width == 0 {
-        continue;
-      }
-      let x = (f32::from(inner.x) + position * f32::from(inner.width.saturating_sub(1)))
-        .round()
-        .clamp(f32::from(inner.x), f32::from(inner.right().saturating_sub(width))) as u16;
-      frame.render_widget(Paragraph::new(label).style(Style::default().fg(theme.muted)), Rect::new(x, y, width, 1));
-    }
-  }
-
-  /// The plain LOW/HIGH pair, used before a frame arrives and in a narrow pane.
-  fn draw_axis_ends(frame: &mut Frame, inner: Rect, body: Rect, theme: &Theme) {
-    let y = inner.y + body.height;
-    frame.render_widget(
-      Paragraph::new("LOW").style(Style::default().fg(theme.muted)),
-      Rect::new(inner.x, y, inner.width.min(3), 1),
-    );
-    if inner.width >= 9 {
-      frame.render_widget(
-        Paragraph::new("HIGH").style(Style::default().fg(theme.muted)),
-        Rect::new(inner.right() - 4, y, 4, 1),
-      );
-    }
-  }
 }
+
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::spectrum::SpectrumChannels;
   use crate::theme::THEMES;
   use rand::SeedableRng;
   use ratatui::{
@@ -464,9 +410,9 @@ mod tests {
   fn scaled(levels: [f32; BANDS]) -> SpectrumFrame {
     SpectrumFrame { low_hz: 40.0, high_hz: 16_000.0, ..active(levels) }
   }
-  /// An active frame with an independent right channel.
-  fn stereo(levels: [f32; BANDS], right: [f32; BANDS]) -> SpectrumFrame {
-    SpectrumFrame { levels_right: right, ..active(levels) }
+  /// An active frame with independent channels.
+  fn stereo(levels: [f32; BANDS], left: [f32; BANDS], right: [f32; BANDS]) -> SpectrumFrame {
+    SpectrumFrame { channels: SpectrumChannels { left, right }, ..active(levels) }
   }
   /// A frame of `level` in `bands` and silence elsewhere.
   fn bands_at(range: Range<usize>, level: f32) -> [f32; BANDS] {
@@ -723,40 +669,50 @@ mod tests {
   }
 
   #[test]
-  fn stereo_separates_the_channels_and_closes_for_mono() {
+  fn the_stereo_style_routes_through_the_channel_envelopes() {
     let mut view = styled(SpectrumStyle::Stereo);
     let mut terminal = backend(40, 12);
-    view.accept(stereo([1.0; BANDS], [0.05; BANDS]));
+    view.accept(SpectrumFrame {
+      channels: SpectrumChannels { left: [1.0; BANDS], right: [0.05; BANDS] },
+      low_hz: 40.0,
+      high_hz: 16_000.0,
+      ..active([1.0; BANDS])
+    });
     render(&mut view, &mut terminal, true);
-    // The upper half is the left channel and the lower the right, meeting at a
-    // spine. Rows 6..=8 carry the loud channel, rows 2..=4 the quiet one.
-    assert!(
-      lit(&terminal, 7) > lit(&terminal, 2),
-      "left is the loud one: {} vs {}",
-      lit(&terminal, 7),
-      lit(&terminal, 2)
-    );
-    assert_eq!(glyph_at(&terminal, 1, 5), "│", "a spine pairs the meters");
-    // A mono source decodes to the same signal on both channels.
-    view.accept(stereo([0.7; BANDS], [0.7; BANDS]));
-    render(&mut view, &mut terminal, true);
-    assert!(lit(&terminal, 7) > 0 && lit(&terminal, 3) > 0, "both halves draw");
-    assert_eq!(lit(&terminal, 7), lit(&terminal, 4), "identical channels render symmetrically");
+    // The view must feed the envelopes and label which half is which.
+    assert!(view.stereo.is_active());
+    assert_eq!(glyph_at(&terminal, 1, 5), "L", "the upper half is the left channel");
+    assert_eq!(glyph_at(&terminal, 1, 6), "R", "the lower half is the right channel");
+    assert!(lit(&terminal, 2) > 0, "the loud left channel fills the upper half");
+    // The axis follows the inset graph, not the whole pane.
+    assert!(row_symbols(&terminal, 10).contains("100"), "the labels sit under the graph");
   }
 
   #[test]
-  fn styles_that_need_room_fall_back_instead_of_drawing_nonsense() {
+  fn a_pane_too_small_for_the_stereo_style_falls_back_to_bars() {
     let mut view = styled(SpectrumStyle::Stereo);
-    view.accept(stereo([0.9; BANDS], [0.9; BANDS]));
-    for (width, height) in [(3, 2), (5, 3), (8, 4), (12, 6)] {
+    view.accept(stereo([0.9; BANDS], [0.9; BANDS], [0.9; BANDS]));
+    for (width, height) in [(3, 2), (5, 3), (9, 4), (12, 6)] {
       let mut terminal = backend(width, height);
       render(&mut view, &mut terminal, true);
     }
   }
 
   #[test]
+  fn the_stereo_envelopes_settle_so_a_stopped_track_stops_the_panel() {
+    let mut view = styled(SpectrumStyle::Stereo);
+    let mut terminal = backend(40, 12);
+    view.accept(stereo([1.0; BANDS], [1.0; BANDS], [1.0; BANDS]));
+    render(&mut view, &mut terminal, true);
+    assert!(view.needs_animation(), "live channels keep the panel awake");
+    settle(&mut view, &mut terminal);
+    assert!(!view.stereo.is_active(), "the envelopes must fall to nothing");
+    assert!(!view.needs_animation(), "and the panel must stop asking for frames");
+  }
+
+  #[test]
   fn trail_leaves_a_streak_of_recent_frames_and_sleeps_without_them() {
-    let theme = THEMES[0];
+    let theme = &THEMES[0];
     let mut view = styled(SpectrumStyle::Trail);
     let mut terminal = backend(40, 12);
     render(&mut view, &mut terminal, true);
@@ -765,12 +721,21 @@ mod tests {
     assert!(view.needs_animation(), "a frame requests one draw");
     view.accept(active([1.0; BANDS]));
     render(&mut view, &mut terminal, false);
-    // The newest frame sits at the top and the quieter older one trails below it.
-    assert_eq!(glyph_at(&terminal, 1, 1), "▄", "the newest frame");
-    assert_eq!(glyph_at(&terminal, 1, 7), "▄", "the older frame trails");
-    assert_eq!(glyph_at(&terminal, 1, 4), " ", "nothing between them");
-    assert_ne!(terminal.backend().buffer()[(1, 1)].fg, theme.border, "the newest frame keeps a zone color");
-    assert_eq!(terminal.backend().buffer()[(1, 7)].fg, theme.border, "older frames fade toward the border role");
+    // The body is nine rows at y = 1..=9, and each frame marks the row its level
+    // reaches, so a full frame sits at the top and the quiet one near the bottom.
+    let row_of = |level: f32| ((level * 9.0).ceil() as u16).saturating_sub(1);
+    let x = 1 + super::geometry::bar_layout(38).next().expect("a bar").columns.start;
+    let (newest, older) = (9 - row_of(1.0), 9 - row_of(0.2));
+    assert_eq!(glyph_at(&terminal, x, newest), "▄", "the newest frame");
+    assert_eq!(glyph_at(&terminal, x, older), "▄", "the older frame trails");
+    assert!(
+      (1..=9).all(|y| y == newest || y == older || glyph_at(&terminal, x, y) != "▄"),
+      "nothing is drawn between the two frames"
+    );
+    let newest_color = terminal.backend().buffer()[(x, newest)].fg;
+    let older_color = terminal.backend().buffer()[(x, older)].fg;
+    assert_eq!(newest_color, super::bars::zone(theme, row_of(1.0), 9), "the newest keeps a zone color");
+    assert_ne!(older_color, newest_color, "an older frame must be dimmer");
     assert!(!view.needs_animation(), "the trail persists until another frame arrives");
   }
 

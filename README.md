@@ -94,8 +94,8 @@ The Now Playing pane shows a live spectrum of the audio you are hearing, with no
 | `dots` | A ladder of lit dots |
 | `squares` | The same ladder filled with whole cells and colored by the gradient, like a contribution graph |
 | `bars` | Flat bars colored by height zone |
-| `trail` | Bars with a fading tail from recent frames |
-| `stereo` | Left and right channels as opposing meters, showing stereo width |
+| `trail` | Bars with a tail from recent frames, older ones fading toward the panel |
+| `stereo` | Left and right channels as opposing meters, each half labelled `L` and `R`, showing stereo width |
 | `mono` | A single accent color |
 | `mirror` | Bars mirrored about the vertical center |
 | `waterfall` | Scrolling history of recent frames |
@@ -106,9 +106,13 @@ The Now Playing pane shows a live spectrum of the audio you are hearing, with no
 
 The last four animate on their own — `fire` keeps burning until its heat runs out, `sparks` throw and fall, and `radial` sends waves on an onset — so they keep the display ticking for a moment after the audio stops. All of them settle to rest when playback pauses, which stops yp redrawing at full rate.
 
-`radial` needs the terminal's cell size to stay round, and it widens into an ellipse in a short, wide pane; too short for a circle and it falls back to a mirrored strip. `smooth`, `stereo`, and `radial` all degrade to plain bars in a pane too small to show their shape.
+`radial` needs the terminal's cell size to stay round, and it widens into an ellipse in a short, wide pane; too short for a circle and it falls back to a mirrored strip. `smooth` and `stereo` degrade to plain bars in a pane too small to show their shape, and `stereo` needs ten columns for its channel labels.
 
-The axis is labelled in decade marks (100, 1k, 10k) to match the logarithmic bands, dropping back to `LOW`/`HIGH` when a pane is too narrow for them. The choice is saved to `prefs.toml`.
+The bar heights come from the left and right channels summed, not from one channel alone, so they read the same as any other spectrum for the same music. The split is kept only for the `stereo` style.
+
+The axis is labelled in decade marks (100, 1k, 10k) to match the logarithmic bands, each mark centred under the bar that actually shows that frequency rather than at a proportional position, and never overlapping its neighbour. It drops back to `LOW`/`HIGH` when a pane is too narrow for the marks, and `radial` keeps the ends because it wraps the bands around a circle. The choice is saved to `prefs.toml`.
+
+Most of these styles, and the per-channel analyzer split behind them, come from [vtamp](https://github.com/rath/vtamp) (MIT). See [`NOTICE`](NOTICE).
 
 The bars are a real FFT of the samples reaching the sound device, not a decoration. `mpv` decodes to a FIFO instead of the sound card and runs ahead as fast as it can; yp drains that FIFO at exactly device rate, which paces `mpv` to real time and makes the position readout the audio actually heard. Seeking therefore restarts `mpv` with `--start`, since a FIFO cannot be rewound.
 

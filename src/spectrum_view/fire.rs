@@ -1,3 +1,5 @@
+// Derived from vtamp (MIT, (c) 2026 Jang-Ho Hwang and vtamp contributors).
+// See NOTICE at the repository root for the full licence text.
 //! Doom-style fire on half-block pixels: the bottom pixel row takes the band levels, and
 //! every step each pixel takes the heat of a random pixel below it, minus a random loss.
 use super::geometry::{bands, merged};

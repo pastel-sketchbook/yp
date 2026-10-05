@@ -10,7 +10,7 @@ use crate::theme::{Theme, spectrum_gradient};
 use ratatui::{buffer::Buffer, layout::Rect, style::Color};
 
 /// Eighths of a cell, from empty to solid.
-const BLOCKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+pub(super) const BLOCKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
 /// Which look the shared bar loop draws.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -21,6 +21,28 @@ pub(super) enum BarKind {
   Mirror,
   Dots,
   Squares,
+}
+
+/// Eighths of the cell at `row` covered by a bar of `level` rows.
+pub(super) fn units(level: f32, row: u16) -> usize {
+  ((level - row as f32) * 8.0).ceil().clamp(0.0, 8.0) as usize
+}
+
+/// Flat color for a row, matching the gradient's three zones.
+pub(super) fn zone(theme: &Theme, row: u16, rows: u16) -> Color {
+  let position = row as f32 / rows.max(1) as f32;
+  if position < 0.55 {
+    theme.spectrum[0]
+  } else if position < 0.8 {
+    theme.spectrum[1]
+  } else {
+    theme.spectrum[2]
+  }
+}
+
+/// Draws one of the bar looks.
+pub(super) fn draw(view: &SpectrumView, buf: &mut Buffer, body: Rect, theme: &Theme, kind: BarKind) {
+  view.draw_bars(buf, body, theme, kind)
 }
 
 impl SpectrumView {
@@ -55,7 +77,7 @@ impl SpectrumView {
               // The lower half inverts fg and bg so a partial cell reads as a
               // solid bar without a second glyph set.
               let cell = &mut buf[(x, bottom - half + row)];
-              match (glyph, Self::units(level, row)) {
+              match (glyph, units(level, row)) {
                 (' ', _) => cell.set_char(' ').set_fg(theme.panel_bg).set_bg(theme.panel_bg),
                 ('▔', _) => cell.set_char('▁').set_fg(color).set_bg(theme.panel_bg),
                 (_, 8) => cell.set_char('█').set_fg(color).set_bg(theme.panel_bg),
@@ -79,7 +101,7 @@ impl SpectrumView {
                 let color = if square {
                   spectrum_gradient(theme, row as f32 / rows.saturating_sub(1).max(1) as f32)
                 } else {
-                  Self::zone(theme, row, rows)
+                  zone(theme, row, rows)
                 };
                 cell.set_char(if square { '█' } else { '●' }).set_fg(color);
               } else {
@@ -93,33 +115,16 @@ impl SpectrumView {
     }
   }
 
-  /// Eighths of the cell at `row` covered by a bar of `level` rows.
-  fn units(level: f32, row: u16) -> usize {
-    ((level - row as f32) * 8.0).ceil().clamp(0.0, 8.0) as usize
-  }
-
-  /// Flat color for a row, matching the gradient's three zones.
-  pub(super) fn zone(theme: &Theme, row: u16, rows: u16) -> Color {
-    let position = row as f32 / rows.max(1) as f32;
-    if position < 0.55 {
-      theme.spectrum[0]
-    } else if position < 0.8 {
-      theme.spectrum[1]
-    } else {
-      theme.spectrum[2]
-    }
-  }
-
   /// Glyph and color of one cell in a vertical bar, including the peak marker.
   pub(super) fn bar_cell(kind: BarKind, theme: &Theme, row: u16, rows: u16, level: f32, peak: f32) -> (char, Color) {
-    let units = Self::units(level, row);
+    let units = units(level, row);
     let glyph =
       if units == 0 && peak > 0.05 && row == (peak.ceil() as u16).saturating_sub(1) { '▔' } else { BLOCKS[units] };
     let color = match kind {
       BarKind::Gradient => spectrum_gradient(theme, row as f32 / rows.saturating_sub(1).max(1) as f32),
       BarKind::Mono if glyph == '▔' => theme.fg,
       BarKind::Mono => theme.accent,
-      _ => Self::zone(theme, row, rows),
+      _ => zone(theme, row, rows),
     };
     (glyph, color)
   }

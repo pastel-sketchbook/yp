@@ -5,6 +5,11 @@ use super::geometry::{bands, merged};
 use crate::theme::{Theme, spectrum_gradient};
 use ratatui::{buffer::Buffer, layout::Rect};
 
+/// Draws the scrolling history.
+pub(super) fn draw(view: &SpectrumView, buf: &mut Buffer, body: Rect, theme: &Theme) {
+  view.draw_waterfall(buf, body, theme)
+}
+
 impl SpectrumView {
   pub(super) fn draw_waterfall(&self, buf: &mut Buffer, body: Rect, theme: &Theme) {
     let width = usize::from(body.width);

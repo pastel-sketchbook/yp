@@ -1,3 +1,5 @@
+// Derived from vtamp (MIT, (c) 2026 Jang-Ho Hwang and vtamp contributors).
+// See NOTICE at the repository root for the full licence text.
 //! Braille dot canvas: 2 × 4 dots per terminal cell, one foreground color per cell.
 use crate::theme::{Theme, blend};
 use ratatui::{buffer::Buffer, layout::Rect, style::Color, symbols::braille::BRAILLE};

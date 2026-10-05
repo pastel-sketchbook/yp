@@ -1,55 +1,67 @@
-//! Smooth: braille bars with the bands interpolated between them.
+// Derived from vtamp (MIT, (c) 2026 Jang-Ho Hwang and vtamp contributors).
+// See NOTICE at the repository root for the full licence text.
+//! A filled, interpolated curve on the shared braille canvas.
 //!
-//! Braille glyphs pack two dot columns and four dot rows per cell, which is four
-//! times the vertical resolution of half-blocks and twice the horizontal. That
-//! is what turns 32 bands into a curve instead of a staircase.
+//! Braille dots pack two columns and four rows per cell, which is four times the
+//! vertical resolution of half-blocks and twice the horizontal. Drawing through
+//! the shared canvas rather than assembling glyphs here means the curve colors by
+//! height zone for free, and the same dot addressing serves every braille style.
 
-use super::SpectrumView;
-use super::bars::BarKind;
-use super::geometry::{BRAILLE_COLUMNS, BRAILLE_ROWS, braille_glyph, sample_interpolated};
+use super::bars::zone;
+use super::braille::Braille;
+use super::geometry::BRAILLE_ROWS;
+use super::geometry::sample_at;
+use crate::spectrum::BANDS;
 use crate::theme::Theme;
 use ratatui::{buffer::Buffer, layout::Rect};
 
-impl SpectrumView {
-  /// Falls back to plain bars when the pane is too small for the extra detail
-  /// to show, since four rows per cell in two rows of body is just noise.
-  pub(super) fn draw_smooth(&self, buf: &mut Buffer, body: Rect, theme: &Theme) {
-    if body.width < 4 || body.height < 2 {
-      self.draw_bars(buf, body, theme, BarKind::Zoned);
-      return;
+/// Whether there is room for the extra detail, or the caller should draw bars.
+pub(super) fn fits(body: Rect) -> bool {
+  body.width >= 4 && body.height >= 2
+}
+
+pub(super) fn draw(buf: &mut Buffer, body: Rect, theme: &Theme, levels: &[f32; BANDS]) {
+  let mut canvas = Braille::new(body);
+  let (columns, rows) = canvas.size();
+  for x in 0..columns {
+    let dots = (sample_at(levels, x as usize, columns as usize) * rows as f32).ceil() as i32;
+    for height in 0..dots.min(rows) {
+      // Color by cell row, so the gradient runs up the curve in bands.
+      canvas.dot(x, rows - 1 - height, zone(theme, (height as usize / BRAILLE_ROWS) as u16, body.height), 0);
     }
-    let dot_rows = usize::from(body.height) * BRAILLE_ROWS;
-    let dot_columns = usize::from(body.width) * BRAILLE_COLUMNS;
-    for row in 0..body.height {
-      let y = body.y + row;
-      for x in 0..body.width {
-        let mut filled = [[false; BRAILLE_ROWS]; BRAILLE_COLUMNS];
-        let mut any = false;
-        for (column, column_filled) in filled.iter_mut().enumerate() {
-          let index = usize::from(x) * BRAILLE_COLUMNS + column;
-          if index >= dot_columns {
-            continue;
-          }
-          let position = index as f32 / (dot_columns - 1).max(1) as f32;
-          let level = sample_interpolated(&self.levels, position) * dot_rows as f32;
-          // Dots fill upward from the bottom of the cell stack.
-          let base = usize::from(body.height - 1 - row) * BRAILLE_ROWS;
-          for dot_row in 0..BRAILLE_ROWS {
-            if base + dot_row < level.ceil() as usize {
-              // Glyph rows count from the top of the cell.
-              column_filled[BRAILLE_ROWS - 1 - dot_row] = true;
-              any = true;
-            }
-          }
-        }
-        let cell = &mut buf[(body.x + x, y)];
-        if any {
-          cell.set_char(braille_glyph(&filled));
-        } else {
-          cell.set_char(' ');
-        }
-        cell.set_fg(Self::zone(theme, row, body.height)).set_bg(theme.panel_bg);
-      }
+  }
+  canvas.render(buf, theme);
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::spectrum_view::braille::dots_of;
+  use crate::theme::THEMES;
+
+  #[test]
+  fn the_curve_fills_upward_uses_height_zones_and_keeps_the_treble() {
+    let body = Rect::new(0, 0, 32, 8);
+    let mut buf = Buffer::empty(body);
+    let ramp: [f32; BANDS] = std::array::from_fn(|i| i as f32 / (BANDS - 1) as f32);
+    draw(&mut buf, body, &THEMES[0], &ramp);
+    assert_eq!(buf[(0, 0)].symbol(), " ", "a ramp starts at silence on the left");
+    assert_eq!(dots_of(buf[(31, 0)].symbol()).len(), 8, "a full column lights all four rows");
+    assert_eq!(buf[(31, 0)].fg, THEMES[0].spectrum[2], "the top is the high role");
+    assert_eq!(buf[(31, 7)].fg, THEMES[0].spectrum[0], "the bottom is the low role");
+    // The whole point of interpolating: no column is left half empty next to a
+    // full one, so the curve reads as a slope rather than a staircase.
+    let mut buf = Buffer::empty(body);
+    draw(&mut buf, body, &THEMES[0], &[0.0; BANDS]);
+    assert!(buf.content().iter().all(|cell| cell.symbol() == " "), "silence draws nothing");
+  }
+
+  #[test]
+  fn a_pane_too_small_for_the_detail_is_declined() {
+    for (width, height) in [(0_u16, 0_u16), (1, 5), (3, 8), (4, 1), (40, 1)] {
+      assert!(!fits(Rect::new(0, 0, width, height)), "{width}x{height} cannot carry the detail");
     }
+    assert!(fits(Rect::new(0, 0, 4, 2)));
+    assert!(fits(Rect::new(0, 0, 40, 12)));
   }
 }

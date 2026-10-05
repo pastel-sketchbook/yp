@@ -1,3 +1,5 @@
+// Derived from vtamp (MIT, (c) 2026 Jang-Ho Hwang and vtamp contributors).
+// See NOTICE at the repository root for the full licence text.
 //! Lossy analysis of the PCM yp is currently playing. Never an audio effect.
 //!
 //! The samples arrive from the reader thread in [`audio::AudioOutput`] at the
@@ -46,10 +48,18 @@ pub struct SpectrumFrame {
   pub active: bool,
   pub low_hz: f32,
   pub high_hz: f32,
-  /// Left channel bands.
+  /// Combined power across both channels, which is what every non-stereo style
+  /// shows. Reading one channel alone would run about 3 dB quiet.
   pub levels: [f32; BANDS],
-  /// Right channel bands, kept separate so the stereo display can show width.
-  pub levels_right: [f32; BANDS],
+  /// The two channels kept apart, for the stereo style alone.
+  pub channels: SpectrumChannels,
+}
+
+/// Per-channel band magnitudes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SpectrumChannels {
+  pub left: [f32; BANDS],
+  pub right: [f32; BANDS],
 }
 
 struct Block {
@@ -290,18 +300,19 @@ impl Analyzer {
     })
   }
 
-  /// Band magnitudes for both channels.
+  /// Band magnitudes for the combined signal and for each channel.
   ///
-  /// Kept separate rather than summed: the stereo display needs to show how
-  /// wide the image is, and a mono sum throws that away.
-  fn levels(&mut self, rate: u32) -> ([f32; BANDS], [f32; BANDS]) {
+  /// The split is what shows stereo width, and the sum is what the bar styles
+  /// draw: neither can be recovered from the other, so both are computed.
+  fn levels(&mut self, rate: u32) -> ([f32; BANDS], SpectrumChannels) {
     let high = (rate as f32 / 2.0).min(HIGH_HZ);
     if high <= LOW_HZ {
-      return ([0.0; BANDS], [0.0; BANDS]);
+      return ([0.0; BANDS], SpectrumChannels::default());
     }
     let left = self.channel_levels(0, rate, high);
     let right = self.channel_levels(1, rate, high);
-    (left, right)
+    let combined = std::array::from_fn(|band| left[band].max(right[band]));
+    (combined, SpectrumChannels { left, right })
   }
 
   fn update(&mut self, spectrum: &Spectrum) {
@@ -324,7 +335,7 @@ impl Analyzer {
     }
     let active = enabled && self.filled == FFT_SIZE && self.last_sample.elapsed() < LIVENESS;
     let rate = spectrum.rate();
-    let (levels, levels_right) = if active { self.levels(rate) } else { ([0.0; BANDS], [0.0; BANDS]) };
+    let (levels, channels) = if active { self.levels(rate) } else { ([0.0; BANDS], SpectrumChannels::default()) };
     if spectrum.generation.load(Ordering::Acquire) != generation {
       return;
     }
@@ -335,7 +346,7 @@ impl Analyzer {
       low_hz: LOW_HZ,
       high_hz: (rate as f32 / 2.0).min(HIGH_HZ),
       levels,
-      levels_right,
+      channels,
     };
     spectrum.frames.send_if_modified(|frame| {
       // Active frames double as liveness heartbeats: a view must keep decaying
@@ -395,6 +406,22 @@ mod tests {
     panic!("no new frame arrived after feeding audio");
   }
 
+  /// Waits for a frame louder than `ceiling`.
+  ///
+  /// Waiting merely for a *different* frame is not enough: the worker keeps
+  /// publishing frames for the audio fed before, so the next one after a change
+  /// can still carry the old level. A test that wants "louder" has to say so.
+  fn await_louder_than(subscription: &mut Subscription, ceiling: f32) -> SpectrumFrame {
+    for _ in 0..400 {
+      let frame = subscription.frames.borrow_and_update().clone();
+      if frame.active && frame.levels.iter().copied().fold(0.0, f32::max) > ceiling {
+        return frame;
+      }
+      std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("no frame louder than {ceiling} arrived");
+  }
+
   fn spectrum() -> (Arc<Spectrum>, Subscription) {
     let spectrum = Spectrum::start(RATE).expect("spectrum worker starts");
     let subscription = spectrum.subscribe();
@@ -449,15 +476,20 @@ mod tests {
       let quiet = (std::f32::consts::TAU * i as f32 / period).sin() * 0.005;
       feed.push(quiet, quiet);
     }
-    let quiet_frame = await_change(&mut subscription, &SpectrumFrame::default());
+    let quiet_frame = await_louder_than(&mut subscription, 0.0);
     let quiet = quiet_frame.levels.iter().copied().fold(0.0, f32::max);
     for i in 0..RATE {
       let loud = (std::f32::consts::TAU * i as f32 / period).sin() * 0.15;
       feed.push(loud, loud);
     }
-    let loud_frame = await_change(&mut subscription, &quiet_frame);
+    let loud_frame = await_louder_than(&mut subscription, quiet + 0.1);
     let loud = loud_frame.levels.iter().copied().fold(0.0, f32::max);
     assert!(loud > quiet + 0.1, "loud {loud} should exceed quiet {quiet}");
+    // The split travels with the combined levels, so the stereo style can show
+    // width without the bar styles having to make do with one channel.
+    for (name, levels) in [("left", &loud_frame.channels.left), ("right", &loud_frame.channels.right)] {
+      assert!(levels.iter().copied().fold(0.0, f32::max) > quiet * 0.5, "the {name} channel must carry the signal too");
+    }
   }
 
   #[test]

@@ -1,3 +1,5 @@
+// Derived from vtamp (MIT, (c) 2026 Jang-Ho Hwang and vtamp contributors).
+// See NOTICE at the repository root for the full licence text.
 //! Polar petals on braille dots around a ring. Bands run from LOW at the left over the
 //! top to HIGH at the right, and the lower half mirrors the upper one, so the axis labels
 //! stay true. Onsets between frames pump a glowing core and send waves outward. Bodies too
